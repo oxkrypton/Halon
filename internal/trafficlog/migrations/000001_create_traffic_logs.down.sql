@@ -1,0 +1,2 @@
+DROP TABLE IF EXISTS error_body;
+DROP TABLE IF EXISTS base_logs;
