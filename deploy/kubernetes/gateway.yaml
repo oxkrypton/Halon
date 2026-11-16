@@ -35,8 +35,13 @@ spec:
           env:
             - name: GIN_MODE
               value: release
-            - name: USER_SERVICE_ADDR
-              value: user-service:50051
+            # Route table: prefix=upstream pairs. The demo entry below only
+            # works when examples/user-service is deployed; replace it with
+            # your own services.
+            - name: ROUTES
+              value: /api/v1/users/=http://user-service:8090
+            - name: UPSTREAM_TIMEOUT
+              value: 3s
             - name: RATE_LIMIT_RPS
               value: "20"
             - name: RATE_LIMIT_BURST
