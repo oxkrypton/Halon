@@ -51,6 +51,13 @@ spec:
                 secretKeyRef:
                   name: halon-secrets
                   key: admin-token
+            - name: AGENT_WEBHOOK_URL
+              value: http://agent:8081/api/v1/incidents/timeout
+            - name: AGENT_WEBHOOK_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: halon-secrets
+                  key: ingest-token
           startupProbe:
             httpGet:
               path: /healthz

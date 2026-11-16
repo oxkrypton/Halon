@@ -14,6 +14,6 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/service /service
 
-EXPOSE 50051 8080 9090
+EXPOSE 50051 8080 8081 9090
 USER 65532:65532
 ENTRYPOINT ["/service"]

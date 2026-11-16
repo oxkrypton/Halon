@@ -19,8 +19,16 @@ user-service (:50051)
 Gin Gateway -- bounded channel --> Batch Writer --> PostgreSQL
                                                    |-- base_logs
                                                    |-- error_body
+                                                   |-- incident_reports
 
 Gateway Admin (:9090) -- Bearer Token --> blacklist / rate-limit rules
+
+Gin Gateway -- 504 webhook --> Agent Service (:8081)
+                                   |-- 事件去重(TTL + ON CONFLICT)
+                                   |-- 编排器队列 --> LLM 排查循环
+                                   |-- 只读工具:日志 / PromQL / Pod / 事件
+                                   |-- 操作工具(按级别开放):重启 / 扩容 / 封禁
+                                   +-- 故障报告持久化 --> incident_reports
 ```
 
 ## 已完成功能
@@ -48,6 +56,16 @@ Gateway Admin (:9090) -- Bearer Token --> blacklist / rate-limit rules
 - 基础日志和详情日志在同一事务中写入，失败批次最多重试 3 次。
 - 使用嵌入式、版本化 SQL 迁移，不使用自动改表。
 - StatefulSet 配合 PersistentVolumeClaim，数据库 Pod 重建后数据仍保留。
+
+### Agent 故障排查服务
+
+- `POST /api/v1/incidents/timeout` 接收网关 504 webhook,Bearer 鉴权 + 事件体严格校验。
+- 双重事件去重:内存 TTL 去重器拦截重试投递，`ON CONFLICT DO NOTHING` 保证入库幂等。
+- 有界队列 + 可配置 worker 数的编排器，每次排查有独立超时，支持 readonly/operator/full 三级操作权限。
+- 只读工具:PostgreSQL 错误日志、流量统计、Top IP,Prometheus PromQL 即时查询,Pod/日志/事件/Deployment 状态。
+- 操作工具(operator):Pod 重启、Deployment 扩容(上限保护)、网关 IP 封禁;full 级别额外支持更新容器镜像。
+- 命名空间白名单与操作冷却时间，SQL 全部参数化，工具参数严格校验。
+- 排查结果(中文 Markdown 报告、工具调用轨迹、Token 用量)持久化到 `incident_reports` 表，可随时通过 API 查询。
 
 ## 环境要求
 
@@ -99,6 +117,16 @@ USER_SERVICE_ADDR='localhost:50051' \
 make run-gateway
 ```
 
+如需本地验证 Agent 排查闭环，再开一个终端启动 Agent 服务（网关配置 `AGENT_WEBHOOK_URL=http://localhost:8081/api/v1/incidents/timeout` 和相同的 Token 后重启）：
+
+```bash
+DATABASE_DSN='postgres://halon:halon-local-password@localhost:5432/halon?sslmode=disable' \
+INGEST_TOKEN='halon-local-ingest-token' \
+OPENAI_API_KEY='<你的 OpenAI 兼容 API Key>' \
+OPENAI_MODEL='gpt-4o-mini' \
+make run-agent
+```
+
 调用网关：
 
 ```bash
@@ -120,6 +148,15 @@ curl -i http://localhost:8080/readyz
 | `DELETE /admin/rules/blacklist/:ip` | 删除黑名单 IP，需要管理鉴权 |
 | `GET /admin/rules/rate-limit` | 查询限流参数，需要管理鉴权 |
 | `PUT /admin/rules/rate-limit` | 更新限流参数，需要管理鉴权 |
+
+Agent 服务接口(`:8081`，均需 `Authorization: Bearer <INGEST_TOKEN>`):
+
+| 接口 | 说明 |
+| --- | --- |
+| `POST /api/v1/incidents/timeout` | 接收超时事件并排队排查；重复事件返回 `duplicate: true` |
+| `GET /api/v1/incidents` | 列出最近的故障报告，`limit` 参数最大 200 |
+| `GET /api/v1/incidents/:event_id` | 查询单个事件的排查报告与工具调用轨迹 |
+| `GET /healthz` / `GET /readyz` | 存活检查 / PostgreSQL 就绪检查 |
 
 管理接口鉴权头：
 
@@ -163,7 +200,9 @@ kubectl create secret generic halon-secrets \
   --from-literal=postgres-user=halon \
   --from-literal=postgres-password=halon-local-password \
   --from-literal=database-dsn='postgres://halon:halon-local-password@postgres:5432/halon?sslmode=disable' \
-  --from-literal=admin-token='halon-local-admin-token'
+  --from-literal=admin-token='halon-local-admin-token' \
+  --from-literal=ingest-token='halon-local-ingest-token' \
+  --from-literal=openai-api-key='<你的 OpenAI 兼容 API Key>'
 ```
 
 构建并载入两个服务镜像，然后先启动数据库：
@@ -180,6 +219,7 @@ kubectl rollout status statefulset/postgres --timeout=180s
 make deploy
 kubectl rollout status deployment/gateway --timeout=180s
 kubectl rollout status deployment/user-service --timeout=180s
+kubectl rollout status deployment/agent --timeout=180s
 make status
 ```
 
@@ -248,7 +288,31 @@ kubectl rollout restart deployment/user-service
 | `SLOW_REQUEST_THRESHOLD` | `1s` | 保存完整报文的慢请求阈值 |
 | `BODY_CAPTURE_BYTES` | `65536` | 请求和响应各自的最大采集字节数 |
 | `RPC_TIMEOUT` | `3s` | 单次 gRPC 调用超时 |
+| `AGENT_WEBHOOK_URL` | 空 | Agent 超时事件接收地址，为空则不推送 |
+| `AGENT_WEBHOOK_TOKEN` | 空 | Agent 接收接口 Bearer Token，配置 URL 后必填 |
 | `SHUTDOWN_TIMEOUT` | `10s` | 平滑退出超时 |
+
+## Agent 配置
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `HTTP_ADDR` | `:8081` | 事件接收与报告查询监听地址 |
+| `DATABASE_DSN` | 必填 | PostgreSQL 连接串，与网关共用数据库 |
+| `INGEST_TOKEN` | 必填，至少 12 字符 | 事件接收与报告查询的 Bearer Token |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI 兼容 API 地址 |
+| `OPENAI_API_KEY` / `OPENAI_MODEL` | 必填 | 大模型凭据与模型名 |
+| `AGENT_OPERATION_LEVEL` | `readonly` | 工具开放级别：`readonly` / `operator` / `full` |
+| `K8S_NAMESPACES` | `default` | 允许操作的命名空间，逗号分隔，`*` 表示全部 |
+| `K8S_MAX_REPLICAS` | `5` | Deployment 扩容上限 |
+| `K8S_ACTION_COOLDOWN` | `2m` | 同一对象两次变更操作的最小间隔 |
+| `AGENT_MAX_STEPS` | `12` | 单次排查的最大模型轮数 |
+| `AGENT_MAX_TOOL_OUTPUT` | `4096` | 单次工具返回的最大字节数 |
+| `AGENT_WORKERS` / `AGENT_QUEUE_SIZE` | `2` / `64` | 排查 worker 数与事件队列容量 |
+| `AGENT_RUN_TIMEOUT` | `5m` | 单次排查的超时时间 |
+| `AGENT_DEDUP_TTL` | `10m` | 事件去重窗口 |
+| `GATEWAY_ADMIN_URL` / `GATEWAY_ADMIN_TOKEN` | 空 | 网关管理接口地址与 Token，供封禁工具使用 |
+| `PROMETHEUS_URL` | 空 | Prometheus 查询地址，为空时 PromQL 工具不可用 |
+| `SHUTDOWN_TIMEOUT` | `30s` | 平滑退出超时 |
 
 ## 当前边界
 
@@ -265,14 +329,19 @@ kubectl rollout restart deployment/user-service
 │   ├── gen/user/v1/              # 生成的 Go 代码
 │   └── proto/user/v1/            # Protobuf 接口定义
 ├── cmd/
+│   ├── agent/                    # Agent 故障排查服务入口
 │   ├── gateway/                  # Gin 网关入口
 │   ├── user-client/              # gRPC 验证客户端
 │   └── user-service/             # 用户服务入口
 ├── internal/
+│   ├── agent/                    # 排查循环、编排器、事件 API 和配置
+│   ├── agent/tools/              # 日志/PromQL/K8s/封禁工具及测试
 │   ├── gateway/                  # HTTP、中间件、规则和测试
+│   ├── incident/                 # 超时事件、去重、报告持久化及测试
 │   ├── trafficlog/               # PostgreSQL、迁移、批写器和测试
 │   └── user/                     # 用户业务实现及测试
 ├── deploy/kubernetes/
+│   ├── agent.yaml                # Agent Deployment、Service 和 RBAC
 │   ├── gateway.yaml              # 网关 Deployment 和 Service
 │   ├── postgres.yaml             # PostgreSQL StatefulSet、Service 和 PVC
 │   └── user-service.yaml         # 用户服务 Deployment 和 Service
