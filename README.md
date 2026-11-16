@@ -72,6 +72,7 @@ Gin Gateway -- 504 webhook --> Agent Service (:8081)
 - `POST /api/v1/incidents/timeout` 接收网关 504 webhook,Bearer 鉴权 + 事件体严格校验。
 - 双重事件去重:内存 TTL 去重器拦截重试投递,`ON CONFLICT DO NOTHING` 保证入库幂等。
 - 有界队列 + 可配置 worker 数的编排器,每次排查有独立超时,支持 readonly/operator/full 三级操作权限。
+- 启动恢复:重启后回收上一进程悬挂的排查——`AGENT_RECOVERY_MAX_AGE` 内的事件重新入队续跑,超龄的标记 failed;仅内存(单副本)模式执行。
 - 只读工具:PostgreSQL 错误日志、流量统计、Top IP,Prometheus PromQL 即时查询,Pod/日志/事件/Deployment 状态。
 - 操作工具(operator):Pod 重启、Deployment 扩容(上限保护)、网关 IP 封禁;full 级别额外支持更新容器镜像。
 - 命名空间白名单与操作冷却时间,SQL 全部参数化,工具参数严格校验。
@@ -342,6 +343,7 @@ kubectl rollout restart deployment/agent
 | `AGENT_WORKERS` / `AGENT_QUEUE_SIZE` | `2` / `64` | 排查 worker 数与事件队列容量 |
 | `AGENT_RUN_TIMEOUT` | `5m` | 单次排查的超时时间 |
 | `AGENT_DEDUP_TTL` | `10m` | 事件去重窗口 |
+| `AGENT_RECOVERY_MAX_AGE` | `30m` | 启动恢复重新入队的事件最大龄期,超龄的未完成报告标记 failed;仅内存模式生效 |
 | `GATEWAY_ADMIN_URL` / `GATEWAY_ADMIN_TOKEN` | 空 | 网关管理接口地址与 Token,供封禁工具使用 |
 | `PROMETHEUS_URL` | 空 | Prometheus 查询地址,为空时 PromQL 工具不可用 |
 | `REDIS_URL` | 空 | 共享状态 Redis 地址;语义与网关一致,两端必须同时配置或同时留空 |
@@ -351,7 +353,7 @@ kubectl rollout restart deployment/agent
 
 ## 当前边界
 
-- 共享状态分两模式:`REDIS_URL` 为空为内存模式,网关与 Agent 均固定 1 副本;非空为共享模式,黑名单/限流/操作冷却外迁 Redis,两端均可 2+ 副本(需两端同时配置;熔断器与并发舱壁是有意的 per-replica 语义,不外迁;事件去重由数据库唯一约束表决,任意副本数安全)。参考清单 `make deploy-redis`,详见 `docs/deployment.md`。
+- 共享状态分两模式:`REDIS_URL` 为空为内存模式,网关与 Agent 均固定 1 副本;非空为共享模式,黑名单/限流/操作冷却外迁 Redis,两端均可 2+ 副本(需两端同时配置;熔断器与并发舱壁是有意的 per-replica 语义,不外迁;事件去重由数据库唯一约束表决,任意副本数安全)。Agent 启动恢复(回收悬挂排查)只在内存模式执行,共享模式下崩溃副本的未完成报告暂不重跑(需租约机制)。参考清单 `make deploy-redis`,详见 `docs/deployment.md`。
 - 异步日志采用有界、尽力投递队列,数据库长期不可用或队列饱和时会丢弃日志,避免拖垮业务请求。
 - 网关与上游之间、Agent 与网关管理接口之间使用集群内明文 HTTP;跨集群或不可信网络应启用 TLS。
 - 弹性策略依赖 failsafe-go(v0.x,API 可能变动),全部封装在 `internal/gateway/resilience.go`;追踪依赖 OpenTelemetry Go SDK,默认关闭。

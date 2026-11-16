@@ -15,7 +15,7 @@
 | `registry.go` | `Registry`:按操作级别过滤工具、排序定义、执行时做 JSON 校验并把错误回传给模型 |
 | `loop.go` | `Loop.Run`:系统提示词 + 事件 JSON → 多轮 `Complete` → 工具执行 → 最终中文报告;工具输出双上限截断(UTF-8 安全):喂模型按 `AGENT_MAX_TOOL_OUTPUT`,落库按更宽的 `AGENT_MAX_STORED_TOOL_OUTPUT` 并置 `output_truncated` 标记 |
 | `openai.go` | `OpenAIClient`:OpenAI 兼容 `/chat/completions`;429/5xx 重试最多 3 次,尊重 `Retry-After`;4xx 不重试 |
-| `orchestrator.go` | `Orchestrator`:`Submit`(校验→Claim→入队)→ worker 池 `investigate`(限时运行 + 落库)→ `Close` 排空 |
+| `orchestrator.go` | `Orchestrator`:`Submit`(校验→Claim→入队)→ worker 池 `investigate`(限时运行 + 落库)→ `Close` 排空;`RecoverUnfinished` 启动时回收悬挂报告(仅内存模式) |
 | `server.go` | HTTP API:事件接收、报告查询、健康探针 |
 | `config.go` | `LoadConfig()`:全部环境变量与启动校验 |
 
@@ -37,7 +37,7 @@
 | `GET /healthz` / `GET /readyz` | 存活 / PostgreSQL 就绪 |
 | `GET /metrics` | Prometheus 指标(无需鉴权);当前含 `halon_agent_redis_up`(共享模式 Redis 可达性,内存模式恒 1) |
 
-去重的正确性由数据库唯一约束保证:`Orchestrator.Submit` → `incident.Store.Claim` 的 `INSERT ... ON CONFLICT DO NOTHING` 是多副本下的表决,同一事件只有一个 `INSERT` 成功;内存 `Deduper` 只是省一次 DB 往返的快路径,不参与正确性。共享模式(`REDIS_URL` 非空)下 Agent 可多副本,变更操作冷却由 Redis 裁决(见 [agent-tools.md](agent-tools.md) 安全模型)。
+去重的正确性由数据库唯一约束保证:`Orchestrator.Submit` → `incident.Store.Claim` 的 `INSERT ... ON CONFLICT DO NOTHING` 是多副本下的表决,同一事件只有一个 `INSERT` 成功;内存 `Deduper` 只是省一次 DB 往返的快路径,不参与正确性。共享模式(`REDIS_URL` 非空)下 Agent 可多副本,变更操作冷却由 Redis 裁决(见 [agent-tools.md](agent-tools.md) 安全模型)。注意启动恢复(`RecoverUnfinished`)只在内存模式执行:单副本下启动时所有 queued/processing 行必然是上一进程的孤儿,共享模式下行可能属于存活的副本,需等租约机制。
 
 ## 编排器行为细节
 
@@ -45,6 +45,7 @@
 - worker 取到任务先 `MarkProcessing`,再带 `AGENT_RUN_TIMEOUT` 跑 `Loop.Run`;
 - 落库用独立的 10s 超时 context(运行 context 可能已取消);
 - `Close()` 关闭队列并等待排空;入口先停 HTTP 再 `Close`,排空受 `SHUTDOWN_TIMEOUT` 兜底。
+- 启动恢复(仅内存模式):`cmd/agent` 在 worker 池启动后、HTTP 监听前调用 `RecoverUnfinished`——数据库里仍处于 queued/processing 的行是上一进程的孤儿(内存队列已随进程消失),事件发生时间在 `AGENT_RECOVERY_MAX_AGE`(默认 30m)内的重新入队续跑,超龄的标记 `failed`(error = incident expired while the agent was down)。恢复失败不阻塞启动,剩余孤儿留待下次重启重试。
 
 ## 配置(环境变量)
 
@@ -52,13 +53,13 @@
 
 ## cmd/agent 装配顺序
 
-`LoadConfig` → `incident.OpenStore` + `Migrate` → K8s clientset(优先 in-cluster,回退 `~/.kube/config`)→ 工具注册(Observability + Kubernetes + GatewayAction)→ `Registry`(按级别过滤)→ `OpenAIClient` → `Loop` → `Orchestrator` → HTTP server。
+`LoadConfig` → `incident.OpenStore` + `Migrate` → K8s clientset(优先 in-cluster,回退 `~/.kube/config`)→ 工具注册(Observability + Kubernetes + GatewayAction)→ `Registry`(按级别过滤)→ `OpenAIClient` → `Loop` → `Orchestrator` → 启动恢复 `RecoverUnfinished`(仅内存模式)→ HTTP server。
 
 ## 测试
 
 - `loop_test.go`:`modelFunc` 桩覆盖工具调用、错误回传、最大轮数、截断(模型视图与落库双上限);
 - `openai_test.go`:httptest 假服务器覆盖重试与错误;
-- `orchestrator_test.go`:完成/失败/重复/非法事件/队列满五个场景;
+- `orchestrator_test.go`:完成/失败/重复/非法事件/队列满/启动恢复(重入队 + 超龄标记)/恢复读库失败七个场景;
 - `server_test.go`:gin 测试路由覆盖鉴权、去重、校验、查询、探针。
 
 ## 修改本模块时必须同步检查

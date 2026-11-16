@@ -55,7 +55,9 @@ spec:
   # Memory mode (default): single replica because action cooldowns are
   # memory-local (event dedup is safe at any replica count — the database
   # unique constraint arbitrates). With REDIS_URL set on BOTH gateway and
-  # agent (shared mode), 2+ replicas are safe.
+  # agent (shared mode), 2+ replicas are safe. Note: startup recovery of
+  # unfinished incidents (RecoverUnfinished) runs only in memory mode —
+  # in shared mode those rows may belong to a live replica.
   replicas: 1
   selector:
     matchLabels:

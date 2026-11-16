@@ -135,6 +135,42 @@ func (s *Store) MarkProcessing(ctx context.Context, eventID string, startedAt ti
 	return nil
 }
 
+// LoadUnfinished returns every report still in queued or processing status,
+// oldest first. At startup these rows are orphans of a previous process: the
+// investigation queue is in-memory, so no worker will ever pick them up.
+// Safe to re-queue only in single-replica (memory) mode; in shared mode a
+// live replica may legitimately own some of these rows.
+func (s *Store) LoadUnfinished(ctx context.Context) ([]Report, error) {
+	reports := make([]Report, 0)
+	result := s.db.WithContext(ctx).
+		Where("status IN ?", []ReportStatus{StatusQueued, StatusProcessing}).
+		Order("occurred_at ASC").
+		Find(&reports)
+	if result.Error != nil {
+		return nil, fmt.Errorf("load unfinished incident reports: %w", result.Error)
+	}
+	return reports, nil
+}
+
+// MarkFailed closes an unfinished report without running an investigation,
+// recording why it was abandoned. Like MarkProcessing it is a conditional
+// update: a row that has since completed is left untouched, and zero
+// affected rows is not an error.
+func (s *Store) MarkFailed(ctx context.Context, eventID, cause string, finishedAt time.Time) error {
+	result := s.db.WithContext(ctx).Model(&Report{}).
+		Where("event_id = ? AND status IN ?", eventID, []ReportStatus{StatusQueued, StatusProcessing}).
+		Updates(map[string]any{
+			"status":      StatusFailed,
+			"error":       cause,
+			"finished_at": finishedAt,
+			"updated_at":  time.Now().UTC(),
+		})
+	if result.Error != nil {
+		return fmt.Errorf("mark incident failed: %w", result.Error)
+	}
+	return nil
+}
+
 // SaveResult writes the finished investigation outcome for a claimed event.
 func (s *Store) SaveResult(ctx context.Context, report Report) error {
 	updates := map[string]any{

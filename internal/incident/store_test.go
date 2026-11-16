@@ -127,6 +127,82 @@ func TestSaveResultFailsForUnknownEvent(t *testing.T) {
 	}
 }
 
+func TestLoadUnfinishedReturnsOrphans(t *testing.T) {
+	t.Parallel()
+
+	store, mock := newMockStore(t)
+	rows := sqlmock.NewRows([]string{
+		"event_id", "request_id", "occurred_at", "method", "path", "route",
+		"client_ip", "status_code", "latency_ms", "status",
+	}).
+		AddRow("evt-old", "req-1", time.Date(2026, 11, 16, 10, 0, 0, 0, time.UTC), "GET", "/a", "/a", "10.0.0.1", 504, 3000.0, "queued").
+		AddRow("evt-new", "req-2", time.Date(2026, 11, 16, 11, 0, 0, 0, time.UTC), "POST", "/b", "/b", "10.0.0.2", 504, 3100.5, "processing")
+	mock.ExpectQuery(`SELECT \* FROM "incident_reports" WHERE status IN \(\$1,\$2\) ORDER BY occurred_at ASC`).
+		WithArgs("queued", "processing").
+		WillReturnRows(rows)
+
+	reports, err := store.LoadUnfinished(context.Background())
+	if err != nil {
+		t.Fatalf("load unfinished: %v", err)
+	}
+	if len(reports) != 2 || reports[0].EventID != "evt-old" || reports[1].EventID != "evt-new" {
+		t.Fatalf("unexpected unfinished reports: %+v", reports)
+	}
+
+	event := reports[1].Event()
+	if event.EventID != "evt-new" || event.RequestID != "req-2" || event.Method != "POST" ||
+		event.Path != "/b" || event.Route != "/b" || event.ClientIP != "10.0.0.2" ||
+		event.StatusCode != 504 || event.LatencyMS != 3100.5 {
+		t.Fatalf("reconstructed event lost fields: %+v", event)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLoadUnfinishedPropagatesErrors(t *testing.T) {
+	t.Parallel()
+
+	store, mock := newMockStore(t)
+	mock.ExpectQuery(`SELECT \* FROM "incident_reports" WHERE status IN`).
+		WillReturnError(errors.New("connection reset"))
+
+	if _, err := store.LoadUnfinished(context.Background()); err == nil {
+		t.Fatal("database errors must surface to the recovery caller")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMarkFailedClosesUnfinishedRow(t *testing.T) {
+	t.Parallel()
+
+	store, mock := newMockStore(t)
+	mock.ExpectBegin()
+	mock.ExpectExec(`UPDATE "incident_reports" SET`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	finished := time.Date(2026, 11, 16, 12, 30, 0, 0, time.UTC)
+	if err := store.MarkFailed(context.Background(), "evt-1", "incident expired while the agent was down", finished); err != nil {
+		t.Fatalf("mark failed: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReportEventRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	want := testEvent()
+	got := incident.NewReport(want).Event()
+	if got != want {
+		t.Fatalf("report -> event round trip mismatch:\n got %+v\nwant %+v", got, want)
+	}
+}
+
 func TestGetReturnsNotFound(t *testing.T) {
 	t.Parallel()
 

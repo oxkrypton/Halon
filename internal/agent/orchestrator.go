@@ -20,6 +20,8 @@ type ReportStore interface {
 	Claim(context.Context, incident.TimeoutEvent) (bool, error)
 	MarkProcessing(ctx context.Context, eventID string, startedAt time.Time) error
 	SaveResult(context.Context, incident.Report) error
+	LoadUnfinished(ctx context.Context) ([]incident.Report, error)
+	MarkFailed(ctx context.Context, eventID, cause string, finishedAt time.Time) error
 }
 
 type OrchestratorOptions struct {
@@ -27,22 +29,26 @@ type OrchestratorOptions struct {
 	Workers    int
 	QueueSize  int
 	RunTimeout time.Duration
-	Logger     *slog.Logger
+	// RecoveryMaxAge bounds how old an unfinished incident may be for
+	// startup recovery to re-queue it; older ones are marked failed.
+	RecoveryMaxAge time.Duration
+	Logger         *slog.Logger
 }
 
 // Orchestrator accepts validated timeout events, claims them in the
 // report store, and investigates them sequentially per worker.
 type Orchestrator struct {
-	loop       *Loop
-	store      ReportStore
-	level      OperationLevel
-	runTimeout time.Duration
-	queue      chan incident.TimeoutEvent
-	workers    int
-	logger     *slog.Logger
-	wg         sync.WaitGroup
-	closeOnce  sync.Once
-	done       chan struct{}
+	loop           *Loop
+	store          ReportStore
+	level          OperationLevel
+	runTimeout     time.Duration
+	recoveryMaxAge time.Duration
+	queue          chan incident.TimeoutEvent
+	workers        int
+	logger         *slog.Logger
+	wg             sync.WaitGroup
+	closeOnce      sync.Once
+	done           chan struct{}
 }
 
 func NewOrchestrator(loop *Loop, store ReportStore, options OrchestratorOptions) *Orchestrator {
@@ -55,6 +61,9 @@ func NewOrchestrator(loop *Loop, store ReportStore, options OrchestratorOptions)
 	if options.RunTimeout <= 0 {
 		options.RunTimeout = 5 * time.Minute
 	}
+	if options.RecoveryMaxAge <= 0 {
+		options.RecoveryMaxAge = 30 * time.Minute
+	}
 	if options.Level == "" {
 		options.Level = LevelReadOnly
 	}
@@ -62,14 +71,15 @@ func NewOrchestrator(loop *Loop, store ReportStore, options OrchestratorOptions)
 		options.Logger = slog.Default()
 	}
 	return &Orchestrator{
-		loop:       loop,
-		store:      store,
-		level:      options.Level,
-		runTimeout: options.RunTimeout,
-		queue:      make(chan incident.TimeoutEvent, options.QueueSize),
-		workers:    options.Workers,
-		logger:     options.Logger,
-		done:       make(chan struct{}),
+		loop:           loop,
+		store:          store,
+		level:          options.Level,
+		runTimeout:     options.RunTimeout,
+		recoveryMaxAge: options.RecoveryMaxAge,
+		queue:          make(chan incident.TimeoutEvent, options.QueueSize),
+		workers:        options.Workers,
+		logger:         options.Logger,
+		done:           make(chan struct{}),
 	}
 }
 
@@ -101,6 +111,45 @@ func (o *Orchestrator) Submit(ctx context.Context, event incident.TimeoutEvent) 
 		}
 		return false, ErrQueueFull
 	}
+}
+
+// RecoverUnfinished re-queues incidents that a previous process claimed but
+// never finished: at startup the in-memory queue is empty, so every row
+// still in queued/processing status is an orphan no worker will pick up.
+// Rows younger than RecoveryMaxAge are re-queued for investigation; older
+// ones are marked failed so they do not look perpetually in-flight.
+//
+// Single-replica (memory) mode only: in shared mode a live replica may
+// legitimately own some of these rows, so callers must skip recovery until
+// lease-based claiming exists.
+//
+// Workers must be running (Run) before calling this, because re-queueing
+// blocks when the queue is full. Partial progress is reported on error; the
+// next startup retries the rest.
+func (o *Orchestrator) RecoverUnfinished(ctx context.Context) (requeued, expired int, err error) {
+	reports, err := o.store.LoadUnfinished(ctx)
+	if err != nil {
+		return 0, 0, fmt.Errorf("load unfinished incidents: %w", err)
+	}
+	cutoff := time.Now().Add(-o.recoveryMaxAge)
+	for _, report := range reports {
+		if report.OccurredAt.Before(cutoff) {
+			finished := time.Now().UTC()
+			if failErr := o.store.MarkFailed(ctx, report.EventID, "incident expired while the agent was down", finished); failErr != nil {
+				return requeued, expired, fmt.Errorf("expire incident %s: %w", report.EventID, failErr)
+			}
+			expired++
+			continue
+		}
+		select {
+		case o.queue <- report.Event():
+			requeued++
+			o.logger.Info("re-queued unfinished incident", "event_id", report.EventID, "status", report.Status)
+		case <-ctx.Done():
+			return requeued, expired, ctx.Err()
+		}
+	}
+	return requeued, expired, nil
 }
 
 // Run starts the worker pool and blocks until Close is called and all

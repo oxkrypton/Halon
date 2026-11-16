@@ -75,6 +75,23 @@ func (Report) TableName() string {
 	return "incident_reports"
 }
 
+// Event reconstructs the original timeout event from the persisted row.
+// Startup recovery uses it to re-queue investigations a previous process
+// claimed but never finished.
+func (r Report) Event() TimeoutEvent {
+	return TimeoutEvent{
+		EventID:    r.EventID,
+		RequestID:  r.RequestID,
+		OccurredAt: r.OccurredAt,
+		Method:     r.Method,
+		Path:       r.Path,
+		Route:      r.Route,
+		ClientIP:   r.ClientIP,
+		StatusCode: r.StatusCode,
+		LatencyMS:  r.LatencyMS,
+	}
+}
+
 // NewReport creates a queued report row for an accepted event.
 func NewReport(event TimeoutEvent) Report {
 	return Report{

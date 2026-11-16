@@ -105,17 +105,36 @@ func run(logger *slog.Logger) error {
 	model := agent.NewOpenAIClient(cfg.OpenAIBaseURL, cfg.OpenAIAPIKey, cfg.OpenAIModel, cfg.OpenAITimeout)
 	loop := agent.NewLoop(model, registry, cfg.MaxSteps, cfg.MaxToolOutput, cfg.MaxStoredToolOutput, logger)
 	orchestrator := agent.NewOrchestrator(loop, store, agent.OrchestratorOptions{
-		Level:      cfg.OperationLevel,
-		Workers:    cfg.Workers,
-		QueueSize:  cfg.QueueSize,
-		RunTimeout: cfg.RunTimeout,
-		Logger:     logger,
+		Level:          cfg.OperationLevel,
+		Workers:        cfg.Workers,
+		QueueSize:      cfg.QueueSize,
+		RunTimeout:     cfg.RunTimeout,
+		RecoveryMaxAge: cfg.RecoveryMaxAge,
+		Logger:         logger,
 	})
 	orchestratorDone := make(chan struct{})
 	go func() {
 		orchestrator.Run()
 		close(orchestratorDone)
 	}()
+
+	// Startup recovery (memory mode only): rows still queued/processing were
+	// claimed by a previous process whose in-memory queue died with it. A
+	// single replica makes them unambiguous orphans, so re-queueing is safe.
+	// In shared mode a live replica may own those rows, so recovery is
+	// skipped until lease-based claiming exists.
+	if cfg.RedisURL == "" {
+		requeued, expired, err := orchestrator.RecoverUnfinished(context.Background())
+		switch {
+		case err != nil:
+			logger.Error("incident recovery incomplete; remaining orphans retry on next restart",
+				"requeued", requeued, "expired", expired, "error", err)
+		case requeued > 0 || expired > 0:
+			logger.Info("incident recovery finished", "requeued", requeued, "expired", expired)
+		}
+	} else {
+		logger.Info("startup incident recovery skipped in shared mode")
+	}
 
 	server := &http.Server{
 		Addr: cfg.HTTPAddr,

@@ -37,8 +37,11 @@ type Config struct {
 	QueueSize           int
 	RunTimeout          time.Duration
 	DedupTTL            time.Duration
-	OpenAITimeout       time.Duration
-	ShutdownTimeout     time.Duration
+	// RecoveryMaxAge bounds startup recovery: unfinished incidents younger
+	// than this are re-queued, older ones are marked failed.
+	RecoveryMaxAge  time.Duration
+	OpenAITimeout   time.Duration
+	ShutdownTimeout time.Duration
 
 	// Shared state (optional). RedisURL empty keeps the single-replica
 	// in-memory mode; non-empty enables the shared multi-replica mode.
@@ -69,6 +72,7 @@ func LoadConfig() (Config, error) {
 		QueueSize:           64,
 		RunTimeout:          5 * time.Minute,
 		DedupTTL:            10 * time.Minute,
+		RecoveryMaxAge:      30 * time.Minute,
 		OpenAITimeout:       60 * time.Second,
 		ShutdownTimeout:     30 * time.Second,
 		RedisURL:            os.Getenv("REDIS_URL"),
@@ -102,6 +106,9 @@ func LoadConfig() (Config, error) {
 		return Config{}, err
 	}
 	if cfg.DedupTTL, err = envDuration("AGENT_DEDUP_TTL", cfg.DedupTTL); err != nil {
+		return Config{}, err
+	}
+	if cfg.RecoveryMaxAge, err = envDuration("AGENT_RECOVERY_MAX_AGE", cfg.RecoveryMaxAge); err != nil {
 		return Config{}, err
 	}
 	if cfg.OpenAITimeout, err = envDuration("OPENAI_TIMEOUT", cfg.OpenAITimeout); err != nil {
@@ -145,8 +152,8 @@ func LoadConfig() (Config, error) {
 	if cfg.MaxSteps <= 0 || cfg.MaxToolOutput <= 0 || cfg.MaxStoredToolOutput <= 0 || cfg.Workers <= 0 || cfg.QueueSize <= 0 {
 		validationErrors = append(validationErrors, errors.New("agent steps, tool output limits, workers, and queue size must be positive"))
 	}
-	if cfg.RunTimeout <= 0 || cfg.DedupTTL <= 0 || cfg.OpenAITimeout <= 0 || cfg.ShutdownTimeout <= 0 {
-		validationErrors = append(validationErrors, errors.New("timeouts and dedup TTL must be positive"))
+	if cfg.RunTimeout <= 0 || cfg.DedupTTL <= 0 || cfg.OpenAITimeout <= 0 || cfg.ShutdownTimeout <= 0 || cfg.RecoveryMaxAge <= 0 {
+		validationErrors = append(validationErrors, errors.New("timeouts, dedup TTL, and recovery max age must be positive"))
 	}
 	if cfg.RedisURL != "" {
 		if _, err := redis.ParseURL(cfg.RedisURL); err != nil {

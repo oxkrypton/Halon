@@ -85,3 +85,43 @@ func TestLoadConfigRejectsNonPositiveStoredToolOutput(t *testing.T) {
 		t.Fatal("LoadConfig() succeeded with AGENT_MAX_STORED_TOOL_OUTPUT=0")
 	}
 }
+
+func TestLoadConfigRecoveryMaxAge(t *testing.T) {
+	t.Setenv("DATABASE_DSN", "postgres://localhost/halon")
+	t.Setenv("INGEST_TOKEN", "test-ingest-token")
+	t.Setenv("OPENAI_API_KEY", "test-api-key")
+	t.Setenv("OPENAI_MODEL", "test-model")
+	t.Setenv("AGENT_RECOVERY_MAX_AGE", "2h")
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RecoveryMaxAge != 2*time.Hour {
+		t.Fatalf("RecoveryMaxAge = %v, want 2h", cfg.RecoveryMaxAge)
+	}
+}
+
+func TestLoadConfigRecoveryMaxAgeDefaults(t *testing.T) {
+	t.Setenv("DATABASE_DSN", "postgres://localhost/halon")
+	t.Setenv("INGEST_TOKEN", "test-ingest-token")
+	t.Setenv("OPENAI_API_KEY", "test-api-key")
+	t.Setenv("OPENAI_MODEL", "test-model")
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RecoveryMaxAge != 30*time.Minute {
+		t.Fatalf("default RecoveryMaxAge = %v, want 30m", cfg.RecoveryMaxAge)
+	}
+}
+
+func TestLoadConfigRejectsNonPositiveRecoveryMaxAge(t *testing.T) {
+	t.Setenv("DATABASE_DSN", "postgres://localhost/halon")
+	t.Setenv("INGEST_TOKEN", "test-ingest-token")
+	t.Setenv("OPENAI_API_KEY", "test-api-key")
+	t.Setenv("OPENAI_MODEL", "test-model")
+	t.Setenv("AGENT_RECOVERY_MAX_AGE", "0s")
+	if _, err := LoadConfig(); err == nil {
+		t.Fatal("LoadConfig() succeeded with AGENT_RECOVERY_MAX_AGE=0s")
+	}
+}
