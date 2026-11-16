@@ -21,12 +21,12 @@
 
 | 模块 | 文档 | 一句话职责 |
 | --- | --- | --- |
-| Gin 网关 | [modules/gateway.md](modules/gateway.md) | HTTP 入口、转发 gRPC、黑名单限流、流量日志与超时事件上报 |
-| 用户服务 | [modules/user-service.md](modules/user-service.md) | gRPC `GetUser` 演示服务 |
+| Gin 网关 | [modules/gateway.md](modules/gateway.md) | 通用反向代理、黑名单限流、流量日志与超时事件上报 |
 | 流量日志存储 | [modules/trafficlog.md](modules/trafficlog.md) | 请求日志的批量异步写入与 PostgreSQL 表结构 |
 | 超时事件与故障报告 | [modules/incident.md](modules/incident.md) | 事件模型、去重、报告表与存储层 |
 | Agent 核心 | [modules/agent.md](modules/agent.md) | LLM 循环、工具注册、编排器、事件 API、服务配置 |
 | Agent 工具层 | [modules/agent-tools.md](modules/agent-tools.md) | 日志/PromQL/K8s/封禁工具的清单、级别与安全约束 |
+| 演示后端(非产品) | [../examples/user-service/README.md](../examples/user-service/README.md) | 演练用 HTTP 服务与故障注入 |
 
 ### 历史设计稿
 

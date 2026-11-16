@@ -57,7 +57,7 @@ func ObservabilityTools(database *sql.DB, prometheusBaseURL string, httpClient *
 			Description: "Query PostgreSQL error and slow request details. Use the incident request_id first, then path and time window to find related failures.",
 			Parameters: objectSchema(map[string]any{
 				"request_id": stringProperty("Optional exact gateway X-Request-ID."),
-				"path":       stringProperty("Optional exact request path, for example /api/v1/users/1."),
+				"path":       stringProperty("Optional exact request path, for example /api/v1/orders/42."),
 				"minutes":    integerProperty("Lookback window in minutes, default 30.", 1, 1440),
 				"limit":      integerProperty("Maximum rows, default 20.", 1, 100),
 			}),
