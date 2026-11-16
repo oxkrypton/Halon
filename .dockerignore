@@ -1,0 +1,14 @@
+.git
+.gitignore
+Dockerfile
+.dockerignore
+bin
+*.log
+coverage.out
+docs
+deploy
+README.md
+LICENSE
+.vscode
+.idea
+.DS_Store
