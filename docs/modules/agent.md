@@ -13,7 +13,7 @@
 | --- | --- |
 | `types.go` | `OperationLevel`(readonly < operator < full)、消息/工具调用类型、`RunResult`、`ErrMaxSteps` |
 | `registry.go` | `Registry`:按操作级别过滤工具、排序定义、执行时做 JSON 校验并把错误回传给模型 |
-| `loop.go` | `Loop.Run`:系统提示词 + 事件 JSON → 多轮 `Complete` → 工具执行 → 最终中文报告;工具输出超限截断(UTF-8 安全) |
+| `loop.go` | `Loop.Run`:系统提示词 + 事件 JSON → 多轮 `Complete` → 工具执行 → 最终中文报告;工具输出双上限截断(UTF-8 安全):喂模型按 `AGENT_MAX_TOOL_OUTPUT`,落库按更宽的 `AGENT_MAX_STORED_TOOL_OUTPUT` 并置 `output_truncated` 标记 |
 | `openai.go` | `OpenAIClient`:OpenAI 兼容 `/chat/completions`;429/5xx 重试最多 3 次,尊重 `Retry-After`;4xx 不重试 |
 | `orchestrator.go` | `Orchestrator`:`Submit`(校验→Claim→入队)→ worker 池 `investigate`(限时运行 + 落库)→ `Close` 排空 |
 | `server.go` | HTTP API:事件接收、报告查询、健康探针 |
@@ -53,7 +53,7 @@
 
 ## 测试
 
-- `loop_test.go`:`modelFunc` 桩覆盖工具调用、错误回传、最大轮数、截断;
+- `loop_test.go`:`modelFunc` 桩覆盖工具调用、错误回传、最大轮数、截断(模型视图与落库双上限);
 - `openai_test.go`:httptest 假服务器覆盖重试与错误;
 - `orchestrator_test.go`:完成/失败/重复/非法事件/队列满五个场景;
 - `server_test.go`:gin 测试路由覆盖鉴权、去重、校验、查询、探针。

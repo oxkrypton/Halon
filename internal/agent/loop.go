@@ -24,18 +24,19 @@ Rules:
 6. Finish without a tool call when the investigation is complete. Write the final response as a Chinese Markdown report with these sections: 事件摘要、排查过程、根因分析、证据、执行操作、修复验证、后续建议. If evidence is insufficient, explicitly say 无法确定根因.`
 
 type Loop struct {
-	model         Model
-	registry      *Registry
-	maxSteps      int
-	maxToolOutput int
-	logger        *slog.Logger
+	model           Model
+	registry        *Registry
+	maxSteps        int
+	maxToolOutput   int
+	maxStoredOutput int
+	logger          *slog.Logger
 }
 
-func NewLoop(model Model, registry *Registry, maxSteps int, maxToolOutput int, logger *slog.Logger) *Loop {
+func NewLoop(model Model, registry *Registry, maxSteps, maxToolOutput, maxStoredOutput int, logger *slog.Logger) *Loop {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Loop{model: model, registry: registry, maxSteps: maxSteps, maxToolOutput: maxToolOutput, logger: logger}
+	return &Loop{model: model, registry: registry, maxSteps: maxSteps, maxToolOutput: maxToolOutput, maxStoredOutput: maxStoredOutput, logger: logger}
 }
 
 func (l *Loop) Run(ctx context.Context, event incident.TimeoutEvent, level OperationLevel) (RunResult, error) {
@@ -75,8 +76,11 @@ func (l *Loop) Run(ctx context.Context, event incident.TimeoutEvent, level Opera
 			output, execution := l.registry.Execute(ctx, call)
 			execution.StartedAt = started.UTC()
 			execution.DurationMS = float64(time.Since(started)) / float64(time.Millisecond)
-			output = truncateToolOutput(output, l.maxToolOutput)
-			execution.Output = output
+			// Persist against the generous storage cap so incident reports
+			// keep full evidence; only the model feedback message is bound
+			// by the smaller context cap.
+			execution.Output = truncateToolOutput(output, l.maxStoredOutput)
+			execution.OutputTruncated = l.maxStoredOutput > 0 && len(output) > l.maxStoredOutput
 			result.Executions = append(result.Executions, execution)
 			l.logger.Info("agent tool executed",
 				"event_id", event.EventID,
@@ -88,7 +92,7 @@ func (l *Loop) Run(ctx context.Context, event incident.TimeoutEvent, level Opera
 			)
 			messages = append(messages, Message{
 				Role:       "tool",
-				Content:    stringPointer(output),
+				Content:    stringPointer(truncateToolOutput(output, l.maxToolOutput)),
 				ToolCallID: call.ID,
 				Name:       call.Function.Name,
 			})

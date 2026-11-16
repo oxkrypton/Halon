@@ -337,7 +337,8 @@ kubectl rollout restart deployment/agent
 | `K8S_MAX_REPLICAS` | `5` | Deployment 扩容上限 |
 | `K8S_ACTION_COOLDOWN` | `2m` | 同一对象两次变更操作的最小间隔 |
 | `AGENT_MAX_STEPS` | `12` | 单次排查的最大模型轮数 |
-| `AGENT_MAX_TOOL_OUTPUT` | `4096` | 单次工具返回的最大字节数 |
+| `AGENT_MAX_TOOL_OUTPUT` | `4096` | 喂回模型的单次工具输出上限(字节),保护模型上下文 |
+| `AGENT_MAX_STORED_TOOL_OUTPUT` | `262144`(256 KiB) | 工具输出落库(`incident_reports.executions`)的上限(字节),超出部分截断并置 `output_truncated` |
 | `AGENT_WORKERS` / `AGENT_QUEUE_SIZE` | `2` / `64` | 排查 worker 数与事件队列容量 |
 | `AGENT_RUN_TIMEOUT` | `5m` | 单次排查的超时时间 |
 | `AGENT_DEDUP_TTL` | `10m` | 事件去重窗口 |

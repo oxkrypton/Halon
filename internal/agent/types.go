@@ -100,9 +100,14 @@ type ToolExecution struct {
 	Arguments  string         `json:"arguments"`
 	Level      OperationLevel `json:"level"`
 	Output     string         `json:"output"`
-	Error      string         `json:"error,omitempty"`
-	StartedAt  time.Time      `json:"started_at"`
-	DurationMS float64        `json:"duration_ms"`
+	// OutputTruncated is true when Output was capped by the persistence
+	// limit (AGENT_MAX_STORED_TOOL_OUTPUT). The smaller model-context cap
+	// (AGENT_MAX_TOOL_OUTPUT) only applies to the message fed back to the
+	// model and never affects this persisted record.
+	OutputTruncated bool      `json:"output_truncated,omitempty"`
+	Error           string    `json:"error,omitempty"`
+	StartedAt       time.Time `json:"started_at"`
+	DurationMS      float64   `json:"duration_ms"`
 }
 
 type RunResult struct {

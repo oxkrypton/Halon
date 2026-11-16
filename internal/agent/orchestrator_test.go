@@ -55,7 +55,7 @@ func newTestOrchestrator(model Model, store ReportStore, queueSize int) *Orchest
 			return map[string]bool{"ok": true}, nil
 		},
 	})
-	loop := NewLoop(model, registry, 3, 1024, testLogger())
+	loop := NewLoop(model, registry, 3, 1024, 4096, testLogger())
 	return NewOrchestrator(loop, store, OrchestratorOptions{
 		Level: LevelReadOnly, Workers: 1, QueueSize: queueSize,
 		RunTimeout: 5 * time.Second, Logger: testLogger(),

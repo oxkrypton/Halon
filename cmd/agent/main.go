@@ -99,7 +99,7 @@ func run(logger *slog.Logger) error {
 	}
 
 	model := agent.NewOpenAIClient(cfg.OpenAIBaseURL, cfg.OpenAIAPIKey, cfg.OpenAIModel, cfg.OpenAITimeout)
-	loop := agent.NewLoop(model, registry, cfg.MaxSteps, cfg.MaxToolOutput, logger)
+	loop := agent.NewLoop(model, registry, cfg.MaxSteps, cfg.MaxToolOutput, cfg.MaxStoredToolOutput, logger)
 	orchestrator := agent.NewOrchestrator(loop, store, agent.OrchestratorOptions{
 		Level:      cfg.OperationLevel,
 		Workers:    cfg.Workers,

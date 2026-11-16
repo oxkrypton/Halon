@@ -54,7 +54,7 @@ func TestLoopExecutesToolsAndReturnsFinalReport(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	loop := NewLoop(model, registry, 4, 1024, testLogger())
+	loop := NewLoop(model, registry, 4, 1024, 4096, testLogger())
 	result, err := loop.Run(context.Background(), testEvent(), LevelReadOnly)
 	if err != nil {
 		t.Fatal(err)
@@ -112,7 +112,7 @@ func TestLoopReturnsToolErrorsToModel(t *testing.T) {
 	registry, _ := NewRegistry(LevelReadOnly, Tool{Name: "read", Description: "Read", Handler: func(context.Context, json.RawMessage) (any, error) {
 		return nil, errors.New("database unavailable")
 	}})
-	result, err := NewLoop(model, registry, 3, 1024, testLogger()).Run(context.Background(), testEvent(), LevelReadOnly)
+	result, err := NewLoop(model, registry, 3, 1024, 4096, testLogger()).Run(context.Background(), testEvent(), LevelReadOnly)
 	if err != nil || result.FinalMessage != "无法确定根因" || result.Executions[0].Error == "" {
 		t.Fatalf("result = %+v, err = %v", result, err)
 	}
@@ -125,7 +125,7 @@ func TestLoopStopsAtMaxSteps(t *testing.T) {
 	registry, _ := NewRegistry(LevelReadOnly, Tool{Name: "read", Description: "Read", Handler: func(context.Context, json.RawMessage) (any, error) {
 		return map[string]bool{"ok": true}, nil
 	}})
-	result, err := NewLoop(model, registry, 2, 1024, testLogger()).Run(context.Background(), testEvent(), LevelReadOnly)
+	result, err := NewLoop(model, registry, 2, 1024, 4096, testLogger()).Run(context.Background(), testEvent(), LevelReadOnly)
 	if !errors.Is(err, ErrMaxSteps) || result.Steps != 2 || len(result.Executions) != 2 {
 		t.Fatalf("result = %+v, err = %v", result, err)
 	}
@@ -148,4 +148,59 @@ func testEvent() incident.TimeoutEvent {
 
 func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+func TestLoopPersistsFullToolOutputBeyondModelLimit(t *testing.T) {
+	full := strings.Repeat("x", 5000)
+	calls := 0
+	modelView := ""
+	model := modelFunc(func(_ context.Context, messages []Message, _ []ToolDefinition) (Message, Usage, error) {
+		calls++
+		if calls == 1 {
+			return Message{ToolCalls: []ToolCall{{ID: "big", Function: FunctionCall{Name: "read", Arguments: `{}`}}}}, Usage{}, nil
+		}
+		last := messages[len(messages)-1]
+		if last.Role != "tool" || last.Content == nil {
+			t.Fatalf("expected tool message, got %+v", last)
+		}
+		modelView = *last.Content
+		return NewTextMessage("assistant", "done"), Usage{}, nil
+	})
+	registry, _ := NewRegistry(LevelReadOnly, Tool{Name: "read", Description: "Read", Handler: func(context.Context, json.RawMessage) (any, error) {
+		return full, nil
+	}})
+	result, err := NewLoop(model, registry, 3, 1024, 8192, testLogger()).Run(context.Background(), testEvent(), LevelReadOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(modelView, "[tool output truncated]") || len(modelView) > 1024+64 {
+		t.Fatalf("model view not capped at context limit: %d bytes", len(modelView))
+	}
+	stored := result.Executions[0].Output
+	if !strings.Contains(stored, full) || result.Executions[0].OutputTruncated {
+		t.Fatalf("stored output lost evidence: %d bytes, truncated=%v", len(stored), result.Executions[0].OutputTruncated)
+	}
+}
+
+func TestLoopMarksStoredToolOutputTruncated(t *testing.T) {
+	full := strings.Repeat("y", 5000)
+	calls := 0
+	model := modelFunc(func(_ context.Context, _ []Message, _ []ToolDefinition) (Message, Usage, error) {
+		calls++
+		if calls == 1 {
+			return Message{ToolCalls: []ToolCall{{ID: "big", Function: FunctionCall{Name: "read", Arguments: `{}`}}}}, Usage{}, nil
+		}
+		return NewTextMessage("assistant", "done"), Usage{}, nil
+	})
+	registry, _ := NewRegistry(LevelReadOnly, Tool{Name: "read", Description: "Read", Handler: func(context.Context, json.RawMessage) (any, error) {
+		return full, nil
+	}})
+	result, err := NewLoop(model, registry, 3, 1024, 2048, testLogger()).Run(context.Background(), testEvent(), LevelReadOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	execution := result.Executions[0]
+	if !execution.OutputTruncated || !strings.Contains(execution.Output, "[tool output truncated]") || len(execution.Output) > 2048+64 {
+		t.Fatalf("stored output = %d bytes, truncated=%v", len(execution.Output), execution.OutputTruncated)
+	}
 }

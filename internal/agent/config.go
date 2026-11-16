@@ -29,12 +29,16 @@ type Config struct {
 	K8sActionCooldown time.Duration
 	MaxSteps          int
 	MaxToolOutput     int
-	Workers           int
-	QueueSize         int
-	RunTimeout        time.Duration
-	DedupTTL          time.Duration
-	OpenAITimeout     time.Duration
-	ShutdownTimeout   time.Duration
+	// MaxStoredToolOutput caps tool output persisted in incident reports.
+	// It is deliberately much larger than MaxToolOutput, which only bounds
+	// the output fed back into the model context.
+	MaxStoredToolOutput int
+	Workers             int
+	QueueSize           int
+	RunTimeout          time.Duration
+	DedupTTL            time.Duration
+	OpenAITimeout       time.Duration
+	ShutdownTimeout     time.Duration
 
 	// Shared state (optional). RedisURL empty keeps the single-replica
 	// in-memory mode; non-empty enables the shared multi-replica mode.
@@ -45,30 +49,31 @@ type Config struct {
 
 func LoadConfig() (Config, error) {
 	cfg := Config{
-		HTTPAddr:          envString("HTTP_ADDR", ":8081"),
-		DatabaseDSN:       os.Getenv("DATABASE_DSN"),
-		IngestToken:       os.Getenv("INGEST_TOKEN"),
-		OpenAIBaseURL:     envString("OPENAI_BASE_URL", "https://api.openai.com/v1"),
-		OpenAIAPIKey:      os.Getenv("OPENAI_API_KEY"),
-		OpenAIModel:       os.Getenv("OPENAI_MODEL"),
-		PrometheusURL:     os.Getenv("PROMETHEUS_URL"),
-		GatewayAdminURL:   os.Getenv("GATEWAY_ADMIN_URL"),
-		GatewayAdminToken: os.Getenv("GATEWAY_ADMIN_TOKEN"),
-		GinMode:           envString("GIN_MODE", "release"),
-		K8sNamespaces:     splitCSV(envString("K8S_NAMESPACES", "default")),
-		K8sMaxReplicas:    5,
-		K8sActionCooldown: 2 * time.Minute,
-		MaxSteps:          12,
-		MaxToolOutput:     4096,
-		Workers:           2,
-		QueueSize:         64,
-		RunTimeout:        5 * time.Minute,
-		DedupTTL:          10 * time.Minute,
-		OpenAITimeout:     60 * time.Second,
-		ShutdownTimeout:   30 * time.Second,
-		RedisURL:          os.Getenv("REDIS_URL"),
-		RedisDialTimeout:  time.Second,
-		RedisOpTimeout:    500 * time.Millisecond,
+		HTTPAddr:            envString("HTTP_ADDR", ":8081"),
+		DatabaseDSN:         os.Getenv("DATABASE_DSN"),
+		IngestToken:         os.Getenv("INGEST_TOKEN"),
+		OpenAIBaseURL:       envString("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+		OpenAIAPIKey:        os.Getenv("OPENAI_API_KEY"),
+		OpenAIModel:         os.Getenv("OPENAI_MODEL"),
+		PrometheusURL:       os.Getenv("PROMETHEUS_URL"),
+		GatewayAdminURL:     os.Getenv("GATEWAY_ADMIN_URL"),
+		GatewayAdminToken:   os.Getenv("GATEWAY_ADMIN_TOKEN"),
+		GinMode:             envString("GIN_MODE", "release"),
+		K8sNamespaces:       splitCSV(envString("K8S_NAMESPACES", "default")),
+		K8sMaxReplicas:      5,
+		K8sActionCooldown:   2 * time.Minute,
+		MaxSteps:            12,
+		MaxToolOutput:       4096,
+		MaxStoredToolOutput: 256 * 1024,
+		Workers:             2,
+		QueueSize:           64,
+		RunTimeout:          5 * time.Minute,
+		DedupTTL:            10 * time.Minute,
+		OpenAITimeout:       60 * time.Second,
+		ShutdownTimeout:     30 * time.Second,
+		RedisURL:            os.Getenv("REDIS_URL"),
+		RedisDialTimeout:    time.Second,
+		RedisOpTimeout:      500 * time.Millisecond,
 	}
 
 	var err error
@@ -82,6 +87,9 @@ func LoadConfig() (Config, error) {
 		return Config{}, err
 	}
 	if cfg.MaxToolOutput, err = envInt("AGENT_MAX_TOOL_OUTPUT", cfg.MaxToolOutput); err != nil {
+		return Config{}, err
+	}
+	if cfg.MaxStoredToolOutput, err = envInt("AGENT_MAX_STORED_TOOL_OUTPUT", cfg.MaxStoredToolOutput); err != nil {
 		return Config{}, err
 	}
 	if cfg.Workers, err = envInt("AGENT_WORKERS", cfg.Workers); err != nil {
@@ -134,8 +142,8 @@ func LoadConfig() (Config, error) {
 	if cfg.K8sMaxReplicas <= 0 || cfg.K8sActionCooldown <= 0 {
 		validationErrors = append(validationErrors, errors.New("kubernetes limits must be positive"))
 	}
-	if cfg.MaxSteps <= 0 || cfg.MaxToolOutput <= 0 || cfg.Workers <= 0 || cfg.QueueSize <= 0 {
-		validationErrors = append(validationErrors, errors.New("agent steps, tool output, workers, and queue size must be positive"))
+	if cfg.MaxSteps <= 0 || cfg.MaxToolOutput <= 0 || cfg.MaxStoredToolOutput <= 0 || cfg.Workers <= 0 || cfg.QueueSize <= 0 {
+		validationErrors = append(validationErrors, errors.New("agent steps, tool output limits, workers, and queue size must be positive"))
 	}
 	if cfg.RunTimeout <= 0 || cfg.DedupTTL <= 0 || cfg.OpenAITimeout <= 0 || cfg.ShutdownTimeout <= 0 {
 		validationErrors = append(validationErrors, errors.New("timeouts and dedup TTL must be positive"))
