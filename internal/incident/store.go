@@ -120,6 +120,21 @@ func (s *Store) Claim(ctx context.Context, event TimeoutEvent) (bool, error) {
 	return result.RowsAffected == 1, nil
 }
 
+// MarkProcessing records that an investigation has started.
+func (s *Store) MarkProcessing(ctx context.Context, eventID string, startedAt time.Time) error {
+	result := s.db.WithContext(ctx).Model(&Report{}).
+		Where("event_id = ? AND status = ?", eventID, StatusQueued).
+		Updates(map[string]any{
+			"status":     StatusProcessing,
+			"started_at": startedAt,
+			"updated_at": time.Now().UTC(),
+		})
+	if result.Error != nil {
+		return fmt.Errorf("mark incident processing: %w", result.Error)
+	}
+	return nil
+}
+
 // SaveResult writes the finished investigation outcome for a claimed event.
 func (s *Store) SaveResult(ctx context.Context, report Report) error {
 	updates := map[string]any{
