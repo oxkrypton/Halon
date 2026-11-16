@@ -39,7 +39,7 @@ spec:
             # works when examples/user-service is deployed; replace it with
             # your own services.
             - name: ROUTES
-              value: /api/v1/users/=http://user-service:8090
+              value: /api/v1/users/=http://user-service:8090,/api/v1/orders/=http://order-service:8092
             - name: UPSTREAM_TIMEOUT
               value: 3s
             - name: RATE_LIMIT_RPS
