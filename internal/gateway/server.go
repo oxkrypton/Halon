@@ -8,6 +8,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	userv1 "github.com/oxkrypton/Halon/api/gen/user/v1"
+	"github.com/oxkrypton/Halon/internal/incident"
 	"github.com/oxkrypton/Halon/internal/trafficlog"
 	"google.golang.org/grpc"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
@@ -26,9 +27,11 @@ type Dependencies struct {
 	HealthClient         HealthChecker
 	Repository           Pinger
 	LogQueue             chan<- trafficlog.Entry
+	TimeoutQueue         chan<- incident.TimeoutEvent
 	Logger               *slog.Logger
 	Rules                *IPRules
 	Limiter              *RateLimiter
+	Metrics              *Metrics
 	RPCTimeout           time.Duration
 	SlowRequestThreshold time.Duration
 	BodyCaptureLimit     int64
@@ -39,7 +42,14 @@ func NewHTTPHandler(dependencies Dependencies) *gin.Engine {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	router := newRouter(logger, AccessLog(dependencies.LogQueue, dependencies.SlowRequestThreshold, dependencies.BodyCaptureLimit, logger))
+	router := newRouter(logger, AccessLog(AccessLogOptions{
+		Queue:         dependencies.LogQueue,
+		TimeoutQueue:  dependencies.TimeoutQueue,
+		SlowThreshold: dependencies.SlowRequestThreshold,
+		CaptureLimit:  dependencies.BodyCaptureLimit,
+		Logger:        logger,
+		Metrics:       dependencies.Metrics,
+	}))
 
 	router.GET("/healthz", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
@@ -52,11 +62,14 @@ func NewHTTPHandler(dependencies Dependencies) *gin.Engine {
 	return router
 }
 
-func NewAdminHandler(token string, rules *IPRules, limiter *RateLimiter, logger *slog.Logger) *gin.Engine {
+func NewAdminHandler(token string, rules *IPRules, limiter *RateLimiter, logger *slog.Logger, metrics *Metrics) *gin.Engine {
 	router := newRouter(logger)
 	router.GET("/healthz", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
+	if metrics != nil {
+		router.GET("/metrics", gin.WrapH(metrics.Handler()))
+	}
 
 	admin := router.Group("/admin/rules", adminAuthentication(token))
 	admin.GET("/blacklist", func(c *gin.Context) {

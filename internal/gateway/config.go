@@ -15,11 +15,14 @@ type Config struct {
 	UserServiceAddr      string
 	DatabaseDSN          string
 	AdminToken           string
+	AgentWebhookURL      string
+	AgentWebhookToken    string
 	GinMode              string
 	RateLimitRPS         float64
 	RateLimitBurst       int
 	LogQueueSize         int
 	LogBatchSize         int
+	TimeoutQueueSize     int
 	LogFlushInterval     time.Duration
 	RPCTimeout           time.Duration
 	SlowRequestThreshold time.Duration
@@ -34,11 +37,14 @@ func LoadConfig() (Config, error) {
 		UserServiceAddr:      envString("USER_SERVICE_ADDR", "localhost:50051"),
 		DatabaseDSN:          os.Getenv("DATABASE_DSN"),
 		AdminToken:           os.Getenv("ADMIN_TOKEN"),
+		AgentWebhookURL:      os.Getenv("AGENT_WEBHOOK_URL"),
+		AgentWebhookToken:    os.Getenv("AGENT_WEBHOOK_TOKEN"),
 		GinMode:              envString("GIN_MODE", "release"),
 		RateLimitRPS:         20,
 		RateLimitBurst:       40,
 		LogQueueSize:         1024,
 		LogBatchSize:         500,
+		TimeoutQueueSize:     64,
 		LogFlushInterval:     time.Second,
 		RPCTimeout:           3 * time.Second,
 		SlowRequestThreshold: time.Second,
@@ -57,6 +63,9 @@ func LoadConfig() (Config, error) {
 		return Config{}, err
 	}
 	if cfg.LogBatchSize, err = envInt("LOG_BATCH_SIZE", cfg.LogBatchSize); err != nil {
+		return Config{}, err
+	}
+	if cfg.TimeoutQueueSize, err = envInt("TIMEOUT_QUEUE_SIZE", cfg.TimeoutQueueSize); err != nil {
 		return Config{}, err
 	}
 	if cfg.LogFlushInterval, err = envDuration("LOG_FLUSH_INTERVAL", cfg.LogFlushInterval); err != nil {
@@ -82,14 +91,17 @@ func LoadConfig() (Config, error) {
 	if len(cfg.AdminToken) < 12 {
 		validationErrors = append(validationErrors, errors.New("ADMIN_TOKEN must contain at least 12 characters"))
 	}
+	if cfg.AgentWebhookURL != "" && len(cfg.AgentWebhookToken) < 12 {
+		validationErrors = append(validationErrors, errors.New("AGENT_WEBHOOK_TOKEN must contain at least 12 characters when AGENT_WEBHOOK_URL is set"))
+	}
 	if cfg.GinMode != "release" && cfg.GinMode != "debug" && cfg.GinMode != "test" {
 		validationErrors = append(validationErrors, errors.New("GIN_MODE must be release, debug, or test"))
 	}
 	if math.IsNaN(cfg.RateLimitRPS) || math.IsInf(cfg.RateLimitRPS, 0) || cfg.RateLimitRPS <= 0 || cfg.RateLimitBurst <= 0 {
 		validationErrors = append(validationErrors, errors.New("rate limit values must be positive"))
 	}
-	if cfg.LogQueueSize <= 0 || cfg.LogBatchSize <= 0 || cfg.LogFlushInterval <= 0 {
-		validationErrors = append(validationErrors, errors.New("log queue, batch size, and flush interval must be positive"))
+	if cfg.LogQueueSize <= 0 || cfg.LogBatchSize <= 0 || cfg.TimeoutQueueSize <= 0 || cfg.LogFlushInterval <= 0 {
+		validationErrors = append(validationErrors, errors.New("log queues, batch size, and flush interval must be positive"))
 	}
 	if cfg.RPCTimeout <= 0 || cfg.SlowRequestThreshold <= 0 || cfg.BodyCaptureLimit <= 0 || cfg.ShutdownTimeout <= 0 {
 		validationErrors = append(validationErrors, errors.New("timeouts and body capture limit must be positive"))

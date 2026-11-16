@@ -175,7 +175,7 @@ func TestReadinessChecksDependencies(t *testing.T) {
 
 func TestAdminAuthenticationAndRules(t *testing.T) {
 	fixture := newFixture(userClientStub{response: &userv1.GetUserResponse{User: &userv1.User{Id: "1", Name: "Alice"}}})
-	admin := NewAdminHandler(testAdminToken, fixture.rules, fixture.limiter, testLogger())
+	admin := NewAdminHandler(testAdminToken, fixture.rules, fixture.limiter, testLogger(), nil)
 
 	unauthorized := httptest.NewRecorder()
 	admin.ServeHTTP(unauthorized, httptest.NewRequest(http.MethodGet, "/admin/rules/blacklist", nil))
@@ -210,7 +210,7 @@ func TestAdminAuthenticationAndRules(t *testing.T) {
 
 func TestDynamicRateLimit(t *testing.T) {
 	fixture := newFixture(userClientStub{response: &userv1.GetUserResponse{User: &userv1.User{Id: "1"}}})
-	admin := NewAdminHandler(testAdminToken, fixture.rules, fixture.limiter, testLogger())
+	admin := NewAdminHandler(testAdminToken, fixture.rules, fixture.limiter, testLogger(), nil)
 	request := httptest.NewRequest(http.MethodPut, "/admin/rules/rate-limit", strings.NewReader(`{"requests_per_second":1,"burst":1}`))
 	request.Header.Set("Authorization", "Bearer "+testAdminToken)
 	request.Header.Set("Content-Type", "application/json")
@@ -233,7 +233,7 @@ func TestAccessLogCapturesRequestAndResponseBodies(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	queue := make(chan trafficlog.Entry, 1)
 	router := gin.New()
-	router.Use(RequestID(), AccessLog(queue, time.Second, 8, testLogger()), Recovery(testLogger()))
+	router.Use(RequestID(), AccessLog(AccessLogOptions{Queue: queue, SlowThreshold: time.Second, CaptureLimit: 8, Logger: testLogger()}), Recovery(testLogger()))
 	router.POST("/error", func(c *gin.Context) {
 		body, _ := io.ReadAll(c.Request.Body)
 		c.Data(http.StatusBadRequest, "text/plain", bytes.Repeat(body, 2))
@@ -252,7 +252,7 @@ func TestAccessLogQueueFullDoesNotBlockRequest(t *testing.T) {
 	queue := make(chan trafficlog.Entry, 1)
 	queue <- trafficlog.Entry{}
 	router := gin.New()
-	router.Use(RequestID(), AccessLog(queue, time.Second, 8, testLogger()))
+	router.Use(RequestID(), AccessLog(AccessLogOptions{Queue: queue, SlowThreshold: time.Second, CaptureLimit: 8, Logger: testLogger()}))
 	router.GET("/healthz", func(c *gin.Context) { c.Status(http.StatusOK) })
 	response := httptest.NewRecorder()
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/healthz", nil))

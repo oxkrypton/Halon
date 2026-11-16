@@ -14,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 	userv1 "github.com/oxkrypton/Halon/api/gen/user/v1"
 	"github.com/oxkrypton/Halon/internal/gateway"
+	"github.com/oxkrypton/Halon/internal/incident"
 	"github.com/oxkrypton/Halon/internal/trafficlog"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -66,19 +67,34 @@ func run(logger *slog.Logger) error {
 		close(writerDone)
 	}()
 
+	var timeoutQueue chan incident.TimeoutEvent
+	notifierDone := make(chan struct{})
+	if cfg.AgentWebhookURL != "" {
+		timeoutQueue = make(chan incident.TimeoutEvent, cfg.TimeoutQueueSize)
+		notifier := gateway.NewTimeoutNotifier(cfg.AgentWebhookURL, cfg.AgentWebhookToken, timeoutQueue, logger)
+		go func() {
+			notifier.Run()
+			close(notifierDone)
+		}()
+	} else {
+		close(notifierDone)
+	}
+	metrics := gateway.NewMetrics()
 	httpServer := newHTTPServer(cfg.HTTPAddr, gateway.NewHTTPHandler(gateway.Dependencies{
 		UserClient:           userv1.NewUserServiceClient(connection),
 		HealthClient:         healthpb.NewHealthClient(connection),
 		Repository:           repository,
 		LogQueue:             queue,
+		TimeoutQueue:         timeoutQueue,
 		Logger:               logger,
 		Rules:                rules,
 		Limiter:              limiter,
+		Metrics:              metrics,
 		RPCTimeout:           cfg.RPCTimeout,
 		SlowRequestThreshold: cfg.SlowRequestThreshold,
 		BodyCaptureLimit:     cfg.BodyCaptureLimit,
 	}))
-	adminServer := newHTTPServer(cfg.AdminAddr, gateway.NewAdminHandler(cfg.AdminToken, rules, limiter, logger))
+	adminServer := newHTTPServer(cfg.AdminAddr, gateway.NewAdminHandler(cfg.AdminToken, rules, limiter, logger, metrics))
 
 	serverErrors := make(chan error, 2)
 	go listen(httpServer, "http", serverErrors)
@@ -109,12 +125,20 @@ func run(logger *slog.Logger) error {
 		}
 	}
 
-	// Stop accepting logs only after all in-flight HTTP handlers have finished.
+	// Stop accepting events only after all in-flight HTTP handlers have finished.
 	close(queue)
+	if timeoutQueue != nil {
+		close(timeoutQueue)
+	}
 	select {
 	case <-writerDone:
 	case <-shutdownContext.Done():
 		shutdownResult = append(shutdownResult, errors.New("traffic log writer shutdown timed out"))
+	}
+	select {
+	case <-notifierDone:
+	case <-shutdownContext.Done():
+		shutdownResult = append(shutdownResult, errors.New("timeout notifier shutdown timed out"))
 	}
 	return errors.Join(append(shutdownResult, runError)...)
 }

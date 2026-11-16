@@ -30,6 +30,8 @@ func abortWithError(c *gin.Context, httpStatus int, code, message string) {
 	}})
 }
 
+const upstreamTimeoutKey = "upstream_timeout"
+
 type UserHandler struct {
 	client  userv1.UserServiceClient
 	timeout time.Duration
@@ -60,6 +62,7 @@ func handleUserRPCError(c *gin.Context, err error) {
 	case codes.NotFound:
 		abortWithError(c, http.StatusNotFound, "NOT_FOUND", rpcStatus.Message())
 	case codes.DeadlineExceeded:
+		c.Set(upstreamTimeoutKey, true)
 		abortWithError(c, http.StatusGatewayTimeout, "UPSTREAM_TIMEOUT", "user service request timed out")
 	case codes.Unavailable:
 		abortWithError(c, http.StatusServiceUnavailable, "UPSTREAM_UNAVAILABLE", "user service is unavailable")
