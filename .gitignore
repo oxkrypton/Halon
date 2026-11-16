@@ -1,0 +1,18 @@
+# macOS
+.DS_Store
+
+# Go
+/bin/
+/coverage.out
+*.test
+
+# Environment files
+.env
+.env.*
+
+# Editor settings
+.idea/
+.vscode/
+
+# Runtime files
+*.log
