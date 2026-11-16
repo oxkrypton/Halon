@@ -317,6 +317,10 @@ kubectl rollout restart deployment/agent
 | `OTEL_TRACES_SAMPLER_RATIO` | `1.0` | 采样比例(0–1,父 span 优先) |
 | `AGENT_WEBHOOK_URL` | 空 | Agent 超时事件接收地址,为空则不推送 |
 | `AGENT_WEBHOOK_TOKEN` | 空 | Agent 接收接口 Bearer Token,配置 URL 后必填 |
+| `REDIS_URL` | 空 | 共享状态 Redis 地址(如 `redis://redis:6379/0`);为空为内存模式(单副本),非空为共享模式(可多副本) |
+| `BLACKLIST_CACHE_TTL` | `10s` | 共享模式下黑名单进程内缓存的兜底刷新间隔 |
+| `REDIS_DIAL_TIMEOUT` | `1s` | Redis 拨号超时 |
+| `REDIS_OP_TIMEOUT` | `500ms` | Redis 单次操作超时(同时作为读写 socket 超时) |
 | `SHUTDOWN_TIMEOUT` | `10s` | 平滑退出超时 |
 
 ## Agent 配置
@@ -339,6 +343,9 @@ kubectl rollout restart deployment/agent
 | `AGENT_DEDUP_TTL` | `10m` | 事件去重窗口 |
 | `GATEWAY_ADMIN_URL` / `GATEWAY_ADMIN_TOKEN` | 空 | 网关管理接口地址与 Token,供封禁工具使用 |
 | `PROMETHEUS_URL` | 空 | Prometheus 查询地址,为空时 PromQL 工具不可用 |
+| `REDIS_URL` | 空 | 共享状态 Redis 地址;语义与网关一致,两端必须同时配置或同时留空 |
+| `REDIS_DIAL_TIMEOUT` | `1s` | Redis 拨号超时 |
+| `REDIS_OP_TIMEOUT` | `500ms` | Redis 单次操作超时(同时作为读写 socket 超时) |
 | `SHUTDOWN_TIMEOUT` | `30s` | 平滑退出超时 |
 
 ## 当前边界

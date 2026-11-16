@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // Config holds the agent service configuration loaded from the environment.
@@ -33,6 +35,12 @@ type Config struct {
 	DedupTTL          time.Duration
 	OpenAITimeout     time.Duration
 	ShutdownTimeout   time.Duration
+
+	// Shared state (optional). RedisURL empty keeps the single-replica
+	// in-memory mode; non-empty enables the shared multi-replica mode.
+	RedisURL         string
+	RedisDialTimeout time.Duration
+	RedisOpTimeout   time.Duration
 }
 
 func LoadConfig() (Config, error) {
@@ -58,6 +66,9 @@ func LoadConfig() (Config, error) {
 		DedupTTL:          10 * time.Minute,
 		OpenAITimeout:     60 * time.Second,
 		ShutdownTimeout:   30 * time.Second,
+		RedisURL:          os.Getenv("REDIS_URL"),
+		RedisDialTimeout:  time.Second,
+		RedisOpTimeout:    500 * time.Millisecond,
 	}
 
 	var err error
@@ -91,6 +102,12 @@ func LoadConfig() (Config, error) {
 	if cfg.ShutdownTimeout, err = envDuration("SHUTDOWN_TIMEOUT", cfg.ShutdownTimeout); err != nil {
 		return Config{}, err
 	}
+	if cfg.RedisDialTimeout, err = envDuration("REDIS_DIAL_TIMEOUT", cfg.RedisDialTimeout); err != nil {
+		return Config{}, err
+	}
+	if cfg.RedisOpTimeout, err = envDuration("REDIS_OP_TIMEOUT", cfg.RedisOpTimeout); err != nil {
+		return Config{}, err
+	}
 	if cfg.OperationLevel, err = ParseOperationLevel(envString("AGENT_OPERATION_LEVEL", string(LevelReadOnly))); err != nil {
 		return Config{}, err
 	}
@@ -122,6 +139,14 @@ func LoadConfig() (Config, error) {
 	}
 	if cfg.RunTimeout <= 0 || cfg.DedupTTL <= 0 || cfg.OpenAITimeout <= 0 || cfg.ShutdownTimeout <= 0 {
 		validationErrors = append(validationErrors, errors.New("timeouts and dedup TTL must be positive"))
+	}
+	if cfg.RedisURL != "" {
+		if _, err := redis.ParseURL(cfg.RedisURL); err != nil {
+			validationErrors = append(validationErrors, fmt.Errorf("REDIS_URL: %w", err))
+		}
+	}
+	if cfg.RedisDialTimeout <= 0 || cfg.RedisOpTimeout <= 0 {
+		validationErrors = append(validationErrors, errors.New("redis timeouts must be positive"))
 	}
 	return cfg, errors.Join(validationErrors...)
 }

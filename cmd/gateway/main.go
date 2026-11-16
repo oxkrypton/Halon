@@ -15,6 +15,7 @@ import (
 	"github.com/oxkrypton/Halon/internal/gateway"
 	"github.com/oxkrypton/Halon/internal/incident"
 	"github.com/oxkrypton/Halon/internal/trafficlog"
+	"github.com/redis/go-redis/v9"
 )
 
 func main() {
@@ -66,12 +67,39 @@ func run() error {
 	}
 	logger.Info("proxy routes loaded", "count", len(routes.Routes()))
 
+	metrics := gateway.NewMetrics()
+
+	// Optional shared-state mode: with REDIS_URL set, blacklist and rate
+	// limit live in Redis so multiple replicas can run. Ping failure does
+	// not abort startup; the stores degrade per the documented policies.
+	sharedStateMode := "memory"
+	var redisClient *redis.Client
+	if cfg.RedisURL != "" {
+		options, err := redis.ParseURL(cfg.RedisURL)
+		if err != nil {
+			return fmt.Errorf("parse REDIS_URL: %w", err)
+		}
+		options.DialTimeout = cfg.RedisDialTimeout
+		options.ReadTimeout = cfg.RedisOpTimeout
+		options.WriteTimeout = cfg.RedisOpTimeout
+		redisClient = redis.NewClient(options)
+		defer func() { _ = redisClient.Close() }()
+		pingContext, cancelPing := context.WithTimeout(context.Background(), cfg.RedisDialTimeout)
+		pingErr := redisClient.Ping(pingContext).Err()
+		cancelPing()
+		metrics.SetRedisUp(pingErr == nil)
+		if pingErr != nil {
+			logger.Warn("redis unreachable at startup; running with degraded shared state", "error", pingErr)
+		}
+		sharedStateMode = "redis"
+	}
+	logger.Info("shared state mode", "shared_state_mode", sharedStateMode)
+
 	rules, err := gateway.NewIPRules(nil)
 	if err != nil {
 		return err
 	}
 	limiter := gateway.NewRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst)
-	metrics := gateway.NewMetrics()
 
 	queue := make(chan trafficlog.Entry, cfg.LogQueueSize)
 	writer := trafficlog.NewBatchWriter(repository, queue, cfg.LogBatchSize, cfg.LogFlushInterval, logger)

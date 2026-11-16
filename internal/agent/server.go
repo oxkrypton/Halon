@@ -30,6 +30,7 @@ type ServerDeps struct {
 	Reports      ReportReader
 	IngestToken  string
 	Logger       *slog.Logger
+	Metrics      *Metrics
 }
 
 // NewHTTPHandler exposes the timeout incident ingest API and report queries.
@@ -57,6 +58,10 @@ func NewHTTPHandler(deps ServerDeps) *gin.Engine {
 		}
 		c.JSON(http.StatusOK, gin.H{"status": "ready", "checks": gin.H{"database": true}})
 	})
+
+	if deps.Metrics != nil {
+		router.GET("/metrics", gin.WrapH(deps.Metrics.Handler()))
+	}
 
 	api := router.Group("/api/v1", bearerAuth(deps.IngestToken))
 	api.POST("/incidents/timeout", ingestTimeout(deps, logger))

@@ -47,6 +47,20 @@ make deploy-observability   # kubectl apply -f deploy/kubernetes/observability/
 
 Loki 基数约定:`trace_id`、`route`、`status` 可做 label 或查询条件;`path`、`client_ip` 只作为日志字段检索,严禁进 label(Loki 高基数会显著拖慢)。
 
+### 可选共享状态 Redis(`deploy/kubernetes/redis/`)
+
+多副本前置组件,`make deploy` **不**包含它:
+
+```bash
+make deploy-redis   # kubectl apply -f deploy/kubernetes/redis/
+```
+
+参考清单为单副本 Redis 7 + Service,开启 `appendonly yes` / `appendfsync everysec`:共享模式下 Redis 是黑名单的事实源,重启不得静默清空;AOF 最坏丢失约 1s 的写入,恢复后经网关管理接口(`PUT /admin/rules/blacklist/:ip`)重放补齐即可。该清单面向开发与演练;生产请改用云厂商托管 Redis 或 Helm 的 HA(Sentinel/Cluster)部署。
+
+启用共享模式:给网关与 Agent 同时设置 `REDIS_URL`(参考清单对应 `redis://redis:6379/0`,清单里有注释好的示例)并滚动重启。**两端必须同时配置或同时留空**——一端共享、一端内存的"半共享态"属于配置错误;两端启动日志都会打 `shared_state_mode=redis|memory` 供核查。多套部署不要共用同一个 Redis logical DB(用 `REDIS_URL` 的 db 编号区分)。
+
+Redis 健康不进 `/readyz`(降级策略允许网关在 Redis 不可达时继续服务,摘除 Pod 反而中断全部流量),用指标表达:网关 `halon_gateway_redis_up`、Agent `halon_agent_redis_up`(新增 `/metrics` 端点),告警规则可并入观测栈。
+
 ### 适配任意 K8s 集群
 
 清单不绑定任何发行版,无 Minikube/云厂商专属 API:

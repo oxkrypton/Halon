@@ -55,6 +55,8 @@ type Metrics struct {
 	trafficlogDropped     prometheus.Counter
 	timeoutEventsDropped  prometheus.Counter
 	webhookNotifyFailures prometheus.Counter
+
+	redisUp prometheus.Gauge
 }
 
 func NewMetrics() *Metrics {
@@ -123,12 +125,18 @@ func NewMetrics() *Metrics {
 			Name: "halon_gateway_webhook_notify_failures_total",
 			Help: "Timeout incident webhook deliveries that failed after all attempts.",
 		}),
+		redisUp: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "halon_gateway_redis_up",
+			Help: "Whether the shared-state Redis is reachable (1) or degraded (0). Always 1 in memory mode.",
+		}),
 	}
+	m.redisUp.Set(1)
 	m.registry.MustRegister(
 		m.requests, m.duration, m.inFlight, m.respSize, m.rejected,
 		m.upstreamRequests, m.upstreamDuration, m.upstreamInFlight,
 		m.retries, m.retriesExhausted, m.breakerState, m.breakerTrips,
 		m.trafficlogDropped, m.timeoutEventsDropped, m.webhookNotifyFailures,
+		m.redisUp,
 	)
 	return m
 }
@@ -223,6 +231,19 @@ func (m *Metrics) IncWebhookNotifyFailures() {
 	if m != nil {
 		m.webhookNotifyFailures.Inc()
 	}
+}
+
+// SetRedisUp records shared-state Redis reachability. In memory mode it is
+// simply never called and the gauge stays at its initial 1.
+func (m *Metrics) SetRedisUp(up bool) {
+	if m == nil {
+		return
+	}
+	if up {
+		m.redisUp.Set(1)
+		return
+	}
+	m.redisUp.Set(0)
 }
 
 func (m *Metrics) Handler() http.Handler {

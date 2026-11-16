@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -48,6 +49,34 @@ func run(logger *slog.Logger) error {
 	if err := store.Migrate(); err != nil {
 		return err
 	}
+
+	metrics := agent.NewMetrics()
+
+	// Optional shared-state mode: with REDIS_URL set, action cooldowns are
+	// arbitrated in Redis so multiple replicas can run. Ping failure does
+	// not abort startup; mutation tools reject actions while degraded.
+	sharedStateMode := "memory"
+	var redisClient *redis.Client
+	if cfg.RedisURL != "" {
+		options, err := redis.ParseURL(cfg.RedisURL)
+		if err != nil {
+			return fmt.Errorf("parse REDIS_URL: %w", err)
+		}
+		options.DialTimeout = cfg.RedisDialTimeout
+		options.ReadTimeout = cfg.RedisOpTimeout
+		options.WriteTimeout = cfg.RedisOpTimeout
+		redisClient = redis.NewClient(options)
+		defer func() { _ = redisClient.Close() }()
+		pingContext, cancelPing := context.WithTimeout(context.Background(), cfg.RedisDialTimeout)
+		pingErr := redisClient.Ping(pingContext).Err()
+		cancelPing()
+		metrics.SetRedisUp(pingErr == nil)
+		if pingErr != nil {
+			logger.Warn("redis unreachable at startup; running with degraded shared state", "error", pingErr)
+		}
+		sharedStateMode = "redis"
+	}
+	logger.Info("shared state mode", "shared_state_mode", sharedStateMode)
 
 	clientset, err := kubernetesClientset()
 	if err != nil {
@@ -92,6 +121,7 @@ func run(logger *slog.Logger) error {
 			Reports:      store,
 			IngestToken:  cfg.IngestToken,
 			Logger:       logger,
+			Metrics:      metrics,
 		}),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,

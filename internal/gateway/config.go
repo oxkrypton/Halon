@@ -8,6 +8,8 @@ import (
 	"os"
 	"strconv"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 const (
@@ -59,6 +61,13 @@ type Config struct {
 	OTELEnabled            bool
 	OTELExporterEndpoint   string
 	OTELTracesSamplerRatio float64
+
+	// Shared state (optional). RedisURL empty keeps the single-replica
+	// in-memory mode; non-empty enables the shared multi-replica mode.
+	RedisURL          string
+	BlacklistCacheTTL time.Duration
+	RedisDialTimeout  time.Duration
+	RedisOpTimeout    time.Duration
 }
 
 func LoadConfig() (Config, error) {
@@ -100,6 +109,11 @@ func LoadConfig() (Config, error) {
 		// otlptracegrpc expects host:port without a scheme.
 		OTELExporterEndpoint:   "otel-collector.observability.svc.cluster.local:4317",
 		OTELTracesSamplerRatio: 1.0,
+
+		RedisURL:          os.Getenv("REDIS_URL"),
+		BlacklistCacheTTL: 10 * time.Second,
+		RedisDialTimeout:  time.Second,
+		RedisOpTimeout:    500 * time.Millisecond,
 	}
 
 	var err error
@@ -196,6 +210,17 @@ func LoadConfig() (Config, error) {
 		return Config{}, err
 	}
 
+	// Shared state (optional).
+	if cfg.BlacklistCacheTTL, err = envDuration("BLACKLIST_CACHE_TTL", cfg.BlacklistCacheTTL); err != nil {
+		return Config{}, err
+	}
+	if cfg.RedisDialTimeout, err = envDuration("REDIS_DIAL_TIMEOUT", cfg.RedisDialTimeout); err != nil {
+		return Config{}, err
+	}
+	if cfg.RedisOpTimeout, err = envDuration("REDIS_OP_TIMEOUT", cfg.RedisOpTimeout); err != nil {
+		return Config{}, err
+	}
+
 	var validationErrors []error
 	if _, err := ParseRoutes(cfg.Routes); err != nil {
 		validationErrors = append(validationErrors, fmt.Errorf("ROUTES: %w", err))
@@ -250,6 +275,14 @@ func LoadConfig() (Config, error) {
 	}
 	if math.IsNaN(cfg.OTELTracesSamplerRatio) || cfg.OTELTracesSamplerRatio < 0 || cfg.OTELTracesSamplerRatio > 1 {
 		validationErrors = append(validationErrors, errors.New("OTEL_TRACES_SAMPLER_RATIO must be between 0 and 1"))
+	}
+	if cfg.RedisURL != "" {
+		if _, err := redis.ParseURL(cfg.RedisURL); err != nil {
+			validationErrors = append(validationErrors, fmt.Errorf("REDIS_URL: %w", err))
+		}
+	}
+	if cfg.BlacklistCacheTTL <= 0 || cfg.RedisDialTimeout <= 0 || cfg.RedisOpTimeout <= 0 {
+		validationErrors = append(validationErrors, errors.New("blacklist cache TTL and redis timeouts must be positive"))
 	}
 	return cfg, errors.Join(validationErrors...)
 }

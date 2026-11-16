@@ -115,6 +115,53 @@ func TestLoadConfigResilienceOverrides(t *testing.T) {
 	}
 }
 
+func TestLoadConfigSharedState(t *testing.T) {
+	t.Setenv("DATABASE_DSN", "postgres://localhost/halon")
+	t.Setenv("ADMIN_TOKEN", "test-admin-token")
+	t.Setenv("REDIS_URL", "redis://redis:6379/2")
+	t.Setenv("BLACKLIST_CACHE_TTL", "5s")
+	t.Setenv("REDIS_OP_TIMEOUT", "250ms")
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RedisURL != "redis://redis:6379/2" || cfg.BlacklistCacheTTL != 5*time.Second || cfg.RedisOpTimeout != 250*time.Millisecond {
+		t.Fatalf("shared state overrides not applied: %+v", cfg)
+	}
+}
+
+func TestLoadConfigSharedStateDefaults(t *testing.T) {
+	t.Setenv("DATABASE_DSN", "postgres://localhost/halon")
+	t.Setenv("ADMIN_TOKEN", "test-admin-token")
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RedisURL != "" || cfg.BlacklistCacheTTL != 10*time.Second || cfg.RedisDialTimeout != time.Second || cfg.RedisOpTimeout != 500*time.Millisecond {
+		t.Fatalf("unexpected shared state defaults: %+v", cfg)
+	}
+}
+
+func TestLoadConfigRejectsInvalidSharedState(t *testing.T) {
+	cases := map[string]map[string]string{
+		"unparseable redis url": {"REDIS_URL": "not a url"},
+		"zero cache ttl":        {"BLACKLIST_CACHE_TTL": "0s"},
+		"negative op timeout":   {"REDIS_OP_TIMEOUT": "-1s"},
+	}
+	for name, envs := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("DATABASE_DSN", "postgres://localhost/halon")
+			t.Setenv("ADMIN_TOKEN", "test-admin-token")
+			for key, value := range envs {
+				t.Setenv(key, value)
+			}
+			if _, err := LoadConfig(); err == nil {
+				t.Fatalf("LoadConfig() succeeded with %v", envs)
+			}
+		})
+	}
+}
+
 func TestIPRulesValidation(t *testing.T) {
 	rules, err := NewIPRules(nil)
 	if err != nil {
