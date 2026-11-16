@@ -50,7 +50,7 @@ func NewGatewayActionTool(kubernetes *KubernetesToolset, adminBaseURL, adminToke
 			if err != nil {
 				return nil, err
 			}
-			defer response.Body.Close()
+			defer func() { _ = response.Body.Close() }()
 			body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
 			if response.StatusCode < 200 || response.StatusCode >= 300 {
 				return nil, fmt.Errorf("gateway returned %s: %s", response.Status, strings.TrimSpace(string(body)))

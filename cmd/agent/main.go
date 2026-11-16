@@ -44,7 +44,7 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 	if err := store.Migrate(); err != nil {
 		return err
 	}

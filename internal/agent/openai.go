@@ -118,7 +118,7 @@ func (c *OpenAIClient) do(ctx context.Context, payload []byte) (completionResult
 	if err != nil {
 		return completionResult{}, fmt.Errorf("call OpenAI-compatible API: %w", err)
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(response.Body, 8<<20))
 	if err != nil {
 		return completionResult{}, err

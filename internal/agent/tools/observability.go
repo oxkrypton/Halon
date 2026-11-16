@@ -178,6 +178,7 @@ func queryErrorLogs(ctx context.Context, database *sql.DB, requestID, path strin
 		conditions = append(conditions, fmt.Sprintf("b.path = $%d", len(arguments)))
 	}
 	arguments = append(arguments, limit)
+	// #nosec G201 -- only fixed column names and $n placeholders are interpolated; all values stay parameterized.
 	query := fmt.Sprintf(`SELECT b.id, b.request_id, b.client_ip, b.method, b.path, b.status_code, b.latency_ms, b.created_at, e.request_body, e.response_body
 FROM base_logs b JOIN error_body e ON e.base_log_id = b.id
 WHERE %s ORDER BY b.created_at DESC LIMIT $%d`, strings.Join(conditions, " AND "), len(arguments))
@@ -234,6 +235,7 @@ func queryTopIPs(ctx context.Context, database *sql.DB, path string, minutes, li
 		filter = " AND path = $2"
 	}
 	arguments = append(arguments, limit)
+	// #nosec G201 -- the interpolated filter only adds a fixed " AND path = $2" clause; all values stay parameterized.
 	query := fmt.Sprintf(`SELECT client_ip, COUNT(*), COUNT(*) FILTER (WHERE status_code >= 400), AVG(latency_ms)
 FROM base_logs WHERE created_at >= NOW() - make_interval(mins => $1)%s GROUP BY client_ip ORDER BY COUNT(*) DESC LIMIT $%d`, filter, len(arguments))
 	ctx, cancel := queryContext(ctx)
@@ -273,7 +275,7 @@ func queryPrometheus(ctx context.Context, client *http.Client, baseURL, query, e
 	if err != nil {
 		return nil, err
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	var envelope struct {
 		Status string          `json:"status"`
 		Data   json.RawMessage `json:"data"`
@@ -284,7 +286,7 @@ func queryPrometheus(ctx context.Context, client *http.Client, baseURL, query, e
 		return nil, fmt.Errorf("decode Prometheus response: %w", err)
 	}
 	if response.StatusCode != http.StatusOK || envelope.Status != "success" {
-		return nil, fmt.Errorf("Prometheus query failed with %s: %s", response.Status, envelope.Error)
+		return nil, fmt.Errorf("prometheus query failed with %s: %s", response.Status, envelope.Error)
 	}
 	return map[string]any{"status": envelope.Status, "data": envelope.Data, "evaluation_time": evaluationTime, "query": query, "unix_time": strconv.FormatInt(time.Now().Unix(), 10)}, nil
 }

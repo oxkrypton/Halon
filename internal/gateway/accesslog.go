@@ -128,7 +128,7 @@ func AccessLog(options AccessLogOptions) gin.HandlerFunc {
 			"path", entry.Base.Path,
 			"status", entry.Base.Status,
 			"latency_ms", entry.Base.LatencyMS,
-			"upstream_timeout", timedOut == true,
+			"upstream_timeout", timedOut,
 		)
 	}
 }

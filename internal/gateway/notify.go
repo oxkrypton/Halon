@@ -59,7 +59,7 @@ func (n *TimeoutNotifier) send(event incident.TimeoutEvent) error {
 		response, err := n.client.Do(request)
 		if err == nil {
 			_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
-			response.Body.Close()
+			_ = response.Body.Close()
 			if response.StatusCode >= 200 && response.StatusCode < 300 {
 				cancel()
 				return nil

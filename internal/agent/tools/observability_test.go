@@ -17,7 +17,7 @@ func TestQueryErrorLogsUsesParametersAndReturnsRows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 	createdAt := time.Now().UTC()
 	rows := sqlmock.NewRows([]string{"id", "request_id", "client_ip", "method", "path", "status_code", "latency_ms", "created_at", "request_body", "response_body"}).
 		AddRow(1, "request-1", "127.0.0.1", "GET", "/api/v1/users/1", 504, 3000.0, createdAt, "", `{"error":"timeout"}`)
@@ -39,7 +39,7 @@ func TestObservabilityToolRejectsInvalidArguments(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 	tools := ObservabilityTools(database, "", nil)
 	_, err = tools[0].Handler(context.Background(), json.RawMessage(`{"limit":1000}`))
 	if err == nil {

@@ -108,7 +108,7 @@ func (o *Orchestrator) Submit(ctx context.Context, event incident.TimeoutEvent) 
 func (o *Orchestrator) Run() {
 	o.wg.Add(o.workers)
 	for i := 0; i < o.workers; i++ {
-		go o.work(i)
+		go o.work()
 	}
 	o.wg.Wait()
 	close(o.done)
@@ -120,7 +120,7 @@ func (o *Orchestrator) Close() {
 	<-o.done
 }
 
-func (o *Orchestrator) work(id int) {
+func (o *Orchestrator) work() {
 	defer o.wg.Done()
 	for event := range o.queue {
 		o.investigate(event)

@@ -264,6 +264,7 @@ func (k *KubernetesToolset) tools() []agent.Tool {
 				if err := k.allowAction("scale/" + input.Namespace + "/" + input.Name); err != nil {
 					return nil, err
 				}
+				// #nosec G115 -- input.Replicas is validated to 0..k.maxReplicas above.
 				desiredReplicas := int32(input.Replicas)
 				err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
 					deployment, err := k.client.AppsV1().Deployments(input.Namespace).Get(ctx, input.Name, metav1.GetOptions{})

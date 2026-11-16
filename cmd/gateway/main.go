@@ -39,7 +39,7 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	defer repository.Close()
+	defer func() { _ = repository.Close() }()
 	if err := repository.Migrate(); err != nil {
 		return err
 	}
