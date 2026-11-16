@@ -23,7 +23,7 @@ type Dependencies struct {
 	TimeoutQueue         chan<- incident.TimeoutEvent
 	Logger               *slog.Logger
 	Rules                BlacklistStore
-	Limiter              *RateLimiter
+	Limiter              RateLimitBackend
 	Metrics              *Metrics
 	Proxy                ProxyOptions
 	Resilience           *ResilienceSet
@@ -61,7 +61,7 @@ func NewHTTPHandler(dependencies Dependencies) *gin.Engine {
 	proxy.Resilience.Metrics = metrics
 	proxyMiddlewares := []gin.HandlerFunc{
 		BlacklistMiddleware(dependencies.Rules, func() { metrics.IncRejected(RejectReasonBlacklist) }),
-		dependencies.Limiter.Middleware(func() { metrics.IncRejected(RejectReasonRateLimit) }),
+		RateLimitMiddleware(dependencies.Limiter, func() { metrics.IncRejected(RejectReasonRateLimit) }),
 		routes.ProxyHandler(proxy, dependencies.Resilience),
 	}
 	router.NoRoute(func(c *gin.Context) {
@@ -81,7 +81,7 @@ type AdminOptions struct {
 	Resilience         *ResilienceSet
 }
 
-func NewAdminHandler(token string, rules BlacklistStore, limiter *RateLimiter, logger *slog.Logger, metrics *Metrics, options AdminOptions) *gin.Engine {
+func NewAdminHandler(token string, rules BlacklistStore, limiter RateLimitBackend, logger *slog.Logger, metrics *Metrics, options AdminOptions) *gin.Engine {
 	router := newRouter(logger)
 	router.GET("/healthz", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
@@ -153,7 +153,14 @@ func NewAdminHandler(token string, rules BlacklistStore, limiter *RateLimiter, l
 			abortWithError(c, http.StatusBadRequest, "INVALID_RATE_LIMIT", "positive requests_per_second and burst are required")
 			return
 		}
-		limiter.Update(request.RequestsPerSecond, request.Burst)
+		if err := limiter.Update(request.RequestsPerSecond, request.Burst); err != nil {
+			if errors.Is(err, ErrRateLimitUnavailable) {
+				abortWithError(c, http.StatusServiceUnavailable, "RATELIMIT_UNAVAILABLE", "rate limit store is unavailable")
+				return
+			}
+			abortWithError(c, http.StatusBadRequest, "INVALID_RATE_LIMIT", err.Error())
+			return
+		}
 		c.JSON(http.StatusOK, gin.H{"requests_per_second": request.RequestsPerSecond, "burst": request.Burst})
 	})
 	return router

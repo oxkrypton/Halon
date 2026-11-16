@@ -96,15 +96,17 @@ func run() error {
 	logger.Info("shared state mode", "shared_state_mode", sharedStateMode)
 
 	var rules gateway.BlacklistStore
+	var limiter gateway.RateLimitBackend
 	if redisClient != nil {
 		rules = gateway.NewRedisBlacklistStore(redisClient, cfg.BlacklistCacheTTL, cfg.RedisOpTimeout, logger, metrics.SetRedisUp)
+		limiter = gateway.NewRedisRateLimiter(redisClient, cfg.RateLimitRPS, cfg.RateLimitBurst, cfg.RedisOpTimeout, logger, metrics.SetRedisUp)
 	} else {
 		rules, err = gateway.NewIPRules(nil)
 		if err != nil {
 			return err
 		}
+		limiter = gateway.NewRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst)
 	}
-	limiter := gateway.NewRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst)
 
 	queue := make(chan trafficlog.Entry, cfg.LogQueueSize)
 	writer := trafficlog.NewBatchWriter(repository, queue, cfg.LogBatchSize, cfg.LogFlushInterval, logger)

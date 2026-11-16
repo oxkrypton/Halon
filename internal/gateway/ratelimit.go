@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"errors"
 	"net/http"
 	"sync"
 	"time"
@@ -13,6 +14,36 @@ const (
 	limiterCleanupInterval = time.Minute
 	limiterIdleTimeout     = 10 * time.Minute
 )
+
+// RateLimitBackend is the contract behind per-IP rate limiting. The
+// single-replica memory mode uses RateLimiter; the shared multi-replica
+// mode uses RedisRateLimiter. Update failures in shared mode are surfaced
+// as ErrRateLimitUnavailable so the admin API can answer 503.
+type RateLimitBackend interface {
+	Allow(ip string) bool
+	Update(rps float64, burst int) error
+	Settings() (rps float64, burst int)
+}
+
+// ErrRateLimitUnavailable marks rate-limit config writes that failed
+// because the backing store is unreachable.
+var ErrRateLimitUnavailable = errors.New("rate limit store unavailable")
+
+// RateLimitMiddleware applies the per-IP rate limit. Each rejection invokes
+// the optional hooks (used for metrics) before the error response is written.
+func RateLimitMiddleware(limiter RateLimitBackend, onRejected ...func()) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if !limiter.Allow(c.ClientIP()) {
+			for _, hook := range onRejected {
+				hook()
+			}
+			c.Header("Retry-After", "1")
+			abortWithError(c, http.StatusTooManyRequests, "RATE_LIMITED", "too many requests")
+			return
+		}
+		c.Next()
+	}
+}
 
 type clientLimiter struct {
 	limiter  *rate.Limiter
@@ -58,7 +89,9 @@ func (l *RateLimiter) Allow(ip string) bool {
 	return client.limiter.AllowN(now, 1)
 }
 
-func (l *RateLimiter) Update(rps float64, burst int) {
+// Update applies new limit parameters. The memory implementation never
+// fails; the signature matches RateLimitBackend.
+func (l *RateLimiter) Update(rps float64, burst int) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.rps = rps
@@ -67,26 +100,11 @@ func (l *RateLimiter) Update(rps float64, burst int) {
 		client.limiter.SetLimit(rate.Limit(rps))
 		client.limiter.SetBurst(burst)
 	}
+	return nil
 }
 
 func (l *RateLimiter) Settings() (float64, int) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.rps, l.burst
-}
-
-// Middleware applies the per-IP rate limit. Each rejection invokes the
-// optional hooks (used for metrics) before the error response is written.
-func (l *RateLimiter) Middleware(onRejected ...func()) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		if !l.Allow(c.ClientIP()) {
-			for _, hook := range onRejected {
-				hook()
-			}
-			c.Header("Retry-After", "1")
-			abortWithError(c, http.StatusTooManyRequests, "RATE_LIMITED", "too many requests")
-			return
-		}
-		c.Next()
-	}
 }
