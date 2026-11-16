@@ -1,26 +1,16 @@
 SHELL := /bin/sh
 
-USER_IMAGE := halon/user-service:dev
 GATEWAY_IMAGE := halon/gateway:dev
 AGENT_IMAGE := halon/agent:dev
+DEMO_IMAGE := halon/user-service-demo:dev
 GO_BIN := $(shell go env GOPATH)/bin
 export PATH := $(GO_BIN):$(PATH)
 
-.PHONY: proto generate test run run-gateway run-agent build docker-build minikube-start minikube-image deploy status clean
-
-proto generate:
-	mkdir -p api/gen/user/v1
-	protoc -I api/proto \
-		--go_out=api/gen --go_opt=paths=source_relative \
-		--go-grpc_out=api/gen --go-grpc_opt=paths=source_relative \
-		api/proto/user/v1/user.proto
+.PHONY: test run-gateway run-agent run-demo build build-demo docker-build docker-build-demo minikube-start minikube-image deploy status clean
 
 test:
 	go test -race ./...
 	go vet ./...
-
-run:
-	go run ./cmd/user-service
 
 run-gateway:
 	go run ./cmd/gateway
@@ -28,21 +18,30 @@ run-gateway:
 run-agent:
 	go run ./cmd/agent
 
+run-demo:
+	go run ./examples/user-service
+
 build:
-	CGO_ENABLED=0 go build -trimpath -o bin/user-service ./cmd/user-service
 	CGO_ENABLED=0 go build -trimpath -o bin/gateway ./cmd/gateway
 	CGO_ENABLED=0 go build -trimpath -o bin/agent ./cmd/agent
 
+build-demo:
+	CGO_ENABLED=0 go build -trimpath -o bin/user-service-demo ./examples/user-service
+
 docker-build:
-	docker build --build-arg SERVICE=user-service -t $(USER_IMAGE) .
-	docker build --build-arg SERVICE=gateway -t $(GATEWAY_IMAGE) .
-	docker build --build-arg SERVICE=agent -t $(AGENT_IMAGE) .
+	docker build --build-arg SERVICE_PATH=cmd/gateway -t $(GATEWAY_IMAGE) .
+	docker build --build-arg SERVICE_PATH=cmd/agent -t $(AGENT_IMAGE) .
+
+docker-build-demo:
+	docker build --build-arg SERVICE_PATH=examples/user-service -t $(DEMO_IMAGE) .
 
 minikube-start:
 	minikube start --driver=docker
 
-minikube-image: docker-build
-	minikube image load $(USER_IMAGE) $(GATEWAY_IMAGE) $(AGENT_IMAGE)
+# Optional convenience for local Minikube development. Any other cluster
+# works too: push the images to your registry and point the manifests at it.
+minikube-image: docker-build docker-build-demo
+	minikube image load $(GATEWAY_IMAGE) $(AGENT_IMAGE) $(DEMO_IMAGE)
 
 deploy:
 	kubectl apply -f deploy/kubernetes/

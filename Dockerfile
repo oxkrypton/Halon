@@ -7,9 +7,9 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-ARG SERVICE=user-service
+ARG SERVICE_PATH=cmd/gateway
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
-    -o /out/service ./cmd/${SERVICE}
+    -o /out/service ./${SERVICE_PATH}
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/service /service
