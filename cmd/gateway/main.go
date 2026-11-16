@@ -18,19 +18,19 @@ import (
 )
 
 func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	slog.SetDefault(logger)
-	if err := run(logger); err != nil {
-		logger.Error("gateway stopped", "error", err)
+	if err := run(); err != nil {
+		slog.Error("gateway stopped", "error", err)
 		os.Exit(1)
 	}
 }
 
-func run(logger *slog.Logger) error {
+func run() error {
 	cfg, err := gateway.LoadConfig()
 	if err != nil {
 		return fmt.Errorf("load configuration: %w", err)
 	}
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.SlogLevel()}))
+	slog.SetDefault(logger)
 	gin.SetMode(cfg.GinMode)
 
 	startupContext, cancelStartup := context.WithTimeout(context.Background(), 15*time.Second)
@@ -44,6 +44,22 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
+	tracing, err := gateway.InitTracing(context.Background(), gateway.TracingConfig{
+		Enabled:      cfg.OTELEnabled,
+		Endpoint:     cfg.OTELExporterEndpoint,
+		SamplerRatio: cfg.OTELTracesSamplerRatio,
+	})
+	if err != nil {
+		return err
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := tracing.Shutdown(ctx); err != nil {
+			logger.Error("shutdown tracer provider", "error", err)
+		}
+	}()
+
 	routes, err := gateway.ParseRoutes(cfg.Routes)
 	if err != nil {
 		return fmt.Errorf("parse routes: %w", err)
@@ -55,6 +71,8 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 	limiter := gateway.NewRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst)
+	metrics := gateway.NewMetrics()
+
 	queue := make(chan trafficlog.Entry, cfg.LogQueueSize)
 	writer := trafficlog.NewBatchWriter(repository, queue, cfg.LogBatchSize, cfg.LogFlushInterval, logger)
 	writerDone := make(chan struct{})
@@ -67,7 +85,7 @@ func run(logger *slog.Logger) error {
 	notifierDone := make(chan struct{})
 	if cfg.AgentWebhookURL != "" {
 		timeoutQueue = make(chan incident.TimeoutEvent, cfg.TimeoutQueueSize)
-		notifier := gateway.NewTimeoutNotifier(cfg.AgentWebhookURL, cfg.AgentWebhookToken, timeoutQueue, logger)
+		notifier := gateway.NewTimeoutNotifier(cfg.AgentWebhookURL, cfg.AgentWebhookToken, timeoutQueue, logger, metrics)
 		go func() {
 			notifier.Run()
 			close(notifierDone)
@@ -75,8 +93,31 @@ func run(logger *slog.Logger) error {
 	} else {
 		close(notifierDone)
 	}
-	metrics := gateway.NewMetrics()
-	httpServer := newHTTPServer(cfg.HTTPAddr, gateway.NewHTTPHandler(gateway.Dependencies{
+
+	proxyOptions := gateway.ProxyOptions{
+		Timeout:               cfg.ProxyTimeout,
+		DialTimeout:           cfg.UpstreamDialTimeout,
+		TLSHandshakeTimeout:   cfg.UpstreamTLSHandshakeTimeout,
+		ResponseHeaderTimeout: cfg.UpstreamResponseHeaderTimeout,
+		MaxConnsPerHost:       cfg.UpstreamMaxConnsPerHost,
+		MaxRequestBodyBytes:   cfg.MaxRequestBodyBytes,
+		RetryBodyBufferBytes:  cfg.RetryBodyBufferBytes,
+		Resilience: gateway.ResilienceConfig{
+			RetryMaxAttempts:         cfg.RetryMaxAttempts,
+			BreakerEnabled:           cfg.BreakerEnabled,
+			BreakerFailureThreshold:  cfg.BreakerFailureThreshold,
+			BreakerOpenDuration:      cfg.BreakerOpenDuration,
+			BreakerHalfOpenSuccesses: cfg.BreakerHalfOpenSuccesses,
+			BreakerCount5xx:          cfg.BreakerCount5xx,
+			ConcurrencyPerRoute:      cfg.ConcurrencyPerRoute,
+			Logger:                   logger,
+		},
+		Logger:           logger,
+		TransportWrapper: tracing.WrapTransport,
+	}
+	resilience := proxyOptions.BuildResilienceSet(routes.Prefixes(), metrics)
+
+	httpServer := newHTTPServer(cfg.HTTPAddr, tracing.WrapHandler(gateway.NewHTTPHandler(gateway.Dependencies{
 		Routes:               routes,
 		Repository:           repository,
 		LogQueue:             queue,
@@ -85,11 +126,15 @@ func run(logger *slog.Logger) error {
 		Rules:                rules,
 		Limiter:              limiter,
 		Metrics:              metrics,
-		ProxyTimeout:         cfg.ProxyTimeout,
+		Proxy:                proxyOptions,
+		Resilience:           resilience,
 		SlowRequestThreshold: cfg.SlowRequestThreshold,
 		BodyCaptureLimit:     cfg.BodyCaptureLimit,
+	})))
+	adminServer := newHTTPServer(cfg.AdminAddr, gateway.NewAdminHandler(cfg.AdminToken, rules, limiter, logger, metrics, gateway.AdminOptions{
+		MetricsRequireAuth: cfg.MetricsRequireAuth,
+		Resilience:         resilience,
 	}))
-	adminServer := newHTTPServer(cfg.AdminAddr, gateway.NewAdminHandler(cfg.AdminToken, rules, limiter, logger, metrics))
 
 	serverErrors := make(chan error, 2)
 	go listen(httpServer, "http", serverErrors)

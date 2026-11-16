@@ -24,7 +24,8 @@ type Dependencies struct {
 	Rules                *IPRules
 	Limiter              *RateLimiter
 	Metrics              *Metrics
-	ProxyTimeout         time.Duration
+	Proxy                ProxyOptions
+	Resilience           *ResilienceSet
 	SlowRequestThreshold time.Duration
 	BodyCaptureLimit     int64
 }
@@ -34,13 +35,14 @@ func NewHTTPHandler(dependencies Dependencies) *gin.Engine {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	metrics := dependencies.Metrics
 	router := newRouter(logger, AccessLog(AccessLogOptions{
 		Queue:         dependencies.LogQueue,
 		TimeoutQueue:  dependencies.TimeoutQueue,
 		SlowThreshold: dependencies.SlowRequestThreshold,
 		CaptureLimit:  dependencies.BodyCaptureLimit,
 		Logger:        logger,
-		Metrics:       dependencies.Metrics,
+		Metrics:       metrics,
 	}))
 
 	router.GET("/healthz", func(c *gin.Context) {
@@ -54,10 +56,12 @@ func NewHTTPHandler(dependencies Dependencies) *gin.Engine {
 	if routes == nil {
 		routes = &RouteTable{}
 	}
+	proxy := dependencies.Proxy
+	proxy.Resilience.Metrics = metrics
 	proxyMiddlewares := []gin.HandlerFunc{
-		dependencies.Rules.Middleware(),
-		dependencies.Limiter.Middleware(),
-		routes.ProxyHandler(dependencies.ProxyTimeout),
+		dependencies.Rules.Middleware(func() { metrics.IncRejected(RejectReasonBlacklist) }),
+		dependencies.Limiter.Middleware(func() { metrics.IncRejected(RejectReasonRateLimit) }),
+		routes.ProxyHandler(proxy, dependencies.Resilience),
 	}
 	router.NoRoute(func(c *gin.Context) {
 		for _, middleware := range proxyMiddlewares {
@@ -70,20 +74,36 @@ func NewHTTPHandler(dependencies Dependencies) *gin.Engine {
 	return router
 }
 
-func NewAdminHandler(token string, rules *IPRules, limiter *RateLimiter, logger *slog.Logger, metrics *Metrics) *gin.Engine {
+// AdminOptions configures optional admin surface features.
+type AdminOptions struct {
+	MetricsRequireAuth bool
+	Resilience         *ResilienceSet
+}
+
+func NewAdminHandler(token string, rules *IPRules, limiter *RateLimiter, logger *slog.Logger, metrics *Metrics, options AdminOptions) *gin.Engine {
 	router := newRouter(logger)
 	router.GET("/healthz", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
 	if metrics != nil {
-		router.GET("/metrics", gin.WrapH(metrics.Handler()))
+		metricsHandler := gin.WrapH(metrics.Handler())
+		if options.MetricsRequireAuth {
+			router.GET("/metrics", adminAuthentication(token), metricsHandler)
+		} else {
+			router.GET("/metrics", metricsHandler)
+		}
 	}
 
-	admin := router.Group("/admin/rules", adminAuthentication(token))
-	admin.GET("/blacklist", func(c *gin.Context) {
+	admin := router.Group("/admin", adminAuthentication(token))
+	if options.Resilience != nil {
+		admin.GET("/breakers", func(c *gin.Context) {
+			c.JSON(http.StatusOK, gin.H{"breakers": options.Resilience.BreakerStatuses()})
+		})
+	}
+	admin.GET("/rules/blacklist", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"ips": rules.List()})
 	})
-	admin.PUT("/blacklist/:ip", func(c *gin.Context) {
+	admin.PUT("/rules/blacklist/:ip", func(c *gin.Context) {
 		created, err := rules.Add(c.Param("ip"))
 		if err != nil {
 			abortWithError(c, http.StatusBadRequest, "INVALID_IP", err.Error())
@@ -95,7 +115,7 @@ func NewAdminHandler(token string, rules *IPRules, limiter *RateLimiter, logger 
 		}
 		c.JSON(statusCode, gin.H{"ip": c.Param("ip")})
 	})
-	admin.DELETE("/blacklist/:ip", func(c *gin.Context) {
+	admin.DELETE("/rules/blacklist/:ip", func(c *gin.Context) {
 		removed, err := rules.Remove(c.Param("ip"))
 		if err != nil {
 			abortWithError(c, http.StatusBadRequest, "INVALID_IP", err.Error())
@@ -107,11 +127,11 @@ func NewAdminHandler(token string, rules *IPRules, limiter *RateLimiter, logger 
 		}
 		c.Status(http.StatusNoContent)
 	})
-	admin.GET("/rate-limit", func(c *gin.Context) {
+	admin.GET("/rules/rate-limit", func(c *gin.Context) {
 		rps, burst := limiter.Settings()
 		c.JSON(http.StatusOK, gin.H{"requests_per_second": rps, "burst": burst})
 	})
-	admin.PUT("/rate-limit", func(c *gin.Context) {
+	admin.PUT("/rules/rate-limit", func(c *gin.Context) {
 		var request struct {
 			RequestsPerSecond float64 `json:"requests_per_second" binding:"required,gt=0"`
 			Burst             int     `json:"burst" binding:"required,gt=0"`

@@ -60,7 +60,7 @@ func newFixture(t *testing.T, upstream *httptest.Server) *fixture {
 			Logger:               testLogger(),
 			Rules:                rules,
 			Limiter:              limiter,
-			ProxyTimeout:         time.Second,
+			Proxy:                ProxyOptions{Timeout: time.Second},
 			SlowRequestThreshold: time.Second,
 			BodyCaptureLimit:     1024,
 		}),
@@ -164,7 +164,7 @@ func TestProxyUnreachableUpstreamReturns502(t *testing.T) {
 	router := NewHTTPHandler(Dependencies{
 		Routes: routes, Repository: pingerStub{}, LogQueue: queue,
 		Logger: testLogger(), Rules: rules, Limiter: NewRateLimiter(100, 100),
-		ProxyTimeout: time.Second, SlowRequestThreshold: time.Second, BodyCaptureLimit: 1024,
+		Proxy: ProxyOptions{Timeout: time.Second}, SlowRequestThreshold: time.Second, BodyCaptureLimit: 1024,
 	})
 
 	response := httptest.NewRecorder()
@@ -253,7 +253,7 @@ func TestAdminAuthenticationAndRules(t *testing.T) {
 	fixture := newFixture(t, echoUpstream(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	}))
-	admin := NewAdminHandler(testAdminToken, fixture.rules, fixture.limiter, testLogger(), nil)
+	admin := NewAdminHandler(testAdminToken, fixture.rules, fixture.limiter, testLogger(), nil, AdminOptions{})
 
 	unauthorized := httptest.NewRecorder()
 	admin.ServeHTTP(unauthorized, httptest.NewRequest(http.MethodGet, "/admin/rules/blacklist", nil))
@@ -290,7 +290,7 @@ func TestDynamicRateLimit(t *testing.T) {
 	fixture := newFixture(t, echoUpstream(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	}))
-	admin := NewAdminHandler(testAdminToken, fixture.rules, fixture.limiter, testLogger(), nil)
+	admin := NewAdminHandler(testAdminToken, fixture.rules, fixture.limiter, testLogger(), nil, AdminOptions{})
 	request := httptest.NewRequest(http.MethodPut, "/admin/rules/rate-limit", strings.NewReader(`{"requests_per_second":1,"burst":1}`))
 	request.Header.Set("Authorization", "Bearer "+testAdminToken)
 	request.Header.Set("Content-Type", "application/json")

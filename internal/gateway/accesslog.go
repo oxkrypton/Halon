@@ -63,6 +63,8 @@ func AccessLog(options AccessLogOptions) gin.HandlerFunc {
 	var droppedTimeouts atomic.Uint64
 	return func(c *gin.Context) {
 		started := time.Now()
+		options.Metrics.IncInFlight()
+		defer options.Metrics.DecInFlight()
 		requestBody := captureRequestBody(c, options.CaptureLimit)
 		capture := &responseCapture{
 			ResponseWriter: c.Writer,
@@ -92,6 +94,7 @@ func AccessLog(options AccessLogOptions) gin.HandlerFunc {
 		select {
 		case options.Queue <- entry:
 		default:
+			options.Metrics.IncTrafficlogDropped()
 			count := dropped.Add(1)
 			if count == 1 || count%100 == 0 {
 				options.Logger.Warn("traffic log queue full; dropping entry", "dropped_total", count)
@@ -115,21 +118,36 @@ func AccessLog(options AccessLogOptions) gin.HandlerFunc {
 			select {
 			case options.TimeoutQueue <- event:
 			default:
+				options.Metrics.IncTimeoutEventsDropped()
 				count := droppedTimeouts.Add(1)
 				if count == 1 || count%100 == 0 {
 					options.Logger.Warn("timeout incident queue full; dropping event", "dropped_total", count)
 				}
 			}
 		}
-		options.Logger.Info("http request",
+		outcome, _ := c.Request.Context().Value(upstreamOutcomeKey{}).(*upstreamOutcome)
+		attributes := []any{
 			"request_id", entry.Base.RequestID,
 			"client_ip", entry.Base.ClientIP,
 			"method", entry.Base.Method,
 			"path", entry.Base.Path,
 			"status", entry.Base.Status,
 			"latency_ms", entry.Base.LatencyMS,
+			"route", routeLabel(c),
 			"upstream_timeout", timedOut,
-		)
+		}
+		if traceID := traceIDFromContext(c.Request.Context()); traceID != "" {
+			attributes = append(attributes, "trace_id", traceID)
+		}
+		if outcome != nil {
+			if outcome.result != "" {
+				attributes = append(attributes, "upstream_result", outcome.result)
+			}
+			if outcome.retries > 0 {
+				attributes = append(attributes, "retries", outcome.retries)
+			}
+		}
+		options.Logger.Info("http request", attributes...)
 	}
 }
 

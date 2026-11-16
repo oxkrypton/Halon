@@ -81,9 +81,14 @@ func (r *IPRules) List() []string {
 	return ips
 }
 
-func (r *IPRules) Middleware() gin.HandlerFunc {
+// Middleware blocks listed IPs. Each rejection invokes the optional hooks
+// (used for metrics) before the error response is written.
+func (r *IPRules) Middleware(onRejected ...func()) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if r.Contains(c.ClientIP()) {
+			for _, hook := range onRejected {
+				hook()
+			}
 			abortWithError(c, http.StatusForbidden, "IP_BLOCKED", "client IP is blocked")
 			return
 		}

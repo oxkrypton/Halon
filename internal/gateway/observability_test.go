@@ -39,7 +39,7 @@ func TestUpstreamTimeoutEmitsIncidentAndMetrics(t *testing.T) {
 		Rules:                rules,
 		Limiter:              limiter,
 		Metrics:              metrics,
-		ProxyTimeout:         300 * time.Millisecond,
+		Proxy:                ProxyOptions{Timeout: 300 * time.Millisecond},
 		SlowRequestThreshold: time.Second,
 		BodyCaptureLimit:     1024,
 	})
@@ -58,7 +58,7 @@ func TestUpstreamTimeoutEmitsIncidentAndMetrics(t *testing.T) {
 		t.Fatalf("invalid timeout event: %v", err)
 	}
 
-	admin := NewAdminHandler(testAdminToken, rules, limiter, testLogger(), metrics)
+	admin := NewAdminHandler(testAdminToken, rules, limiter, testLogger(), metrics, AdminOptions{})
 	metricsResponse := httptest.NewRecorder()
 	admin.ServeHTTP(metricsResponse, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	if !strings.Contains(metricsResponse.Body.String(), `halon_gateway_http_requests_total{method="GET",route="/api/v1/",status="504"} 1`) {
@@ -82,7 +82,7 @@ func TestTimeoutNotifierDeliversAuthenticatedEvent(t *testing.T) {
 	defer server.Close()
 
 	queue := make(chan incident.TimeoutEvent, 1)
-	notifier := NewTimeoutNotifier(server.URL, "test-webhook-token", queue, testLogger())
+	notifier := NewTimeoutNotifier(server.URL, "test-webhook-token", queue, testLogger(), nil)
 	done := make(chan struct{})
 	go func() {
 		notifier.Run()

@@ -75,9 +75,14 @@ func (l *RateLimiter) Settings() (float64, int) {
 	return l.rps, l.burst
 }
 
-func (l *RateLimiter) Middleware() gin.HandlerFunc {
+// Middleware applies the per-IP rate limit. Each rejection invokes the
+// optional hooks (used for metrics) before the error response is written.
+func (l *RateLimiter) Middleware(onRejected ...func()) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if !l.Allow(c.ClientIP()) {
+			for _, hook := range onRejected {
+				hook()
+			}
 			c.Header("Retry-After", "1")
 			abortWithError(c, http.StatusTooManyRequests, "RATE_LIMITED", "too many requests")
 			return

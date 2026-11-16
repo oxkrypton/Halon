@@ -19,21 +19,24 @@ type TimeoutNotifier struct {
 	queue      <-chan incident.TimeoutEvent
 	client     *http.Client
 	logger     *slog.Logger
+	metrics    *Metrics
 }
 
-func NewTimeoutNotifier(webhookURL, token string, queue <-chan incident.TimeoutEvent, logger *slog.Logger) *TimeoutNotifier {
+func NewTimeoutNotifier(webhookURL, token string, queue <-chan incident.TimeoutEvent, logger *slog.Logger, metrics *Metrics) *TimeoutNotifier {
 	return &TimeoutNotifier{
 		webhookURL: webhookURL,
 		token:      token,
 		queue:      queue,
 		client:     &http.Client{Timeout: 5 * time.Second},
 		logger:     logger,
+		metrics:    metrics,
 	}
 }
 
 func (n *TimeoutNotifier) Run() {
 	for event := range n.queue {
 		if err := n.send(event); err != nil {
+			n.metrics.IncWebhookNotifyFailures()
 			n.logger.Error("deliver timeout incident", "event_id", event.EventID, "error", err)
 			continue
 		}

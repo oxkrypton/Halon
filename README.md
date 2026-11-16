@@ -20,8 +20,9 @@ HTTP Client
 Gin Gateway (:8080)                      # 通用反向代理
     |-- Request ID / Recovery / Access Log
     |-- IP Blacklist / Per-IP Rate Limit
+    |-- Resilience: bulkhead --> circuit breaker --> retry (failsafe-go)
     |
-    | ROUTES: prefix=upstream(纯 HTTP)
+    | ROUTES: prefix=upstream(纯 HTTP,可选 OTel traceparent 透传)
     v
 任意上游服务(如 examples/ 下的 user-service、order-service 演示后端)
 
@@ -30,7 +31,10 @@ Gin Gateway -- bounded channel --> Batch Writer --> PostgreSQL
                                                    |-- error_body
                                                    |-- incident_reports
 
-Gateway Admin (:9090) -- Bearer Token --> blacklist / rate-limit rules
+Gin Gateway -- /metrics + OTLP traces + JSON logs --> 可选观测栈
+                                                   (Prometheus / Tempo / Loki / Grafana)
+
+Gateway Admin (:9090) -- Bearer Token --> blacklist / rate-limit / breakers
 
 Gin Gateway -- 504 webhook --> Agent Service (:8081)
                                    |-- 事件去重(TTL + ON CONFLICT)
@@ -45,10 +49,12 @@ Gin Gateway -- 504 webhook --> Agent Service (:8081)
 ### Gin 网关(通用反向代理)
 
 - `ROUTES` 环境变量声明路由表(`前缀=上游地址`,逗号分隔,最长前缀优先),上游可以是集群内任意 HTTP 服务。
-- 上游响应原样透传;上游超时返回 504 `UPSTREAM_TIMEOUT` 并触发故障事件;连接失败返回 502 `UPSTREAM_ERROR`。
+- 上游弹性策略(基于 [failsafe-go](https://github.com/failsafe-go/failsafe-go)):拨号/TLS/响应头分阶段超时、幂等请求的有预算重试(默认关)、每路由熔断(503 + `Retry-After` 快速失败)、每路由并发上限(429 快速失败)、请求体大小上限。
+- 上游响应原样透传;上游超时返回 504 `UPSTREAM_TIMEOUT` 并触发故障事件;连接失败返回 502 `UPSTREAM_ERROR`;熔断开启返回 503 `UPSTREAM_UNAVAILABLE`。
 - 统一 JSON 错误响应和 `X-Request-ID` 请求追踪(自动透传到上游)。
 - 内存 IP 黑名单及按客户端 IP 的令牌桶限流。
-- 独立管理端口 `:9090`,支持动态更新黑名单和限流参数,暴露 Prometheus 指标。
+- 独立管理端口 `:9090`,支持动态更新黑名单和限流参数、查询各路由熔断状态,暴露 Prometheus 指标(全指标清单见 [docs/modules/gateway.md](docs/modules/gateway.md))。
+- 可选 OpenTelemetry 追踪(`OTEL_ENABLED`):自动注入/透传 W3C `traceparent`,上游零改动;`trace_id` 写入结构化日志实现日志↔追踪互跳。配套开源观测栈(OTel Collector + Tempo + Loki + Prometheus + Grafana)见 `deploy/kubernetes/observability/`。
 - `/healthz` 存活检查和 `/readyz` 数据库就绪检查。
 - HTTP 超时、Panic 恢复、平滑退出及非 root 容器运行。
 
@@ -151,7 +157,8 @@ curl -s http://localhost:8081/api/v1/incidents -H 'Authorization: Bearer halon-l
 | `DELETE /admin/rules/blacklist/:ip` | 删除黑名单 IP,需要管理鉴权 |
 | `GET /admin/rules/rate-limit` | 查询限流参数,需要管理鉴权 |
 | `PUT /admin/rules/rate-limit` | 更新限流参数,需要管理鉴权 |
-| `GET /metrics` | Prometheus 指标(管理端口) |
+| `GET /admin/breakers` | 查询各路由熔断器状态,需要管理鉴权 |
+| `GET /metrics` | Prometheus 指标(管理端口;`METRICS_REQUIRE_AUTH=true` 时需管理鉴权) |
 
 管理接口鉴权头:
 
@@ -175,6 +182,9 @@ curl -X PUT http://localhost:9090/admin/rules/rate-limit \
 | 无匹配路由 | 404 | `ROUTE_NOT_FOUND` |
 | IP 被拉黑 | 403 | `IP_BLOCKED` |
 | 请求超过限流阈值 | 429 | `RATE_LIMITED` |
+| 路由并发额度打满 | 429 | `CONCURRENCY_LIMIT`(带 `Retry-After`) |
+| 请求体超过上限 | 413 | `REQUEST_TOO_LARGE` |
+| 路由熔断器开启 | 503 | `UPSTREAM_UNAVAILABLE`(带 `Retry-After`) |
 | 上游响应超时 | 504 | `UPSTREAM_TIMEOUT`(同时触发故障事件) |
 | 上游连接失败 | 502 | `UPSTREAM_ERROR` |
 
@@ -286,7 +296,25 @@ kubectl rollout restart deployment/agent
 | `LOG_FLUSH_INTERVAL` | `1s` | 批量写入间隔 |
 | `SLOW_REQUEST_THRESHOLD` | `1s` | 保存完整报文的慢请求阈值 |
 | `BODY_CAPTURE_BYTES` | `65536` | 请求和响应各自的最大采集字节数 |
-| `UPSTREAM_TIMEOUT` | `3s` | 单次上游调用超时 |
+| `UPSTREAM_TIMEOUT` | `3s` | 上游调用总超时(覆盖含重试的全部尝试) |
+| `UPSTREAM_DIAL_TIMEOUT` | `2s` | 上游 TCP 拨号超时 |
+| `UPSTREAM_TLS_HANDSHAKE_TIMEOUT` | `3s` | 上游 TLS 握手超时 |
+| `UPSTREAM_RESPONSE_HEADER_TIMEOUT` | 同 `UPSTREAM_TIMEOUT` | 等待上游响应头的超时,不得超过 `UPSTREAM_TIMEOUT` |
+| `UPSTREAM_MAX_CONNS_PER_HOST` | `64` | 单个上游的最大连接数 |
+| `MAX_REQUEST_BODY_BYTES` | `10485760` (10 MiB) | 请求体上限,超限 413;`0` 表示不限 |
+| `RETRY_MAX_ATTEMPTS` | `1` | 幂等请求的最大尝试次数(含首次),`1` 即不重试,硬上限 3 |
+| `RETRY_BODY_BUFFER_BYTES` | `1048576` (1 MiB) | 可重试请求的体缓冲上限,超限不重试 |
+| `BREAKER_ENABLED` | `true` | 每路由熔断器开关 |
+| `BREAKER_FAILURE_THRESHOLD` | `5` | 熔断的连续失败阈值 |
+| `BREAKER_OPEN_DURATION` | `30s` | 熔断 open 持续时长(之后进入 half-open 探测) |
+| `BREAKER_HALF_OPEN_MAX` | `1` | half-open 转 closed 需要的连续成功数 |
+| `BREAKER_COUNT_5XX` | `true` | 是否把上游 5xx 计入熔断失败 |
+| `CONCURRENCY_PER_ROUTE` | `256` | 每路由并发上限,满则 429;`0` 表示不限 |
+| `LOG_LEVEL` | `info` | 日志级别:`debug` / `info` / `warn` / `error` |
+| `METRICS_REQUIRE_AUTH` | `false` | `/metrics` 是否需要管理 Bearer 鉴权 |
+| `OTEL_ENABLED` | `false` | OpenTelemetry 追踪开关 |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `otel-collector.observability.svc.cluster.local:4317` | OTLP gRPC 端点(host:port,不带 scheme) |
+| `OTEL_TRACES_SAMPLER_RATIO` | `1.0` | 采样比例(0–1,父 span 优先) |
 | `AGENT_WEBHOOK_URL` | 空 | Agent 超时事件接收地址,为空则不推送 |
 | `AGENT_WEBHOOK_TOKEN` | 空 | Agent 接收接口 Bearer Token,配置 URL 后必填 |
 | `SHUTDOWN_TIMEOUT` | `10s` | 平滑退出超时 |
@@ -315,9 +343,11 @@ kubectl rollout restart deployment/agent
 
 ## 当前边界
 
-- 黑名单和限流状态保存在网关内存中,因此当前 Deployment 固定为 1 个副本;多副本前应迁移到 Redis 等共享存储。
+- 黑名单、限流、熔断器与并发舱壁状态都保存在网关内存中,因此当前 Deployment 固定为 1 个副本;多副本前应迁移到 Redis 等共享存储。
 - 异步日志采用有界、尽力投递队列,数据库长期不可用或队列饱和时会丢弃日志,避免拖垮业务请求。
 - 网关与上游之间、Agent 与网关管理接口之间使用集群内明文 HTTP;跨集群或不可信网络应启用 TLS。
+- 弹性策略依赖 failsafe-go(v0.x,API 可能变动),全部封装在 `internal/gateway/resilience.go`;追踪依赖 OpenTelemetry Go SDK,默认关闭。
+- 观测栈(`deploy/kubernetes/observability/`)是可选参考件,单副本小资源配置,生产使用需自行扩容与加固。
 - PostgreSQL 清单面向本地开发,生产环境还需要高可用、备份、密钥管理和网络策略。
 
 ## 项目结构
@@ -330,7 +360,7 @@ kubectl rollout restart deployment/agent
 ├── internal/
 │   ├── agent/                    # 排查循环、编排器、事件 API 和配置
 │   ├── agent/tools/              # 日志/PromQL/K8s/封禁工具及测试
-│   ├── gateway/                  # 反向代理、中间件、规则和测试
+│   ├── gateway/                  # 反向代理、弹性策略(resilience.go)、OTel(tracing.go)、中间件、规则和测试
 │   ├── incident/                 # 超时事件、去重、报告持久化及测试
 │   └── trafficlog/               # PostgreSQL、迁移、批写器和测试
 ├── examples/
@@ -339,7 +369,8 @@ kubectl rollout restart deployment/agent
 ├── deploy/kubernetes/
 │   ├── agent.yaml                # Agent Deployment、Service 和 RBAC
 │   ├── gateway.yaml              # 网关 Deployment 和 Service
-│   └── postgres.yaml             # PostgreSQL StatefulSet、Service 和 PVC
+│   ├── postgres.yaml             # PostgreSQL StatefulSet、Service 和 PVC
+│   └── observability/            # 可选观测栈:OTel Collector、Tempo、Loki、Alloy、Prometheus、Alertmanager、Grafana
 ├── docs/
 │   ├── README.md                 # 文档索引与文档维护规则
 │   ├── development.md            # 开发流程与约定

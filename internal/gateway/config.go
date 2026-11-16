@@ -3,10 +3,17 @@ package gateway
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"os"
 	"strconv"
 	"time"
+)
+
+const (
+	// retryAttemptsHardCap bounds retry amplification regardless of configuration.
+	retryAttemptsHardCap = 3
+	minAdminTokenLength  = 12
 )
 
 type Config struct {
@@ -18,6 +25,8 @@ type Config struct {
 	AgentWebhookURL      string
 	AgentWebhookToken    string
 	GinMode              string
+	LogLevel             string
+	MetricsRequireAuth   bool
 	RateLimitRPS         float64
 	RateLimitBurst       int
 	LogQueueSize         int
@@ -28,6 +37,28 @@ type Config struct {
 	SlowRequestThreshold time.Duration
 	BodyCaptureLimit     int64
 	ShutdownTimeout      time.Duration
+
+	// Upstream transport (P0).
+	UpstreamDialTimeout           time.Duration
+	UpstreamTLSHandshakeTimeout   time.Duration
+	UpstreamResponseHeaderTimeout time.Duration
+	UpstreamMaxConnsPerHost       int
+
+	// Resilience policies (P1).
+	MaxRequestBodyBytes      int64
+	RetryMaxAttempts         int
+	RetryBodyBufferBytes     int64
+	BreakerEnabled           bool
+	BreakerFailureThreshold  uint
+	BreakerOpenDuration      time.Duration
+	BreakerHalfOpenSuccesses uint
+	BreakerCount5xx          bool
+	ConcurrencyPerRoute      uint
+
+	// Tracing (P2).
+	OTELEnabled            bool
+	OTELExporterEndpoint   string
+	OTELTracesSamplerRatio float64
 }
 
 func LoadConfig() (Config, error) {
@@ -40,6 +71,7 @@ func LoadConfig() (Config, error) {
 		AgentWebhookURL:      os.Getenv("AGENT_WEBHOOK_URL"),
 		AgentWebhookToken:    os.Getenv("AGENT_WEBHOOK_TOKEN"),
 		GinMode:              envString("GIN_MODE", "release"),
+		LogLevel:             envString("LOG_LEVEL", "info"),
 		RateLimitRPS:         20,
 		RateLimitBurst:       40,
 		LogQueueSize:         1024,
@@ -50,9 +82,30 @@ func LoadConfig() (Config, error) {
 		SlowRequestThreshold: time.Second,
 		BodyCaptureLimit:     64 * 1024,
 		ShutdownTimeout:      10 * time.Second,
+
+		UpstreamDialTimeout:         2 * time.Second,
+		UpstreamTLSHandshakeTimeout: 3 * time.Second,
+		UpstreamMaxConnsPerHost:     64,
+
+		MaxRequestBodyBytes:      10 << 20,
+		RetryMaxAttempts:         1,
+		RetryBodyBufferBytes:     1 << 20,
+		BreakerEnabled:           true,
+		BreakerFailureThreshold:  5,
+		BreakerOpenDuration:      30 * time.Second,
+		BreakerHalfOpenSuccesses: 1,
+		BreakerCount5xx:          true,
+		ConcurrencyPerRoute:      256,
+
+		// otlptracegrpc expects host:port without a scheme.
+		OTELExporterEndpoint:   "otel-collector.observability.svc.cluster.local:4317",
+		OTELTracesSamplerRatio: 1.0,
 	}
 
 	var err error
+	if cfg.MetricsRequireAuth, err = envBool("METRICS_REQUIRE_AUTH", cfg.MetricsRequireAuth); err != nil {
+		return Config{}, err
+	}
 	if cfg.RateLimitRPS, err = envFloat("RATE_LIMIT_RPS", cfg.RateLimitRPS); err != nil {
 		return Config{}, err
 	}
@@ -84,6 +137,65 @@ func LoadConfig() (Config, error) {
 		return Config{}, err
 	}
 
+	// Upstream transport. The response header timeout defaults to the overall
+	// proxy timeout and must never exceed it, so it is parsed afterwards.
+	if cfg.UpstreamDialTimeout, err = envDuration("UPSTREAM_DIAL_TIMEOUT", cfg.UpstreamDialTimeout); err != nil {
+		return Config{}, err
+	}
+	if cfg.UpstreamTLSHandshakeTimeout, err = envDuration("UPSTREAM_TLS_HANDSHAKE_TIMEOUT", cfg.UpstreamTLSHandshakeTimeout); err != nil {
+		return Config{}, err
+	}
+	if cfg.UpstreamResponseHeaderTimeout, err = envDuration("UPSTREAM_RESPONSE_HEADER_TIMEOUT", cfg.ProxyTimeout); err != nil {
+		return Config{}, err
+	}
+	if cfg.UpstreamMaxConnsPerHost, err = envInt("UPSTREAM_MAX_CONNS_PER_HOST", cfg.UpstreamMaxConnsPerHost); err != nil {
+		return Config{}, err
+	}
+
+	// Resilience policies.
+	if cfg.MaxRequestBodyBytes, err = envInt64("MAX_REQUEST_BODY_BYTES", cfg.MaxRequestBodyBytes); err != nil {
+		return Config{}, err
+	}
+	if cfg.RetryMaxAttempts, err = envInt("RETRY_MAX_ATTEMPTS", cfg.RetryMaxAttempts); err != nil {
+		return Config{}, err
+	}
+	if cfg.RetryBodyBufferBytes, err = envInt64("RETRY_BODY_BUFFER_BYTES", cfg.RetryBodyBufferBytes); err != nil {
+		return Config{}, err
+	}
+	if cfg.BreakerEnabled, err = envBool("BREAKER_ENABLED", cfg.BreakerEnabled); err != nil {
+		return Config{}, err
+	}
+	var breakerFailureThreshold int
+	if breakerFailureThreshold, err = envInt("BREAKER_FAILURE_THRESHOLD", int(cfg.BreakerFailureThreshold)); err != nil {
+		return Config{}, err
+	}
+	cfg.BreakerFailureThreshold = uint(breakerFailureThreshold)
+	if cfg.BreakerOpenDuration, err = envDuration("BREAKER_OPEN_DURATION", cfg.BreakerOpenDuration); err != nil {
+		return Config{}, err
+	}
+	var breakerHalfOpenSuccesses int
+	if breakerHalfOpenSuccesses, err = envInt("BREAKER_HALF_OPEN_MAX", int(cfg.BreakerHalfOpenSuccesses)); err != nil {
+		return Config{}, err
+	}
+	cfg.BreakerHalfOpenSuccesses = uint(breakerHalfOpenSuccesses)
+	if cfg.BreakerCount5xx, err = envBool("BREAKER_COUNT_5XX", cfg.BreakerCount5xx); err != nil {
+		return Config{}, err
+	}
+	var concurrencyPerRoute int
+	if concurrencyPerRoute, err = envInt("CONCURRENCY_PER_ROUTE", int(cfg.ConcurrencyPerRoute)); err != nil {
+		return Config{}, err
+	}
+	cfg.ConcurrencyPerRoute = uint(concurrencyPerRoute)
+
+	// Tracing.
+	if cfg.OTELEnabled, err = envBool("OTEL_ENABLED", cfg.OTELEnabled); err != nil {
+		return Config{}, err
+	}
+	cfg.OTELExporterEndpoint = envString("OTEL_EXPORTER_OTLP_ENDPOINT", cfg.OTELExporterEndpoint)
+	if cfg.OTELTracesSamplerRatio, err = envFloat("OTEL_TRACES_SAMPLER_RATIO", cfg.OTELTracesSamplerRatio); err != nil {
+		return Config{}, err
+	}
+
 	var validationErrors []error
 	if _, err := ParseRoutes(cfg.Routes); err != nil {
 		validationErrors = append(validationErrors, fmt.Errorf("ROUTES: %w", err))
@@ -91,14 +203,17 @@ func LoadConfig() (Config, error) {
 	if cfg.DatabaseDSN == "" {
 		validationErrors = append(validationErrors, errors.New("DATABASE_DSN is required"))
 	}
-	if len(cfg.AdminToken) < 12 {
+	if len(cfg.AdminToken) < minAdminTokenLength {
 		validationErrors = append(validationErrors, errors.New("ADMIN_TOKEN must contain at least 12 characters"))
 	}
-	if cfg.AgentWebhookURL != "" && len(cfg.AgentWebhookToken) < 12 {
+	if cfg.AgentWebhookURL != "" && len(cfg.AgentWebhookToken) < minAdminTokenLength {
 		validationErrors = append(validationErrors, errors.New("AGENT_WEBHOOK_TOKEN must contain at least 12 characters when AGENT_WEBHOOK_URL is set"))
 	}
 	if cfg.GinMode != "release" && cfg.GinMode != "debug" && cfg.GinMode != "test" {
 		validationErrors = append(validationErrors, errors.New("GIN_MODE must be release, debug, or test"))
+	}
+	if _, ok := slogLevels[cfg.LogLevel]; !ok {
+		validationErrors = append(validationErrors, errors.New("LOG_LEVEL must be debug, info, warn, or error"))
 	}
 	if math.IsNaN(cfg.RateLimitRPS) || math.IsInf(cfg.RateLimitRPS, 0) || cfg.RateLimitRPS <= 0 || cfg.RateLimitBurst <= 0 {
 		validationErrors = append(validationErrors, errors.New("rate limit values must be positive"))
@@ -109,7 +224,46 @@ func LoadConfig() (Config, error) {
 	if cfg.ProxyTimeout <= 0 || cfg.SlowRequestThreshold <= 0 || cfg.BodyCaptureLimit <= 0 || cfg.ShutdownTimeout <= 0 {
 		validationErrors = append(validationErrors, errors.New("timeouts and body capture limit must be positive"))
 	}
+	if cfg.UpstreamDialTimeout <= 0 || cfg.UpstreamTLSHandshakeTimeout <= 0 {
+		validationErrors = append(validationErrors, errors.New("upstream dial and TLS handshake timeouts must be positive"))
+	}
+	if cfg.UpstreamResponseHeaderTimeout <= 0 || cfg.UpstreamResponseHeaderTimeout > cfg.ProxyTimeout {
+		validationErrors = append(validationErrors, errors.New("UPSTREAM_RESPONSE_HEADER_TIMEOUT must be positive and not exceed UPSTREAM_TIMEOUT"))
+	}
+	if cfg.UpstreamMaxConnsPerHost <= 0 {
+		validationErrors = append(validationErrors, errors.New("UPSTREAM_MAX_CONNS_PER_HOST must be positive"))
+	}
+	if cfg.MaxRequestBodyBytes < 0 {
+		validationErrors = append(validationErrors, errors.New("MAX_REQUEST_BODY_BYTES must be zero (unlimited) or positive"))
+	}
+	if cfg.RetryMaxAttempts < 1 || cfg.RetryMaxAttempts > retryAttemptsHardCap {
+		validationErrors = append(validationErrors, fmt.Errorf("RETRY_MAX_ATTEMPTS must be 1..%d", retryAttemptsHardCap))
+	}
+	if cfg.RetryBodyBufferBytes <= 0 {
+		validationErrors = append(validationErrors, errors.New("RETRY_BODY_BUFFER_BYTES must be positive"))
+	}
+	if cfg.BreakerFailureThreshold == 0 || cfg.BreakerOpenDuration <= 0 || cfg.BreakerHalfOpenSuccesses == 0 {
+		validationErrors = append(validationErrors, errors.New("breaker threshold, open duration, and half-open successes must be positive"))
+	}
+	if cfg.OTELEnabled && cfg.OTELExporterEndpoint == "" {
+		validationErrors = append(validationErrors, errors.New("OTEL_EXPORTER_OTLP_ENDPOINT is required when OTEL_ENABLED is true"))
+	}
+	if math.IsNaN(cfg.OTELTracesSamplerRatio) || cfg.OTELTracesSamplerRatio < 0 || cfg.OTELTracesSamplerRatio > 1 {
+		validationErrors = append(validationErrors, errors.New("OTEL_TRACES_SAMPLER_RATIO must be between 0 and 1"))
+	}
 	return cfg, errors.Join(validationErrors...)
+}
+
+var slogLevels = map[string]slog.Level{
+	"debug": slog.LevelDebug,
+	"info":  slog.LevelInfo,
+	"warn":  slog.LevelWarn,
+	"error": slog.LevelError,
+}
+
+// SlogLevel returns the configured log level; LoadConfig guarantees it is valid.
+func (c Config) SlogLevel() slog.Level {
+	return slogLevels[c.LogLevel]
 }
 
 func envString(key, fallback string) string {
@@ -117,6 +271,18 @@ func envString(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func envBool(key string, fallback bool) (bool, error) {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
+		return false, fmt.Errorf("parse %s: %w", key, err)
+	}
+	return parsed, nil
 }
 
 func envInt(key string, fallback int) (int, error) {

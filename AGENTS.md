@@ -10,7 +10,7 @@
 
 Halon 是一个**开源的云原生网关 Agent 项目**，适用于任意 Kubernetes 集群（Minikube、Kind、ACK、EKS 等）。两个产品组件彼此独立、通过契约通信：
 
-- **网关（gateway）**：通用 HTTP 反向代理，按 `ROUTES` 环境变量把路径前缀转发到任意上游服务；负责黑名单、限流、流量日志落库、超时事件上报。**它不感知任何具体业务服务。**
+- **网关（gateway）**：通用 HTTP 反向代理，按 `ROUTES` 环境变量把路径前缀转发到任意上游服务；负责黑名单、限流、流量日志落库、超时事件上报，以及分阶段超时/重试/熔断/并发上限等弹性策略（failsafe-go）与可选 OpenTelemetry 追踪。**它不感知任何具体业务服务。**
 - **Agent 服务（agent）**：接收网关超时事件，驱动 OpenAI 兼容大模型 + 只读/变更两级工具排查故障，产出中文 Markdown 报告并持久化。
 
 `examples/user-service` 与 `examples/order-service` 是演示用后端，**不属于产品本体**，仅用于本地开发和故障演练。
@@ -67,7 +67,9 @@ make deploy          # kubectl apply -f deploy/kubernetes/(适用于任意 K8s)
 
 ## 当前已知边界(改动前先读)
 
-- 网关黑名单/限流状态在内存中,网关固定 1 副本;Agent 去重窗口与操作冷却也在内存中,Agent 固定 1 副本。要扩副本需先迁移到共享存储。
+- 网关黑名单/限流/熔断器/并发舱壁状态都在内存中,网关固定 1 副本;Agent 去重窗口与操作冷却也在内存中,Agent 固定 1 副本。要扩副本需先迁移到共享存储。
 - Agent 与网关共用同一个 PostgreSQL 数据库,但使用**独立的迁移版本表**(`incident_schema_migrations`),不要合并。
 - 网关与上游之间、Agent 与网关管理接口之间均为集群内明文 HTTP;跨集群或不可信网络应启用 TLS。
 - `OPENAI_API_KEY` 等密钥只走 `halon-secrets`,禁止入库或写入代码。
+- 网关弹性策略基于 failsafe-go(v0.x),封装在 `internal/gateway/resilience.go`;OpenTelemetry 追踪默认关闭(`OTEL_ENABLED`)。
+- `deploy/kubernetes/observability/` 是可选观测栈参考件,不在 `make deploy` 主路径内,用 `make deploy-observability` 单独部署。
