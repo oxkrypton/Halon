@@ -1,5 +1,7 @@
 # Halon
 
+[![CI](https://github.com/oxkrypton/Halon/actions/workflows/ci.yml/badge.svg)](https://github.com/oxkrypton/Halon/actions/workflows/ci.yml)
+
 > **开发者/Agent 注意**:修改代码后必须同步更新文档,规则见 [AGENTS.md](AGENTS.md) 与 [docs/README.md](docs/README.md)。分模块详细文档见 [docs/](docs/README.md)。
 
 Halon 是一个**开源的云原生网关 Agent 项目**:一个通用 HTTP 网关 + 一个由大模型驱动的故障排查 Agent,两者彼此独立、通过契约通信,可部署到**任意 Kubernetes 集群**(Minikube、Kind、ACK、EKS 等)。

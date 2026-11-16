@@ -46,6 +46,7 @@ Agent 服务:事件去重 → 编排器队列 → LLM 排查循环(工具调用)
 
 ```bash
 make test            # go test -race ./... && go vet ./...(每次提交前必跑)
+make lint            # golangci-lint(每次提交前必跑;CI 在 push/PR 上强制同样检查)
 make build           # 构建 gateway / agent 两个产品二进制
 make build-demo      # 构建演示后端二进制
 make run-gateway / run-agent / run-demo   # 本地运行(环境变量见各模块文档)

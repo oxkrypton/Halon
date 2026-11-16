@@ -5,6 +5,7 @@
 ## 环境要求
 
 - Go 1.26+
+- golangci-lint v2.15+(本地跑 `make lint` 需要,如 `brew install golangci-lint`)
 - Docker(构建镜像)
 - kubectl + 任意 Kubernetes 集群(仅部署验证需要;本地推荐 Minikube 或 Kind)
 
@@ -13,10 +14,20 @@
 | 命令 | 作用 |
 | --- | --- |
 | `make test` | `go test -race ./...` + `go vet ./...`,**每次提交前必跑** |
+| `make lint` | `golangci-lint run ./...`(配置见 `.golangci.yml`),**每次提交前必跑** |
 | `make build` / `make build-demo` | 构建产品二进制 `bin/gateway`、`bin/agent` 与演示二进制 `bin/user-service-demo` |
 | `make run-gateway` / `make run-agent` / `make run-demo` | 本地运行(环境变量见各模块文档) |
 | `make docker-build` / `make docker-build-demo` | 构建产品镜像与演示镜像 |
 | `make deploy` | `kubectl apply -f deploy/kubernetes/`(适用于任意 K8s 集群) |
+
+## CI 流水线
+
+GitHub Actions 工作流见 `.github/workflows/ci.yml`,在 push 到 `main` 和每个 Pull Request 时运行,两个并行任务:
+
+- **test / vet / build**:gofmt 格式检查 → `go vet` → `go test -race -count=1` → `make build`。
+- **golangci-lint**:按 `.golangci.yml` 运行,版本固定为 v2.15(与本地 `make lint` 保持一致;升级时两边同步改)。
+
+规则:`#nosec` 豁免必须写明理由(参见 `internal/agent/tools/observability.go` 中 G201 的用法);不允许用配置整体关闭某个 linter 来让 CI 变绿。
 
 ## 目录约定
 
@@ -49,4 +60,4 @@ docs/                      # 本文档中心
 
 - Conventional Commits:`feat:` / `fix:` / `docs:` / `build:` / `test:` / `refactor:`,主题行英文小写、祈使句。
 - 一次提交只做一件事,分步提交;文档更新可与代码同提交,也可紧随其后以 `docs:` 单独提交。
-- 提交前确认:`make test` 全绿、`gofmt -l` 无输出、`git status` 无遗漏文件。
+- 提交前确认:`make test` 与 `make lint` 全绿、`gofmt -l` 无输出、`git status` 无遗漏文件。CI 会在 push 和 PR 上重复同样的检查,本地先跑可以少一次往返。
