@@ -7,7 +7,7 @@ Halon 是一个**开源的云原生网关 Agent 项目**:一个通用 HTTP 网�
 - **网关(gateway)**:通用反向代理,按 `ROUTES` 环境变量把路径前缀转发到任意上游 HTTP 服务;自带 IP 黑名单、按 IP 限流、流量日志落库、上游超时事件上报。**不感知任何具体业务服务。**
 - **Agent 服务(agent)**:接收网关超时事件,调用 OpenAI 兼容大模型,借助日志/PromQL/K8s 只读工具取证,按权限级别执行 Pod 重启、扩容、IP 封禁等变更,产出中文 Markdown 排查报告并持久化。
 
-`examples/user-service` 是演示用后端(带故障注入),**不属于产品本体**,仅用于本地开发与故障演练。
+`examples/user-service` 与 `examples/order-service` 是演示用后端(带故障注入),**不属于产品本体**,仅用于本地开发与故障演练。
 
 ## 当前架构
 
@@ -21,7 +21,7 @@ Gin Gateway (:8080)                      # 通用反向代理
     |
     | ROUTES: prefix=upstream(纯 HTTP)
     v
-任意上游服务(如 examples/user-service)
+任意上游服务(如 examples/ 下的 user-service、order-service 演示后端)
 
 Gin Gateway -- bounded channel --> Batch Writer --> PostgreSQL
                                                    |-- base_logs
@@ -98,7 +98,7 @@ docker run --rm --name halon-postgres \
 启动演示后端(第二个终端):
 
 ```bash
-make run-demo    # :8090
+make run-demo    # 用户服务 :8090;订单演示:go run ./examples/order-service(:8092)
 ```
 
 启动网关(第三个终端):
@@ -106,7 +106,7 @@ make run-demo    # :8090
 ```bash
 DATABASE_DSN='postgres://halon:halon-local-password@localhost:5432/halon?sslmode=disable' \
 ADMIN_TOKEN='halon-local-admin-token' \
-ROUTES='/api/v1/users/=http://localhost:8090' \
+ROUTES='/api/v1/users/=http://localhost:8090,/api/v1/orders/=http://localhost:8092' \
 make run-gateway
 ```
 
@@ -230,7 +230,8 @@ kubectl apply -f deploy/kubernetes/postgres.yaml
 kubectl rollout status statefulset/postgres --timeout=180s
 make deploy
 kubectl apply -f examples/user-service/deploy.yaml   # 可选演示后端
-kubectl rollout status deployment/gateway deployment/agent deployment/user-service --timeout=180s
+kubectl apply -f examples/order-service/deploy.yaml
+kubectl rollout status deployment/gateway deployment/agent deployment/user-service deployment/order-service --timeout=180s
 ```
 
 ### 端到端故障演练
@@ -273,7 +274,7 @@ kubectl rollout restart deployment/agent
 | --- | --- | --- |
 | `HTTP_ADDR` | `:8080` | 业务 HTTP 监听地址 |
 | `ADMIN_ADDR` | `:9090` | 管理 HTTP 监听地址 |
-| `ROUTES` | 空 | 路由表,`前缀=上游地址` 逗号分隔,如 `/api/v1/users/=http://user-service:8090` |
+| `ROUTES` | 空 | 路由表,`前缀=上游地址` 逗号分隔,如 `/api/v1/users/=http://user-service:8090,/api/v1/orders/=http://order-service:8092` |
 | `DATABASE_DSN` | 必填 | PostgreSQL 连接串 |
 | `ADMIN_TOKEN` | 必填,至少 12 字符 | 管理接口 Bearer Token |
 | `RATE_LIMIT_RPS` | `20` | 每个 IP 每秒补充的令牌数 |
@@ -331,7 +332,8 @@ kubectl rollout restart deployment/agent
 │   ├── incident/                 # 超时事件、去重、报告持久化及测试
 │   └── trafficlog/               # PostgreSQL、迁移、批写器和测试
 ├── examples/
-│   └── user-service/             # 演示后端(非产品):HTTP 服务 + 故障注入 + 部署清单
+│   ├── user-service/             # 演示后端(非产品):HTTP 服务 + 故障注入 + 部署清单
+│   └── order-service/            # 演示后端(非产品):订单接口 + 故障注入 + 部署清单
 ├── deploy/kubernetes/
 │   ├── agent.yaml                # Agent Deployment、Service 和 RBAC
 │   ├── gateway.yaml              # 网关 Deployment 和 Service

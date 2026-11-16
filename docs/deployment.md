@@ -9,6 +9,7 @@
 | gateway | `halon/gateway:dev` | `bin/gateway` | 8080 (业务) / 9090 (管理) | **产品**:通用网关 |
 | agent | `halon/agent:dev` | `bin/agent` | 8081 (事件 + 报告 API) | **产品**:故障排查 Agent |
 | user-service | `halon/user-service-demo:dev` | `bin/user-service-demo` | 8090 | **演示**,非产品 |
+| order-service | `halon/order-service-demo:dev` | `bin/order-service-demo` | 8092 | **演示**,非产品 |
 
 `Dockerfile` 是多阶段构建:golang:1.26-alpine 编译 → distroless 非 root 运行,`--build-arg SERVICE_PATH=<目录>` 选择入口(`cmd/gateway`、`cmd/agent` 或 `examples/user-service`)。`Makefile` 目标见 [development.md](development.md)。
 
@@ -22,7 +23,7 @@
 | `gateway.yaml` | 1 副本 Deployment + 两个 Service(`gateway` / `gateway-admin`),`ROUTES` 声明上游路由,推送超时事件到 `http://agent:8081/api/v1/incidents/timeout` |
 | `agent.yaml` | ServiceAccount + 命名空间级 Role/RoleBinding(最小权限)+ 1 副本 Deployment + Service |
 
-演示清单在 `examples/user-service/deploy.yaml`,需单独 `kubectl apply`。
+演示清单在 `examples/user-service/deploy.yaml` 与 `examples/order-service/deploy.yaml`,需单独 `kubectl apply`。
 
 ### 适配任意 K8s 集群
 

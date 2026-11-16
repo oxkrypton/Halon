@@ -13,7 +13,7 @@ Halon 是一个**开源的云原生网关 Agent 项目**，适用于任意 Kuber
 - **网关（gateway）**：通用 HTTP 反向代理，按 `ROUTES` 环境变量把路径前缀转发到任意上游服务；负责黑名单、限流、流量日志落库、超时事件上报。**它不感知任何具体业务服务。**
 - **Agent 服务（agent）**：接收网关超时事件，驱动 OpenAI 兼容大模型 + 只读/变更两级工具排查故障，产出中文 Markdown 报告并持久化。
 
-`examples/user-service` 是演示用后端，**不属于产品本体**，仅用于本地开发和故障演练。
+`examples/user-service` 与 `examples/order-service` 是演示用后端，**不属于产品本体**，仅用于本地开发和故障演练。
 
 仓库根目录：`/Users/krypton/Documents/Halon`，Go module：`github.com/oxkrypton/Halon`。
 
@@ -37,7 +37,7 @@ Agent 服务:事件去重 → 编排器队列 → LLM 排查循环(工具调用)
 | Agent 工具层 | [docs/modules/agent-tools.md](docs/modules/agent-tools.md) | `internal/agent/tools` |
 | 超时事件与故障报告 | [docs/modules/incident.md](docs/modules/incident.md) | `internal/incident` |
 | 流量日志存储 | [docs/modules/trafficlog.md](docs/modules/trafficlog.md) | `internal/trafficlog` |
-| 演示后端(示例,非产品) | [examples/user-service/README.md](examples/user-service/README.md) | `examples/user-service` |
+| 演示后端(示例,非产品) | [examples/user-service/README.md](examples/user-service/README.md)、[examples/order-service/README.md](examples/order-service/README.md) | `examples/` |
 | 部署与运维 | [docs/deployment.md](docs/deployment.md) | `Dockerfile`、`Makefile`、`deploy/kubernetes` |
 | 开发流程与约定 | [docs/development.md](docs/development.md) | 全仓库 |
 | 总体设计(历史设计稿) | [docs/system-architecture.txt](docs/system-architecture.txt) | — |
