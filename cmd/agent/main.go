@@ -1,0 +1,153 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"syscall"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
+
+	"github.com/oxkrypton/Halon/internal/agent"
+	"github.com/oxkrypton/Halon/internal/agent/tools"
+	"github.com/oxkrypton/Halon/internal/incident"
+)
+
+func main() {
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	slog.SetDefault(logger)
+	if err := run(logger); err != nil {
+		logger.Error("agent stopped", "error", err)
+		os.Exit(1)
+	}
+}
+
+func run(logger *slog.Logger) error {
+	cfg, err := agent.LoadConfig()
+	if err != nil {
+		return fmt.Errorf("load configuration: %w", err)
+	}
+	gin.SetMode(cfg.GinMode)
+
+	startupContext, cancelStartup := context.WithTimeout(context.Background(), 15*time.Second)
+	store, err := incident.OpenStore(startupContext, cfg.DatabaseDSN)
+	cancelStartup()
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	if err := store.Migrate(); err != nil {
+		return err
+	}
+
+	clientset, err := kubernetesClientset()
+	if err != nil {
+		return fmt.Errorf("create kubernetes client: %w", err)
+	}
+	kubernetesToolset, kubernetesTools := tools.NewKubernetesTools(clientset, tools.KubernetesOptions{
+		AllowedNamespaces: cfg.K8sNamespaces,
+		MaxReplicas:       cfg.K8sMaxReplicas,
+		ActionCooldown:    cfg.K8sActionCooldown,
+	})
+	sqlDB, err := store.SQLDB()
+	if err != nil {
+		return fmt.Errorf("access postgres connection pool: %w", err)
+	}
+	allTools := append(tools.ObservabilityTools(sqlDB, cfg.PrometheusURL, nil), kubernetesTools...)
+	allTools = append(allTools, tools.NewGatewayActionTool(kubernetesToolset, cfg.GatewayAdminURL, cfg.GatewayAdminToken, nil))
+	registry, err := agent.NewRegistry(cfg.OperationLevel, allTools...)
+	if err != nil {
+		return fmt.Errorf("register agent tools: %w", err)
+	}
+
+	model := agent.NewOpenAIClient(cfg.OpenAIBaseURL, cfg.OpenAIAPIKey, cfg.OpenAIModel, cfg.OpenAITimeout)
+	loop := agent.NewLoop(model, registry, cfg.MaxSteps, cfg.MaxToolOutput, logger)
+	orchestrator := agent.NewOrchestrator(loop, store, agent.OrchestratorOptions{
+		Level:      cfg.OperationLevel,
+		Workers:    cfg.Workers,
+		QueueSize:  cfg.QueueSize,
+		RunTimeout: cfg.RunTimeout,
+		Logger:     logger,
+	})
+	orchestratorDone := make(chan struct{})
+	go func() {
+		orchestrator.Run()
+		close(orchestratorDone)
+	}()
+
+	server := &http.Server{
+		Addr: cfg.HTTPAddr,
+		Handler: agent.NewHTTPHandler(agent.ServerDeps{
+			Orchestrator: orchestrator,
+			Deduper:      incident.NewDeduper(cfg.DedupTTL),
+			Reports:      store,
+			IngestToken:  cfg.IngestToken,
+			Logger:       logger,
+		}),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
+
+	serverErrors := make(chan error, 1)
+	go func() {
+		logger.Info("agent listener starting", "address", server.Addr, "level", cfg.OperationLevel)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErrors <- err
+		}
+	}()
+
+	signalContext, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	var runError error
+	select {
+	case <-signalContext.Done():
+		logger.Info("shutting down agent")
+	case err := <-serverErrors:
+		runError = err
+	}
+
+	shutdownContext, cancelShutdown := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+	defer cancelShutdown()
+	var shutdownErrors []error
+	if err := server.Shutdown(shutdownContext); err != nil {
+		shutdownErrors = append(shutdownErrors, fmt.Errorf("http server shutdown: %w", err))
+	}
+
+	// Drain queued investigations; each in-flight run is bounded by RunTimeout.
+	orchestrator.Close()
+	select {
+	case <-orchestratorDone:
+	case <-shutdownContext.Done():
+		shutdownErrors = append(shutdownErrors, errors.New("orchestrator drain timed out"))
+	}
+	return errors.Join(append(shutdownErrors, runError)...)
+}
+
+// kubernetesClientset prefers the in-cluster configuration and falls back
+// to the local kubeconfig for development outside the cluster.
+func kubernetesClientset() (kubernetes.Interface, error) {
+	if config, err := rest.InClusterConfig(); err == nil {
+		return kubernetes.NewForConfig(config)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("locate home directory for kubeconfig: %w", err)
+	}
+	config, err := clientcmd.BuildConfigFromFlags("", filepath.Join(home, ".kube", "config"))
+	if err != nil {
+		return nil, fmt.Errorf("load kubeconfig: %w", err)
+	}
+	return kubernetes.NewForConfig(config)
+}
