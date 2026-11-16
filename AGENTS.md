@@ -67,7 +67,7 @@ make deploy          # kubectl apply -f deploy/kubernetes/(适用于任意 K8s)
 
 ## 当前已知边界(改动前先读)
 
-- 网关黑名单/限流/熔断器/并发舱壁状态都在内存中,网关固定 1 副本;Agent 去重窗口与操作冷却也在内存中,Agent 固定 1 副本。要扩副本需先迁移到共享存储。
+- 共享状态分两模式:`REDIS_URL` 为空为内存模式(网关与 Agent 均固定 1 副本);非空为共享模式——黑名单/限流外迁 Redis(`internal/gateway/rules_redis.go`、`ratelimit_redis.go`),Agent 操作冷却经 `internal/agent/tools/cooldown.go` 的 `SET NX PX` 裁决,两端均可 `replicas: 2+`。熔断器/并发舱壁是**有意的 per-replica 语义**(保护本副本到上游的连接与请求配额),不外迁;事件去重由数据库唯一约束表决,任意副本数安全。**两端 `REDIS_URL` 必须同时配置或同时留空**,"半共享态"是配置错误。方案详见 `docs/proposals/shared-state-multireplica.md`。
 - Agent 与网关共用同一个 PostgreSQL 数据库,但使用**独立的迁移版本表**(`incident_schema_migrations`),不要合并。
 - 网关与上游之间、Agent 与网关管理接口之间均为集群内明文 HTTP;跨集群或不可信网络应启用 TLS。
 - `OPENAI_API_KEY` 等密钥只走 `halon-secrets`,禁止入库或写入代码。

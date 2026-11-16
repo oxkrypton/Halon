@@ -1,6 +1,6 @@
 # 共享状态外迁与多副本方案 v1(设计稿)
 
-> 状态:**待评审**(2026-11-17)
+> 状态:**已实施**(2026-11-17,P0–P4 全部落地;参考 Redis 清单位于 `deploy/kubernetes/redis/` 子目录而非主路径单文件,以满足"不进 `make deploy`"的约束)
 > 评审修订(2026-11-17):限流算法定为 Lua 令牌桶、与现有语义逐点对齐(§3.4);Redis 参考清单开启 AOF 并补恢复步骤(§6);补半共享配置约束与多部署隔离(§5)、滚动升级混合模式窗口(§10)。
 > 范围:`cmd/gateway`、`internal/gateway`、`internal/agent`、`internal/incident`、部署清单与文档
 > 前置阅读:AGENTS.md「当前已知边界」第一条、[gateway-observability-robustness.md](gateway-observability-robustness.md) §12 末行

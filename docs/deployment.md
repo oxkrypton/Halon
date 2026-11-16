@@ -61,6 +61,23 @@ make deploy-redis   # kubectl apply -f deploy/kubernetes/redis/
 
 Redis 健康不进 `/readyz`(降级策略允许网关在 Redis 不可达时继续服务,摘除 Pod 反而中断全部流量),用指标表达:网关 `halon_gateway_redis_up`、Agent `halon_agent_redis_up`(新增 `/metrics` 端点),告警规则可并入观测栈。
 
+切换到多副本的步骤:
+
+1. `make deploy-redis`(或指向托管/HA Redis);
+2. 网关与 Agent 清单同时打开 `REDIS_URL`,先把两端滚动到共享模式——滚动期间内存/共享副本并存,黑名单"≤10s 全副本收敛"的承诺只在全部副本进入共享模式后成立,升级窗口内按单副本语义理解;
+3. 确认两端启动日志均为 `shared_state_mode=redis` 且 `halon_*_redis_up` 为 1;
+4. 再把 `replicas` 提到 2+。回滚:两端同时去掉 `REDIS_URL` 并把 `replicas` 降回 1 即可,任意阶段都安全。
+
+共享模式下黑名单新增/解除最坏 10s 收敛全部副本。需要即时生效时逐 Pod 调管理接口:
+
+```bash
+for pod in $(kubectl get pods -l app.kubernetes.io/name=gateway -o name); do
+  kubectl exec "$pod" -- true 2>/dev/null  # 确认 pod 可用(可选)
+  kubectl port-forward "$pod" 19090:9090 &  # 逐个执行:先 port-forward 再 curl,做完杀掉后台任务
+done
+# 对每个转发的本地端口执行:curl -X PUT -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost:19090/admin/rules/blacklist/1.2.3.4
+```
+
 ### 适配任意 K8s 集群
 
 清单不绑定任何发行版,无 Minikube/云厂商专属 API:

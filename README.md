@@ -351,7 +351,7 @@ kubectl rollout restart deployment/agent
 
 ## 当前边界
 
-- 黑名单、限流、熔断器与并发舱壁状态都保存在网关内存中,因此当前 Deployment 固定为 1 个副本;多副本前应迁移到 Redis 等共享存储。
+- 共享状态分两模式:`REDIS_URL` 为空为内存模式,网关与 Agent 均固定 1 副本;非空为共享模式,黑名单/限流/操作冷却外迁 Redis,两端均可 2+ 副本(需两端同时配置;熔断器与并发舱壁是有意的 per-replica 语义,不外迁;事件去重由数据库唯一约束表决,任意副本数安全)。参考清单 `make deploy-redis`,详见 `docs/deployment.md`。
 - 异步日志采用有界、尽力投递队列,数据库长期不可用或队列饱和时会丢弃日志,避免拖垮业务请求。
 - 网关与上游之间、Agent 与网关管理接口之间使用集群内明文 HTTP;跨集群或不可信网络应启用 TLS。
 - 弹性策略依赖 failsafe-go(v0.x,API 可能变动),全部封装在 `internal/gateway/resilience.go`;追踪依赖 OpenTelemetry Go SDK,默认关闭。

@@ -52,7 +52,10 @@ metadata:
     app.kubernetes.io/name: agent
     app.kubernetes.io/part-of: halon
 spec:
-  # Single replica: the dedup window and action cooldowns are memory-local.
+  # Memory mode (default): single replica because action cooldowns are
+  # memory-local (event dedup is safe at any replica count — the database
+  # unique constraint arbitrates). With REDIS_URL set on BOTH gateway and
+  # agent (shared mode), 2+ replicas are safe.
   replicas: 1
   selector:
     matchLabels:
@@ -108,6 +111,11 @@ spec:
                 secretKeyRef:
                   name: halon-secrets
                   key: admin-token
+            # Shared-state mode is off by default. After deploying Redis
+            # (make deploy-redis) uncomment on BOTH gateway and agent,
+            # then replicas may be raised above 1:
+            # - name: REDIS_URL
+            #   value: redis://redis:6379/0
           startupProbe:
             httpGet:
               path: /healthz
