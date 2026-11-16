@@ -14,6 +14,7 @@
 
 ### 开发指南
 
+- [项目阅读指南](reading-guide.md) — 接手本项目的高效阅读方针:先文档后实验、带问题追代码、修改前检查项
 - [开发流程与约定](development.md) — 环境要求、命令、代码约定、测试与提交规范
 - [部署与运维](deployment.md) — Dockerfile、Makefile、K8s 清单、Secret、本地与 Minikube 运行
 
