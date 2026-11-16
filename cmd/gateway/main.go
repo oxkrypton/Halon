@@ -95,9 +95,14 @@ func run() error {
 	}
 	logger.Info("shared state mode", "shared_state_mode", sharedStateMode)
 
-	rules, err := gateway.NewIPRules(nil)
-	if err != nil {
-		return err
+	var rules gateway.BlacklistStore
+	if redisClient != nil {
+		rules = gateway.NewRedisBlacklistStore(redisClient, cfg.BlacklistCacheTTL, cfg.RedisOpTimeout, logger, metrics.SetRedisUp)
+	} else {
+		rules, err = gateway.NewIPRules(nil)
+		if err != nil {
+			return err
+		}
 	}
 	limiter := gateway.NewRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst)
 

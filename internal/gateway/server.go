@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"time"
@@ -21,7 +22,7 @@ type Dependencies struct {
 	LogQueue             chan<- trafficlog.Entry
 	TimeoutQueue         chan<- incident.TimeoutEvent
 	Logger               *slog.Logger
-	Rules                *IPRules
+	Rules                BlacklistStore
 	Limiter              *RateLimiter
 	Metrics              *Metrics
 	Proxy                ProxyOptions
@@ -59,7 +60,7 @@ func NewHTTPHandler(dependencies Dependencies) *gin.Engine {
 	proxy := dependencies.Proxy
 	proxy.Resilience.Metrics = metrics
 	proxyMiddlewares := []gin.HandlerFunc{
-		dependencies.Rules.Middleware(func() { metrics.IncRejected(RejectReasonBlacklist) }),
+		BlacklistMiddleware(dependencies.Rules, func() { metrics.IncRejected(RejectReasonBlacklist) }),
 		dependencies.Limiter.Middleware(func() { metrics.IncRejected(RejectReasonRateLimit) }),
 		routes.ProxyHandler(proxy, dependencies.Resilience),
 	}
@@ -80,7 +81,7 @@ type AdminOptions struct {
 	Resilience         *ResilienceSet
 }
 
-func NewAdminHandler(token string, rules *IPRules, limiter *RateLimiter, logger *slog.Logger, metrics *Metrics, options AdminOptions) *gin.Engine {
+func NewAdminHandler(token string, rules BlacklistStore, limiter *RateLimiter, logger *slog.Logger, metrics *Metrics, options AdminOptions) *gin.Engine {
 	router := newRouter(logger)
 	router.GET("/healthz", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
@@ -106,6 +107,10 @@ func NewAdminHandler(token string, rules *IPRules, limiter *RateLimiter, logger 
 	admin.PUT("/rules/blacklist/:ip", func(c *gin.Context) {
 		created, err := rules.Add(c.Param("ip"))
 		if err != nil {
+			if errors.Is(err, ErrBlacklistUnavailable) {
+				abortWithError(c, http.StatusServiceUnavailable, "BLACKLIST_UNAVAILABLE", "blacklist store is unavailable")
+				return
+			}
 			abortWithError(c, http.StatusBadRequest, "INVALID_IP", err.Error())
 			return
 		}
@@ -113,11 +118,19 @@ func NewAdminHandler(token string, rules *IPRules, limiter *RateLimiter, logger 
 		if created {
 			statusCode = http.StatusCreated
 		}
-		c.JSON(statusCode, gin.H{"ip": c.Param("ip")})
+		body := gin.H{"ip": c.Param("ip")}
+		if propagator, ok := rules.(interface{ Propagation() string }); ok {
+			body["propagation"] = propagator.Propagation()
+		}
+		c.JSON(statusCode, body)
 	})
 	admin.DELETE("/rules/blacklist/:ip", func(c *gin.Context) {
 		removed, err := rules.Remove(c.Param("ip"))
 		if err != nil {
+			if errors.Is(err, ErrBlacklistUnavailable) {
+				abortWithError(c, http.StatusServiceUnavailable, "BLACKLIST_UNAVAILABLE", "blacklist store is unavailable")
+				return
+			}
 			abortWithError(c, http.StatusBadRequest, "INVALID_IP", err.Error())
 			return
 		}

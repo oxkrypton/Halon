@@ -25,7 +25,8 @@
 | `errors.go` | 统一错误响应结构 `abortWithError` 与 `upstream_timeout` 标记键 |
 | `accesslog.go` | `AccessLog` 中间件:采集请求/响应体(各自最多 `BODY_CAPTURE_BYTES`),投递日志队列;检测超时标记并投递超时事件队列;日志字段含 `route`、`trace_id`(启用 OTel 时)、`upstream_result`、`retries`;维护在途请求 gauge 与队列丢弃计数 |
 | `notify.go` | `TimeoutNotifier`:消费超时事件队列,POST JSON 到 `AGENT_WEBHOOK_URL`,带 Bearer Token,最多 3 次指数退避重试;最终失败计入 `halon_gateway_webhook_notify_failures_total` |
-| `rules.go` | `IPRules`:内存黑名单,IP 规范化(`canonicalIP`),`Middleware()` 拦截并计数拒绝 |
+| `rules.go` | `BlacklistStore` 接口(Add/Remove/Contains/List)与 `ErrBlacklistUnavailable`;`IPRules`:内存实现(内存模式),IP 规范化(`canonicalIP`);`BlacklistMiddleware` 拦截并计数拒绝 |
+| `rules_redis.go` | `RedisBlacklistStore`:共享实现——Redis 集合 `halon:blacklist` 为事实源,进程内缓存服务读路径;pub/sub 即时失效 + TTL 兜底刷新;写失败返回 `ErrBlacklistUnavailable`(管理接口 503) |
 | `ratelimit.go` | `RateLimiter`:每 IP 独立令牌桶(`golang.org/x/time/rate`),`Update` 动态调参,拒绝计数 |
 | `metrics.go` | Prometheus 指标与 `/metrics` Handler(独立 Registry,全部方法 nil-safe) |
 | `request.go` | `RequestID` 中间件(校验/生成)、`Recovery`、`adminAuthentication`(常量时间比较) |
@@ -65,6 +66,15 @@ ProxyHandler 带 UPSTREAM_TIMEOUT 的 context 调上游
 
 `AGENT_WEBHOOK_URL` 为空时整个超时事件链路不启用(队列不创建,事件直接不生成)。
 
+### 共享模式(可选,`REDIS_URL` 非空时启用)
+
+黑名单外迁到 Redis,事实源是集合 `halon:blacklist`:
+
+- **读路径零 Redis 往返**:每请求只查进程内缓存;两级失效——pub/sub 频道 `halon:blacklist:invalidate` 即时通知 + `BLACKLIST_CACHE_TTL`(默认 10s)兜底刷新,消息丢失由 TTL 兜住;
+- **生效窗口**:新增/解除封禁最坏 10s 内在全部副本生效;管理接口写响应带 `propagation: "eventually, <=10s"`,不承诺实时。需要即时生效时经 `kubectl port-forward` 逐 Pod 调管理接口(见 `docs/deployment.md`);
+- **降级**:Redis 不可达时读路径退化为最后一份缓存,`halon_gateway_redis_up` 归 0;写操作返回 503 `BLACKLIST_UNAVAILABLE`(安全功能不允许"看似写成功");
+- 滚动升级期间内存/共享副本并存,上述收敛承诺仅在全部副本进入共享模式后成立。
+
 ### 优雅退出顺序(`cmd/gateway/main.go`)
 
 停两个 HTTP server → `close(logQueue)` / `close(timeoutQueue)` → 等 BatchWriter 和 TimeoutNotifier 排空 → 关数据库;TracerProvider 随进程退出前刷新(span 有界批量,不阻塞)。顺序不能颠倒,否则在途 handler 会向已关闭的 channel 发送导致 panic。
@@ -84,7 +94,7 @@ ProxyHandler 带 UPSTREAM_TIMEOUT 的 context 调上游
 ## 错误语义
 
 - 上游响应(包括 4xx/5xx)**原样透传**,网关不包装;
-- 网关自身错误统一 `{error:{code,message,request_id}}`:404 `ROUTE_NOT_FOUND`、403 `IP_BLOCKED`、429 `RATE_LIMITED` / `CONCURRENCY_LIMIT`、413 `REQUEST_TOO_LARGE`、503 `UPSTREAM_UNAVAILABLE`(熔断开启,带 `Retry-After`)、504 `UPSTREAM_TIMEOUT`(同时触发超时事件)、502 `UPSTREAM_ERROR`。
+- 网关自身错误统一 `{error:{code,message,request_id}}`:404 `ROUTE_NOT_FOUND`、403 `IP_BLOCKED`、429 `RATE_LIMITED` / `CONCURRENCY_LIMIT`、413 `REQUEST_TOO_LARGE`、503 `UPSTREAM_UNAVAILABLE`(熔断开启,带 `Retry-After`)、503 `BLACKLIST_UNAVAILABLE`(共享模式黑名单写时 Redis 不可达)、504 `UPSTREAM_TIMEOUT`(同时触发超时事件)、502 `UPSTREAM_ERROR`。
 
 ## 指标清单(`/metrics`,管理端口)
 
@@ -105,10 +115,11 @@ ProxyHandler 带 UPSTREAM_TIMEOUT 的 context 调上游
 | `halon_gateway_circuit_breaker_trips_total` | Counter | route | 熔断触发次数 |
 | `halon_gateway_trafficlog_dropped_total` / `halon_gateway_timeout_events_dropped_total` | Counter | — | 有界队列丢弃 |
 | `halon_gateway_webhook_notify_failures_total` | Counter | — | 超时事件推送 Agent 最终失败 |
+| `halon_gateway_redis_up` | Gauge | — | 共享模式 Redis 可达性(内存模式恒 1) |
 
 ## 测试
 
-`server_test.go`(代理转发/透传/超时/不可达/404、路由表解析、探针、管理接口、限流)、`observability_test.go`(超时事件与指标、webhook 投递)、`resilience_test.go`(重试与体重放、熔断迁移与 503 快速失败、bulkhead 打满 429、请求体上限 413、响应头超时归类 504、`/metrics` 鉴权、`/admin/breakers`;上游传输用桩 RoundTripper 保证确定性)、`tracing_test.go`(OTel 禁用透传、server/client span 同 trace、`traceparent` 透传,用 in-memory span recorder)、`config_test.go`(配置校验)。真实上游一律用 `httptest.NewServer`。
+`server_test.go`(代理转发/透传/超时/不可达/404、路由表解析、探针、管理接口、限流)、`observability_test.go`(超时事件与指标、webhook 投递)、`resilience_test.go`(重试与体重放、熔断迁移与 503 快速失败、bulkhead 打满 429、请求体上限 413、响应头超时归类 504、`/metrics` 鉴权、`/admin/breakers`;上游传输用桩 RoundTripper 保证确定性)、`tracing_test.go`(OTel 禁用透传、server/client span 同 trace、`traceparent` 透传,用 in-memory span recorder)、`rules_redis_test.go`(共享黑名单增删、外部写入刷新、双副本 pub/sub 传播、TTL 兜底、降级读缓存/写 503;`alicebob/miniredis` 进程内仿真)、`config_test.go`(配置校验)。真实上游一律用 `httptest.NewServer`。
 
 ## 修改本模块时必须同步检查
 
@@ -120,7 +131,7 @@ ProxyHandler 带 UPSTREAM_TIMEOUT 的 context 调上游
 
 ## 已知边界
 
-- 黑名单、限流、熔断器与并发舱壁都是内存态,Deployment 固定 1 副本;
+- 黑名单在共享模式下已外迁 Redis;限流、熔断器与并发舱壁仍是内存态,Deployment 固定 1 副本(多副本待限流外迁,见 `docs/proposals/shared-state-multireplica.md`);
 - 日志与超时事件队列均为有界、满则丢弃,保证不拖垮业务请求;
 - 与上游之间是明文 HTTP,跨集群或不可信网络应启用 TLS;
 - 熔断/限流等弹性策略基于 `failsafe-go`(v0.x,API 可能随版本变动),全部封装在 `resilience.go`,升级依赖时只改这一处;
