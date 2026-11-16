@@ -7,7 +7,7 @@ DEMO_ORDER_IMAGE := halon/order-service-demo:dev
 GO_BIN := $(shell go env GOPATH)/bin
 export PATH := $(GO_BIN):$(PATH)
 
-.PHONY: test lint run-gateway run-agent run-demo build build-demo docker-build docker-build-demo minikube-start minikube-image deploy status clean
+.PHONY: test lint run-gateway run-agent run-demo build build-demo docker-build docker-build-demo minikube-start minikube-image deploy deploy-observability status clean
 
 test:
 	go test -race ./...
@@ -51,6 +51,11 @@ minikube-image: docker-build docker-build-demo
 
 deploy:
 	kubectl apply -f deploy/kubernetes/
+
+# Optional observability reference stack (Prometheus/Grafana/Loki/Tempo/
+# OTel Collector). Not part of `make deploy`; see docs/deployment.md.
+deploy-observability:
+	kubectl apply -f deploy/kubernetes/observability/
 
 status:
 	kubectl get pods,services,statefulsets -l app.kubernetes.io/part-of=halon

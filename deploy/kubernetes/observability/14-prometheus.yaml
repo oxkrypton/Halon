@@ -1,0 +1,197 @@
+# Prometheus: scrapes the gateway admin /metrics endpoint and evaluates the
+# Halon alert rules. If the cluster already runs kube-prometheus-stack, skip
+# this file and add the scrape job and rules to your existing installation
+# (see docs/deployment.md).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: prometheus
+    app.kubernetes.io/part-of: halon-observability
+data:
+  prometheus.yaml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+    rule_files:
+      - /etc/prometheus/rules/*.yaml
+    alerting:
+      alertmanagers:
+        - static_configs:
+            - targets:
+                - alertmanager.observability.svc.cluster.local:9093
+    scrape_configs:
+      # The gateway admin service is ClusterIP-only in the default namespace.
+      - job_name: halon-gateway
+        metrics_path: /metrics
+        static_configs:
+          - targets:
+              - gateway-admin.default.svc.cluster.local:9090
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-rules
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: prometheus
+    app.kubernetes.io/part-of: halon-observability
+data:
+  halon-gateway.yaml: |
+    groups:
+      - name: halon-gateway
+        rules:
+          - alert: HalonGatewayHighServerErrorRate
+            expr: |
+              sum(rate(halon_gateway_http_requests_total{status=~"5.."}[5m]))
+                / sum(rate(halon_gateway_http_requests_total[5m])) > 0.05
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Gateway 5xx ratio above 5% for 5m"
+          - alert: HalonGatewayUpstreamErrors
+            expr: |
+              sum by (route) (rate(halon_gateway_upstream_requests_total{result!="success"}[5m])) > 1
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Upstream calls failing on route {{ $labels.route }}"
+          - alert: HalonGatewayHighLatencyP99
+            expr: |
+              histogram_quantile(0.99,
+                sum by (le, route) (rate(halon_gateway_http_request_duration_seconds_bucket[5m]))) > 1
+            for: 10m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Gateway P99 latency above 1s on route {{ $labels.route }}"
+          - alert: HalonGatewayCircuitBreakerOpen
+            expr: halon_gateway_circuit_breaker_state == 2
+            for: 2m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Circuit breaker open on route {{ $labels.route }}"
+          - alert: HalonGatewayRetryStorm
+            expr: |
+              sum by (route) (rate(halon_gateway_retries_total[5m]))
+                / sum by (route) (rate(halon_gateway_upstream_requests_total[5m])) > 0.2
+            for: 10m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Retries exceed 20% of upstream calls on route {{ $labels.route }}"
+          - alert: HalonGatewayQueueDrops
+            expr: |
+              rate(halon_gateway_trafficlog_dropped_total[5m]) > 0
+                or rate(halon_gateway_timeout_events_dropped_total[5m]) > 0
+            for: 1m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Gateway is dropping traffic log entries or timeout events"
+          - alert: HalonGatewayWebhookNotifyFailures
+            expr: rate(halon_gateway_webhook_notify_failures_total[5m]) > 0
+            for: 5m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Timeout incident webhooks to the Agent are failing"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: prometheus
+    app.kubernetes.io/part-of: halon-observability
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: prometheus
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: prometheus
+        app.kubernetes.io/part-of: halon-observability
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v3.1.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --config.file=/etc/prometheus/prometheus.yaml
+            - --storage.tsdb.path=/prometheus
+            - --storage.tsdb.retention.time=3d
+          ports:
+            - name: http
+              containerPort: 9090
+              protocol: TCP
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+              readOnly: true
+            - name: rules
+              mountPath: /etc/prometheus/rules
+              readOnly: true
+            - name: data
+              mountPath: /prometheus
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65534
+            capabilities:
+              drop:
+                - ALL
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+        - name: rules
+          configMap:
+            name: prometheus-rules
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: prometheus
+    app.kubernetes.io/part-of: halon-observability
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: prometheus
+  ports:
+    - name: http
+      port: 9090
+      targetPort: http
+      protocol: TCP

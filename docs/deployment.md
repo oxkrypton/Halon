@@ -25,6 +25,28 @@
 
 演示清单在 `examples/user-service/deploy.yaml` 与 `examples/order-service/deploy.yaml`,需单独 `kubectl apply`。
 
+可选观测栈在 `deploy/kubernetes/observability/`(`make deploy` **不**包含它):
+
+```bash
+make deploy-observability   # kubectl apply -f deploy/kubernetes/observability/
+```
+
+| 组件 | 角色 | 访问方式 |
+| --- | --- | --- |
+| OTel Collector | 接收网关 OTLP traces(4317/4318),转发 Tempo | 集群内服务 |
+| Tempo | 追踪存储(单二进制,本地存储,保留 24h) | 经 Grafana 查询 |
+| Loki | 日志存储(单二进制,保留 72h) | 经 Grafana 查询 |
+| Alloy | 每节点日志采集(Kubernetes API,只采 `app.kubernetes.io/part-of=halon` 的 Pod) | DaemonSet |
+| Prometheus | 抓取 `gateway-admin:9090/metrics`,评估告警规则 | 集群内服务 |
+| Alertmanager | 告警分组路由(默认无 receiver,需自行配置通知渠道) | 集群内服务 |
+| Grafana | 看板与三信号关联查询,预置「Halon Gateway」看板 | `kubectl port-forward -n observability service/grafana 3000:3000`,默认 admin / `halon-admin`(生产必改) |
+
+启用追踪:部署栈后,在 `gateway.yaml` 打开 `OTEL_ENABLED=true`(清单里有注释好的示例)并 `kubectl rollout restart deployment/gateway`。之后:Loki 日志行的 `trace_id` 可一键跳到 Tempo 追踪,Grafana Explore 三信号互通。
+
+对接已有 Prometheus:集群已有 kube-prometheus-stack 时跳过 `14-prometheus.yaml`/`15-alertmanager.yaml`,把 `14-prometheus.yaml` 里的 `halon-gateway` scrape job 与告警规则组(`prometheus-rules` ConfigMap 内容)并入现有安装即可。
+
+Loki 基数约定:`trace_id`、`route`、`status` 可做 label 或查询条件;`path`、`client_ip` 只作为日志字段检索,严禁进 label(Loki 高基数会显著拖慢)。
+
 ### 适配任意 K8s 集群
 
 清单不绑定任何发行版,无 Minikube/云厂商专属 API:

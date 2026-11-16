@@ -1,0 +1,12 @@
+# Optional observability reference stack for Halon (OTel Collector, Tempo,
+# Loki, Prometheus, Alertmanager, Grafana, Alloy). It is NOT part of
+# `make deploy`; deploy it explicitly with `make deploy-observability`.
+# All components are single-replica with conservative resources, meant as a
+# working starting point for any Kubernetes cluster — harden and scale for
+# production use.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: observability
+  labels:
+    app.kubernetes.io/part-of: halon-observability
