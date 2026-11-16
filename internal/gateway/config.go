@@ -12,7 +12,7 @@ import (
 type Config struct {
 	HTTPAddr             string
 	AdminAddr            string
-	UserServiceAddr      string
+	Routes               string
 	DatabaseDSN          string
 	AdminToken           string
 	AgentWebhookURL      string
@@ -24,7 +24,7 @@ type Config struct {
 	LogBatchSize         int
 	TimeoutQueueSize     int
 	LogFlushInterval     time.Duration
-	RPCTimeout           time.Duration
+	ProxyTimeout         time.Duration
 	SlowRequestThreshold time.Duration
 	BodyCaptureLimit     int64
 	ShutdownTimeout      time.Duration
@@ -34,7 +34,7 @@ func LoadConfig() (Config, error) {
 	cfg := Config{
 		HTTPAddr:             envString("HTTP_ADDR", ":8080"),
 		AdminAddr:            envString("ADMIN_ADDR", ":9090"),
-		UserServiceAddr:      envString("USER_SERVICE_ADDR", "localhost:50051"),
+		Routes:               os.Getenv("ROUTES"),
 		DatabaseDSN:          os.Getenv("DATABASE_DSN"),
 		AdminToken:           os.Getenv("ADMIN_TOKEN"),
 		AgentWebhookURL:      os.Getenv("AGENT_WEBHOOK_URL"),
@@ -46,7 +46,7 @@ func LoadConfig() (Config, error) {
 		LogBatchSize:         500,
 		TimeoutQueueSize:     64,
 		LogFlushInterval:     time.Second,
-		RPCTimeout:           3 * time.Second,
+		ProxyTimeout:         3 * time.Second,
 		SlowRequestThreshold: time.Second,
 		BodyCaptureLimit:     64 * 1024,
 		ShutdownTimeout:      10 * time.Second,
@@ -71,7 +71,7 @@ func LoadConfig() (Config, error) {
 	if cfg.LogFlushInterval, err = envDuration("LOG_FLUSH_INTERVAL", cfg.LogFlushInterval); err != nil {
 		return Config{}, err
 	}
-	if cfg.RPCTimeout, err = envDuration("RPC_TIMEOUT", cfg.RPCTimeout); err != nil {
+	if cfg.ProxyTimeout, err = envDuration("UPSTREAM_TIMEOUT", cfg.ProxyTimeout); err != nil {
 		return Config{}, err
 	}
 	if cfg.SlowRequestThreshold, err = envDuration("SLOW_REQUEST_THRESHOLD", cfg.SlowRequestThreshold); err != nil {
@@ -85,6 +85,9 @@ func LoadConfig() (Config, error) {
 	}
 
 	var validationErrors []error
+	if _, err := ParseRoutes(cfg.Routes); err != nil {
+		validationErrors = append(validationErrors, fmt.Errorf("ROUTES: %w", err))
+	}
 	if cfg.DatabaseDSN == "" {
 		validationErrors = append(validationErrors, errors.New("DATABASE_DSN is required"))
 	}
@@ -103,7 +106,7 @@ func LoadConfig() (Config, error) {
 	if cfg.LogQueueSize <= 0 || cfg.LogBatchSize <= 0 || cfg.TimeoutQueueSize <= 0 || cfg.LogFlushInterval <= 0 {
 		validationErrors = append(validationErrors, errors.New("log queues, batch size, and flush interval must be positive"))
 	}
-	if cfg.RPCTimeout <= 0 || cfg.SlowRequestThreshold <= 0 || cfg.BodyCaptureLimit <= 0 || cfg.ShutdownTimeout <= 0 {
+	if cfg.ProxyTimeout <= 0 || cfg.SlowRequestThreshold <= 0 || cfg.BodyCaptureLimit <= 0 || cfg.ShutdownTimeout <= 0 {
 		validationErrors = append(validationErrors, errors.New("timeouts and body capture limit must be positive"))
 	}
 	return cfg, errors.Join(validationErrors...)

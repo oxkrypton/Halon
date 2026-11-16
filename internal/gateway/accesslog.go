@@ -107,7 +107,7 @@ func AccessLog(options AccessLogOptions) gin.HandlerFunc {
 				OccurredAt: time.Now().UTC(),
 				Method:     entry.Base.Method,
 				Path:       entry.Base.Path,
-				Route:      c.FullPath(),
+				Route:      routeLabel(c),
 				ClientIP:   entry.Base.ClientIP,
 				StatusCode: status,
 				LatencyMS:  entry.Base.LatencyMS,

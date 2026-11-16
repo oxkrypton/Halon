@@ -7,24 +7,16 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	userv1 "github.com/oxkrypton/Halon/api/gen/user/v1"
 	"github.com/oxkrypton/Halon/internal/incident"
 	"github.com/oxkrypton/Halon/internal/trafficlog"
-	"google.golang.org/grpc"
-	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 )
-
-type HealthChecker interface {
-	Check(context.Context, *healthpb.HealthCheckRequest, ...grpc.CallOption) (*healthpb.HealthCheckResponse, error)
-}
 
 type Pinger interface {
 	Ping(context.Context) error
 }
 
 type Dependencies struct {
-	UserClient           userv1.UserServiceClient
-	HealthClient         HealthChecker
+	Routes               *RouteTable
 	Repository           Pinger
 	LogQueue             chan<- trafficlog.Entry
 	TimeoutQueue         chan<- incident.TimeoutEvent
@@ -32,7 +24,7 @@ type Dependencies struct {
 	Rules                *IPRules
 	Limiter              *RateLimiter
 	Metrics              *Metrics
-	RPCTimeout           time.Duration
+	ProxyTimeout         time.Duration
 	SlowRequestThreshold time.Duration
 	BodyCaptureLimit     int64
 }
@@ -54,11 +46,27 @@ func NewHTTPHandler(dependencies Dependencies) *gin.Engine {
 	router.GET("/healthz", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
-	router.GET("/readyz", readinessHandler(dependencies.Repository, dependencies.HealthClient))
+	router.GET("/readyz", readinessHandler(dependencies.Repository))
 
-	userHandler := &UserHandler{client: dependencies.UserClient, timeout: dependencies.RPCTimeout}
-	api := router.Group("/api/v1", dependencies.Rules.Middleware(), dependencies.Limiter.Middleware())
-	api.GET("/users/:id", userHandler.GetUser)
+	// Everything that is not a probe is a proxy candidate: blacklist and
+	// rate limit first, then the route table decides the upstream.
+	routes := dependencies.Routes
+	if routes == nil {
+		routes = &RouteTable{}
+	}
+	proxyMiddlewares := []gin.HandlerFunc{
+		dependencies.Rules.Middleware(),
+		dependencies.Limiter.Middleware(),
+		routes.ProxyHandler(dependencies.ProxyTimeout),
+	}
+	router.NoRoute(func(c *gin.Context) {
+		for _, middleware := range proxyMiddlewares {
+			middleware(c)
+			if c.IsAborted() {
+				return
+			}
+		}
+	})
 	return router
 }
 
@@ -127,38 +135,32 @@ func newRouter(logger *slog.Logger, middleware ...gin.HandlerFunc) *gin.Engine {
 	if err := router.SetTrustedProxies(nil); err != nil {
 		panic(err)
 	}
-	router.HandleMethodNotAllowed = true
+	router.HandleMethodNotAllowed = false
 	router.Use(RequestID())
 	if len(middleware) > 0 {
 		router.Use(middleware...)
 	}
 	router.Use(Recovery(logger))
-	router.NoRoute(func(c *gin.Context) {
-		abortWithError(c, http.StatusNotFound, "ROUTE_NOT_FOUND", "route not found")
-	})
 	router.NoMethod(func(c *gin.Context) {
 		abortWithError(c, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
 	})
 	return router
 }
 
-func readinessHandler(repository Pinger, healthClient HealthChecker) gin.HandlerFunc {
+func readinessHandler(repository Pinger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
 		defer cancel()
-		databaseReady := repository.Ping(ctx) == nil
-		health, err := healthClient.Check(ctx, &healthpb.HealthCheckRequest{Service: userv1.UserService_ServiceDesc.ServiceName})
-		userServiceReady := err == nil && health.GetStatus() == healthpb.HealthCheckResponse_SERVING
-		if !databaseReady || !userServiceReady {
+		if repository.Ping(ctx) != nil {
 			c.JSON(http.StatusServiceUnavailable, gin.H{
 				"status": "not_ready",
-				"checks": gin.H{"database": databaseReady, "user_service": userServiceReady},
+				"checks": gin.H{"database": false},
 			})
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{
 			"status": "ready",
-			"checks": gin.H{"database": databaseReady, "user_service": userServiceReady},
+			"checks": gin.H{"database": true},
 		})
 	}
 }

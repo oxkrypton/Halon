@@ -12,13 +12,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	userv1 "github.com/oxkrypton/Halon/api/gen/user/v1"
 	"github.com/oxkrypton/Halon/internal/gateway"
 	"github.com/oxkrypton/Halon/internal/incident"
 	"github.com/oxkrypton/Halon/internal/trafficlog"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 )
 
 func main() {
@@ -48,11 +44,11 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
-	connection, err := grpc.NewClient(cfg.UserServiceAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	routes, err := gateway.ParseRoutes(cfg.Routes)
 	if err != nil {
-		return fmt.Errorf("create user service connection: %w", err)
+		return fmt.Errorf("parse routes: %w", err)
 	}
-	defer connection.Close()
+	logger.Info("proxy routes loaded", "count", len(routes.Routes()))
 
 	rules, err := gateway.NewIPRules(nil)
 	if err != nil {
@@ -81,8 +77,7 @@ func run(logger *slog.Logger) error {
 	}
 	metrics := gateway.NewMetrics()
 	httpServer := newHTTPServer(cfg.HTTPAddr, gateway.NewHTTPHandler(gateway.Dependencies{
-		UserClient:           userv1.NewUserServiceClient(connection),
-		HealthClient:         healthpb.NewHealthClient(connection),
+		Routes:               routes,
 		Repository:           repository,
 		LogQueue:             queue,
 		TimeoutQueue:         timeoutQueue,
@@ -90,7 +85,7 @@ func run(logger *slog.Logger) error {
 		Rules:                rules,
 		Limiter:              limiter,
 		Metrics:              metrics,
-		RPCTimeout:           cfg.RPCTimeout,
+		ProxyTimeout:         cfg.ProxyTimeout,
 		SlowRequestThreshold: cfg.SlowRequestThreshold,
 		BodyCaptureLimit:     cfg.BodyCaptureLimit,
 	}))

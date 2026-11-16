@@ -33,10 +33,7 @@ func (m *Metrics) Observe(c *gin.Context, status int, duration time.Duration) {
 	if m == nil {
 		return
 	}
-	route := c.FullPath()
-	if route == "" {
-		route = "unmatched"
-	}
+	route := routeLabel(c)
 	m.requests.WithLabelValues(c.Request.Method, route, strconv.Itoa(status)).Inc()
 	m.duration.WithLabelValues(c.Request.Method, route).Observe(duration.Seconds())
 }
