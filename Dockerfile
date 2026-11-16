@@ -7,12 +7,13 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
+ARG SERVICE=user-service
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
-    -o /out/user-service ./cmd/user-service
+    -o /out/service ./cmd/${SERVICE}
 
 FROM gcr.io/distroless/static-debian12:nonroot
-COPY --from=build /out/user-service /user-service
+COPY --from=build /out/service /service
 
-EXPOSE 50051
+EXPOSE 50051 8080 9090
 USER 65532:65532
-ENTRYPOINT ["/user-service"]
+ENTRYPOINT ["/service"]
