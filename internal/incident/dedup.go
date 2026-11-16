@@ -8,6 +8,11 @@ import (
 // Deduper tracks recently seen event IDs so duplicate timeout
 // notifications are only investigated once within the TTL window.
 // It is safe for concurrent use.
+//
+// Correctness does not depend on this window: incident.Store.Claim
+// arbitrates duplicate events with INSERT ... ON CONFLICT DO NOTHING,
+// which stays correct across replicas. The Deduper is only a fast path
+// that saves a database round trip (see docs/modules/incident.md).
 type Deduper struct {
 	mu    sync.Mutex
 	ttl   time.Duration

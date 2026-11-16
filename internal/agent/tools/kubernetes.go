@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/oxkrypton/Halon/internal/agent"
@@ -21,6 +20,9 @@ type KubernetesOptions struct {
 	AllowedNamespaces []string
 	MaxReplicas       int
 	ActionCooldown    time.Duration
+	// Cooldowns arbitrates mutating actions. Nil selects the single-replica
+	// memory store; shared mode injects a RedisCooldownStore.
+	Cooldowns CooldownStore
 }
 
 type KubernetesToolset struct {
@@ -28,8 +30,7 @@ type KubernetesToolset struct {
 	namespaces  map[string]struct{}
 	maxReplicas int
 	cooldown    time.Duration
-	mu          sync.Mutex
-	lastActions map[string]time.Time
+	cooldowns   CooldownStore
 }
 
 func NewKubernetesTools(client kubernetes.Interface, options KubernetesOptions) (*KubernetesToolset, []agent.Tool) {
@@ -42,9 +43,12 @@ func NewKubernetesTools(client kubernetes.Interface, options KubernetesOptions) 
 	if options.ActionCooldown <= 0 {
 		options.ActionCooldown = 2 * time.Minute
 	}
+	if options.Cooldowns == nil {
+		options.Cooldowns = newMemoryCooldownStore()
+	}
 	toolset := &KubernetesToolset{
 		client: client, namespaces: make(map[string]struct{}), maxReplicas: options.MaxReplicas,
-		cooldown: options.ActionCooldown, lastActions: make(map[string]time.Time),
+		cooldown: options.ActionCooldown, cooldowns: options.Cooldowns,
 	}
 	for _, namespace := range options.AllowedNamespaces {
 		namespace = strings.TrimSpace(namespace)
@@ -226,7 +230,7 @@ func (k *KubernetesToolset) tools() []agent.Tool {
 				if err := k.checkNamespace(&input.Namespace); err != nil {
 					return nil, err
 				}
-				if err := k.allowAction("restart/" + input.Namespace + "/" + input.Pod); err != nil {
+				if err := k.allowAction(ctx, "restart/"+input.Namespace+"/"+input.Pod); err != nil {
 					return nil, err
 				}
 				if _, err := k.client.CoreV1().Pods(input.Namespace).Get(ctx, input.Pod, metav1.GetOptions{}); err != nil {
@@ -261,7 +265,7 @@ func (k *KubernetesToolset) tools() []agent.Tool {
 				if err := k.checkNamespace(&input.Namespace); err != nil {
 					return nil, err
 				}
-				if err := k.allowAction("scale/" + input.Namespace + "/" + input.Name); err != nil {
+				if err := k.allowAction(ctx, "scale/"+input.Namespace+"/"+input.Name); err != nil {
 					return nil, err
 				}
 				// #nosec G115 -- input.Replicas is validated to 0..k.maxReplicas above.
@@ -309,7 +313,7 @@ func (k *KubernetesToolset) tools() []agent.Tool {
 				if err := k.checkNamespace(&input.Namespace); err != nil {
 					return nil, err
 				}
-				if err := k.allowAction("image/" + input.Namespace + "/" + input.Name + "/" + input.Container); err != nil {
+				if err := k.allowAction(ctx, "image/"+input.Namespace+"/"+input.Name+"/"+input.Container); err != nil {
 					return nil, err
 				}
 				err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -404,14 +408,17 @@ func (k *KubernetesToolset) checkNamespace(namespace *string) error {
 	return nil
 }
 
-func (k *KubernetesToolset) allowAction(key string) error {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	now := time.Now()
-	if last, ok := k.lastActions[key]; ok && now.Sub(last) < k.cooldown {
-		return fmt.Errorf("action %s is cooling down; retry after %s", key, (k.cooldown - now.Sub(last)).Round(time.Second))
+// allowAction claims the cooldown slot for key. In shared mode the claim is
+// an atomic Redis command, so only one replica executes the action per
+// window; a store outage rejects the mutation instead of risking a repeat.
+func (k *KubernetesToolset) allowAction(ctx context.Context, key string) error {
+	remaining, claimed, err := k.cooldowns.Claim(ctx, key, k.cooldown)
+	if err != nil {
+		return fmt.Errorf("action %s is unavailable: %w", key, err)
 	}
-	k.lastActions[key] = now
+	if !claimed {
+		return fmt.Errorf("action %s is cooling down; retry after %s", key, remaining.Round(time.Second))
+	}
 	return nil
 }
 

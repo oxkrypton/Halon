@@ -19,7 +19,7 @@
 - `Seen(eventID)`:TTL 窗口内重复返回 true;新 ID 记录并惰性驱逐过期项;空 ID 永远不算重复也不记录;
 - TTL 默认 10 分钟(由 Agent 配置 `AGENT_DEDUP_TTL` 决定);
 - 并发安全;驱逐在 size 达到 2 的幂时摊还触发,插入均摊 O(1);
-- **内存态,进程重启即失效**——数据库层还有第二道幂等防线(见下)。
+- **内存态,进程重启即失效**——去重的正确性不依赖它:由数据库唯一约束保证(见下),`Deduper` 只是省一次 DB 往返的快路径,多副本下同样成立。
 
 ### Report 与状态机(`report.go`)
 
@@ -33,7 +33,7 @@
 | --- | --- |
 | `OpenStore(ctx, dsn)` | 独立连接池(10 开 / 3 闲),启动时 Ping |
 | `Migrate()` | iofs 嵌入式迁移,**版本表 `incident_schema_migrations`**(与 trafficlog 隔离,允许同库共存) |
-| `Claim(ctx, event)` | 插入 queued 行,`ON CONFLICT DO NOTHING`;返回 false 表示该事件已被认领——这是幂等投递的第二道防线 |
+| `Claim(ctx, event)` | 插入 queued 行,`ON CONFLICT DO NOTHING`;返回 false 表示该事件已被认领——这是幂等投递的表决层:多副本下同一事件只有一个 `INSERT` 成功,编排器队列归属由此唯一确定 |
 | `MarkProcessing(ctx, eventID, at)` | 仅从 queued 转为 processing(条件更新,不覆盖其他字段) |
 | `SaveResult(ctx, report)` | 覆盖写入排查结果;事件不存在返回 `ErrNotFound` |
 | `Get` / `List` | 单查 / 按发生时间倒序列表(limit 钳制到 1..200,默认 50) |

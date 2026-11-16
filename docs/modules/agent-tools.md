@@ -7,7 +7,7 @@
 - 工具分三级:`readonly`(默认)/ `operator` / `full`,由 `AGENT_OPERATION_LEVEL` 总开关控制,低于级别的工具对模型不可见也不可执行;
 - 所有工具参数经 `decodeArguments` 严格解码(`DisallowUnknownFields`,且只允许一个 JSON 对象);
 - 所有 SQL 参数化;K8s 操作受命名空间白名单(`K8S_NAMESPACES`,`*` 表示全部)约束;
-- 变更类操作(重启/扩容/改镜像/封禁)共用 `KubernetesToolset.allowAction` 冷却窗口(`K8S_ACTION_COOLDOWN`,默认 2 分钟),同一对象冷却期内拒绝重复操作;
+- 变更类操作(重启/扩容/改镜像/封禁)共用 `KubernetesToolset.allowAction` 冷却窗口(`K8S_ACTION_COOLDOWN`,默认 2 分钟),同一对象冷却期内拒绝重复操作。冷却由 `CooldownStore` 裁决:内存模式为进程内 map(单副本);共享模式(`REDIS_URL` 非空)为 `RedisCooldownStore`,`SET halon:cooldown:<key> NX PX` 原子抢占,N 个副本同一窗口内只有一个能执行,未抢到的拿到 `PTTL` 剩余时间;Redis 不可达时**拒绝变更**(`ErrCooldownUnavailable`,安全功能不侥幸放行),只读工具不受影响;
 - 单次只读查询有 15s 超时(`queryTimeout`)。
 
 ## 工具清单
@@ -45,6 +45,7 @@
 | --- | --- |
 | `observability.go` | 4 个只读工具(3 个 SQL + PromQL);行类型 `ErrorLogRow`/`TrafficStatRow`/`TopIPRow` |
 | `kubernetes.go` | `KubernetesToolset`(白名单、副本上限、冷却)与 6 个 K8s 工具 |
+| `cooldown.go` | `CooldownStore` 接口(Claim)与 `ErrCooldownUnavailable`;`memoryCooldownStore`(内存模式)与 `RedisCooldownStore`(共享模式,SET NX PX 裁决 + 后台 Ping 保活指标) |
 | `gateway.go` | `NewGatewayActionTool`:封禁 IP,经网关管理接口,复用 K8s 冷却器 |
 | `schema.go` | `objectSchema`/`decodeArguments`/`queryContext` 等工具构造函数 |
 

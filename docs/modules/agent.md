@@ -35,6 +35,9 @@
 | `GET /api/v1/incidents?limit=` | 报告列表(1..200,默认 50) |
 | `GET /api/v1/incidents/:event_id` | 单条报告;不存在 `404 REPORT_NOT_FOUND` |
 | `GET /healthz` / `GET /readyz` | 存活 / PostgreSQL 就绪 |
+| `GET /metrics` | Prometheus 指标(无需鉴权);当前含 `halon_agent_redis_up`(共享模式 Redis 可达性,内存模式恒 1) |
+
+去重的正确性由数据库唯一约束保证:`Orchestrator.Submit` → `incident.Store.Claim` 的 `INSERT ... ON CONFLICT DO NOTHING` 是多副本下的表决,同一事件只有一个 `INSERT` 成功;内存 `Deduper` 只是省一次 DB 往返的快路径,不参与正确性。共享模式(`REDIS_URL` 非空)下 Agent 可多副本,变更操作冷却由 Redis 裁决(见 [agent-tools.md](agent-tools.md) 安全模型)。
 
 ## 编排器行为细节
 

@@ -38,7 +38,7 @@ func NewGatewayActionTool(kubernetes *KubernetesToolset, adminBaseURL, adminToke
 				return nil, fmt.Errorf("GATEWAY_ADMIN_URL is not configured")
 			}
 			ip := parsed.String()
-			if err := kubernetes.allowAction("block-ip/" + ip); err != nil {
+			if err := kubernetes.allowAction(ctx, "block-ip/"+ip); err != nil {
 				return nil, err
 			}
 			request, err := http.NewRequestWithContext(ctx, http.MethodPut, strings.TrimRight(adminBaseURL, "/")+"/admin/rules/blacklist/"+url.PathEscape(ip), nil)

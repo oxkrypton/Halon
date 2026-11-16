@@ -82,11 +82,15 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("create kubernetes client: %w", err)
 	}
-	kubernetesToolset, kubernetesTools := tools.NewKubernetesTools(clientset, tools.KubernetesOptions{
+	kubernetesOptions := tools.KubernetesOptions{
 		AllowedNamespaces: cfg.K8sNamespaces,
 		MaxReplicas:       cfg.K8sMaxReplicas,
 		ActionCooldown:    cfg.K8sActionCooldown,
-	})
+	}
+	if redisClient != nil {
+		kubernetesOptions.Cooldowns = tools.NewRedisCooldownStore(redisClient, cfg.RedisOpTimeout, logger, metrics.SetRedisUp)
+	}
+	kubernetesToolset, kubernetesTools := tools.NewKubernetesTools(clientset, kubernetesOptions)
 	sqlDB, err := store.SQLDB()
 	if err != nil {
 		return fmt.Errorf("access postgres connection pool: %w", err)
