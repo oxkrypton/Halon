@@ -1,0 +1,67 @@
+# 模块:Agent 核心(agent)
+
+代码:`internal/agent/`(核心)+ `cmd/agent/main.go`(服务入口)。
+监听:`:8081`(`HTTP_ADDR`)。
+
+## 职责
+
+接收网关超时事件 → 去重 → 排队 → 驱动 LLM 工具调用循环完成故障排查 → 报告落库。是系统的「大脑」服务。
+
+## 文件结构
+
+| 文件 | 内容 |
+| --- | --- |
+| `types.go` | `OperationLevel`(readonly < operator < full)、消息/工具调用类型、`RunResult`、`ErrMaxSteps` |
+| `registry.go` | `Registry`:按操作级别过滤工具、排序定义、执行时做 JSON 校验并把错误回传给模型 |
+| `loop.go` | `Loop.Run`:系统提示词 + 事件 JSON → 多轮 `Complete` → 工具执行 → 最终中文报告;工具输出超限截断(UTF-8 安全) |
+| `openai.go` | `OpenAIClient`:OpenAI 兼容 `/chat/completions`;429/5xx 重试最多 3 次,尊重 `Retry-After`;4xx 不重试 |
+| `orchestrator.go` | `Orchestrator`:`Submit`(校验→Claim→入队)→ worker 池 `investigate`(限时运行 + 落库)→ `Close` 排空 |
+| `server.go` | HTTP API:事件接收、报告查询、健康探针 |
+| `config.go` | `LoadConfig()`:全部环境变量与启动校验 |
+
+工具实现在独立的 [agent-tools](agent-tools.md) 模块。
+
+## 系统提示词契约(`DefaultSystemPrompt`)
+
+模型被要求:先取证后动手、区分证据与推断、最小可逆变更、变更后验证、最终输出**中文 Markdown 报告**,固定七个小节:事件摘要、排查过程、根因分析、证据、执行操作、修复验证、后续建议;证据不足必须明说「无法确定根因」。修改排查行为时先改这里,并保持与文档一致。
+
+## HTTP API
+
+均需 `Authorization: Bearer <INGEST_TOKEN>`(常量时间比较);事件体最大 64 KiB。
+
+| 接口 | 行为 |
+| --- | --- |
+| `POST /api/v1/incidents/timeout` | 校验事件 → `Deduper.Seen`(内存去重)→ `Orchestrator.Submit`(存储幂等)。新事件 `202 {accepted:true}`;重复 `200 {duplicate:true}`;队列满 `503 QUEUE_FULL` |
+| `GET /api/v1/incidents?limit=` | 报告列表(1..200,默认 50) |
+| `GET /api/v1/incidents/:event_id` | 单条报告;不存在 `404 REPORT_NOT_FOUND` |
+| `GET /healthz` / `GET /readyz` | 存活 / PostgreSQL 就绪 |
+
+## 编排器行为细节
+
+- 队列满时:`Submit` 先把该事件落库为 `failed`(error = queue full)再返回 `ErrQueueFull`,不留悬挂 queued 行;
+- worker 取到任务先 `MarkProcessing`,再带 `AGENT_RUN_TIMEOUT` 跑 `Loop.Run`;
+- 落库用独立的 10s 超时 context(运行 context 可能已取消);
+- `Close()` 关闭队列并等待排空;入口先停 HTTP 再 `Close`,排空受 `SHUTDOWN_TIMEOUT` 兜底。
+
+## 配置(环境变量)
+
+完整表格见根 `README.md` 的「Agent 配置」。必填:`DATABASE_DSN`、`INGEST_TOKEN`(≥12 字符)、`OPENAI_API_KEY`、`OPENAI_MODEL`。`AGENT_OPERATION_LEVEL` 默认 `readonly`(最安全),生产开放变更操作需谨慎评估。
+
+## cmd/agent 装配顺序
+
+`LoadConfig` → `incident.OpenStore` + `Migrate` → K8s clientset(优先 in-cluster,回退 `~/.kube/config`)→ 工具注册(Observability + Kubernetes + GatewayAction)→ `Registry`(按级别过滤)→ `OpenAIClient` → `Loop` → `Orchestrator` → HTTP server。
+
+## 测试
+
+- `loop_test.go`:`modelFunc` 桩覆盖工具调用、错误回传、最大轮数、截断;
+- `openai_test.go`:httptest 假服务器覆盖重试与错误;
+- `orchestrator_test.go`:完成/失败/重复/非法事件/队列满五个场景;
+- `server_test.go`:gin 测试路由覆盖鉴权、去重、校验、查询、探针。
+
+## 修改本模块时必须同步检查
+
+- 根 `README.md`:架构图、Agent 功能列表、Agent 接口表、Agent 配置表;
+- [agent-tools.md](agent-tools.md):若改了 `Tool`/`ToolCall` 结构或级别语义;
+- [gateway.md](gateway.md):若改了事件接收协议;
+- `deploy/kubernetes/agent.yaml`:若改了端口、环境变量或 RBAC 需求;
+- `AGENTS.md`:若改了架构速览或约定。

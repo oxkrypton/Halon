@@ -1,6 +1,8 @@
 # Halon
 
-Halon 是一个面向云原生场景的 Go 微服务项目。当前已实现 Gin HTTP 网关、gRPC 用户服务、PostgreSQL 异步流量日志存储，以及完整的 Minikube 部署配置。
+> **开发者/Agent 注意**:修改代码后必须同步更新文档,规则见 [AGENTS.md](AGENTS.md) 与 [docs/README.md](docs/README.md)。分模块详细文档见 [docs/](docs/README.md)。
+
+Halon 是一个面向云原生场景的 Go 微服务项目。当前已实现 Gin HTTP 网关、gRPC 用户服务、PostgreSQL 异步流量日志存储、Agent 故障排查服务,以及完整的 Minikube 部署配置。
 
 ## 当前架构
 
@@ -345,9 +347,15 @@ kubectl rollout restart deployment/user-service
 │   ├── gateway.yaml              # 网关 Deployment 和 Service
 │   ├── postgres.yaml             # PostgreSQL StatefulSet、Service 和 PVC
 │   └── user-service.yaml         # 用户服务 Deployment 和 Service
-├── docs/                         # 总体架构设计资料
+├── docs/
+│   ├── README.md                 # 文档索引与文档维护规则
+│   ├── development.md            # 开发流程与约定
+│   ├── deployment.md             # 部署与运维手册
+│   ├── modules/                  # 分模块详细文档(改代码必须同步更新)
+│   └── system-architecture.txt   # 立项时的总体设计稿
+├── AGENTS.md                     # Agent 必读:铁律、架构、约定
 ├── Dockerfile                    # 通过 SERVICE 参数构建不同服务
 └── Makefile                      # 常用开发命令
 ```
 
-详细设计见 `docs/system-architecture.txt`。
+详细模块文档见 [docs/README.md](docs/README.md);总体设计稿见 `docs/system-architecture.txt`。
