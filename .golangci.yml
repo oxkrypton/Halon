@@ -1,0 +1,24 @@
+version: "2"
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - misspell
+    - unconvert
+    - unparam
+    - gosec
+  settings:
+    errcheck:
+      # Deferred rows.Close() is an accepted idiom in this codebase;
+      # the error is not actionable after iteration finished.
+      exclude-functions:
+        - (*database/sql.Rows).Close
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

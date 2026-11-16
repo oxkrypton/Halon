@@ -7,11 +7,14 @@ DEMO_ORDER_IMAGE := halon/order-service-demo:dev
 GO_BIN := $(shell go env GOPATH)/bin
 export PATH := $(GO_BIN):$(PATH)
 
-.PHONY: test run-gateway run-agent run-demo build build-demo docker-build docker-build-demo minikube-start minikube-image deploy status clean
+.PHONY: test lint run-gateway run-agent run-demo build build-demo docker-build docker-build-demo minikube-start minikube-image deploy status clean
 
 test:
 	go test -race ./...
 	go vet ./...
+
+lint:
+	golangci-lint run ./...
 
 run-gateway:
 	go run ./cmd/gateway
