@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/oxkrypton/Halon/internal/authz"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -16,6 +17,7 @@ type Config struct {
 	HTTPAddr          string
 	DatabaseDSN       string
 	IngestToken       string
+	Auth              authz.Config
 	OpenAIBaseURL     string
 	OpenAIAPIKey      string
 	OpenAIModel       string
@@ -126,6 +128,11 @@ func LoadConfig() (Config, error) {
 	if cfg.OperationLevel, err = ParseOperationLevel(envString("AGENT_OPERATION_LEVEL", string(LevelReadOnly))); err != nil {
 		return Config{}, err
 	}
+	authConfig, err := authz.LoadConfig()
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.Auth = authConfig
 
 	var validationErrors []error
 	if cfg.DatabaseDSN == "" {

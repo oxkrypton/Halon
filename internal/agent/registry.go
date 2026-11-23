@@ -5,29 +5,35 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+
+	"github.com/oxkrypton/Halon/internal/authz"
 )
 
 type Registry struct {
-	level OperationLevel
+	role  authz.Role
 	tools map[string]Tool
 }
 
 func NewRegistry(level OperationLevel, tools ...Tool) (*Registry, error) {
-	registry := &Registry{level: level, tools: make(map[string]Tool)}
+	role, err := authz.ParseRole(string(level))
+	if err != nil {
+		return nil, err
+	}
+	registry := &Registry{role: role, tools: make(map[string]Tool)}
 	for _, tool := range tools {
 		if tool.Name == "" || tool.Description == "" || tool.Handler == nil {
 			return nil, fmt.Errorf("tool %q must have a name, description, and handler", tool.Name)
 		}
-		if tool.Level == "" {
-			tool.Level = LevelReadOnly
+		if tool.Permission == "" {
+			tool.Permission = authz.PermToolObserve
 		}
-		if _, err := ParseOperationLevel(string(tool.Level)); err != nil {
-			return nil, err
+		if _, err := authz.ParsePermission(string(tool.Permission)); err != nil {
+			return nil, fmt.Errorf("tool %q: %w", tool.Name, err)
 		}
 		if _, exists := registry.tools[tool.Name]; exists {
 			return nil, fmt.Errorf("duplicate tool %q", tool.Name)
 		}
-		if level.Allows(tool.Level) {
+		if role.Allows(tool.Permission) {
 			registry.tools[tool.Name] = tool
 		}
 	}
@@ -71,9 +77,13 @@ func (r *Registry) Execute(ctx context.Context, call ToolCall) (string, ToolExec
 		execution.Error = fmt.Sprintf("tool %q is not available at the configured operation level", call.Function.Name)
 		return errorJSON(execution.Error), execution
 	}
-	execution.Level = tool.Level
-	if !r.level.Allows(tool.Level) {
-		execution.Error = fmt.Sprintf("operation level %s does not allow tool %s", r.level, tool.Name)
+	if required, ok := tool.Permission.RequiredRole(); ok {
+		execution.Level = OperationLevel(required.String())
+	}
+	// Re-check at execution time: Definitions() already filters tools, but a
+	// stale tool call from the model must never bypass a permission change.
+	if !r.role.Allows(tool.Permission) {
+		execution.Error = fmt.Sprintf("operation level %s does not allow tool %s", r.role, tool.Name)
 		return errorJSON(execution.Error), execution
 	}
 	if !json.Valid([]byte(call.Function.Arguments)) {

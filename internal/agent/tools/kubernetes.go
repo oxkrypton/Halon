@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/oxkrypton/Halon/internal/agent"
+	"github.com/oxkrypton/Halon/internal/authz"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -63,7 +64,7 @@ func (k *KubernetesToolset) tools() []agent.Tool {
 	namespaceProperty := stringProperty("Kubernetes namespace; must be in the configured allowlist.")
 	return []agent.Tool{
 		{
-			Name: "k8s_list_pods", Level: agent.LevelReadOnly,
+			Name: "k8s_list_pods", Permission: authz.PermToolObserve,
 			Description: "List pods with phase, readiness, restart counts and container states in an allowed namespace.",
 			Parameters:  objectSchema(map[string]any{"namespace": namespaceProperty, "label_selector": stringProperty("Optional Kubernetes label selector."), "limit": integerProperty("Maximum pods, default 100.", 1, 100)}),
 			Handler: func(ctx context.Context, raw json.RawMessage) (any, error) {
@@ -96,7 +97,7 @@ func (k *KubernetesToolset) tools() []agent.Tool {
 			},
 		},
 		{
-			Name: "k8s_get_pod_logs", Level: agent.LevelReadOnly,
+			Name: "k8s_get_pod_logs", Permission: authz.PermToolObserve,
 			Description: "Read bounded recent logs from a pod container. Set previous=true to inspect a crashed container's previous instance.",
 			Parameters: objectSchema(map[string]any{
 				"namespace": namespaceProperty, "pod": stringProperty("Exact pod name."), "container": stringProperty("Optional container name."),
@@ -141,7 +142,7 @@ func (k *KubernetesToolset) tools() []agent.Tool {
 			},
 		},
 		{
-			Name: "k8s_list_events", Level: agent.LevelReadOnly,
+			Name: "k8s_list_events", Permission: authz.PermToolObserve,
 			Description: "List recent Kubernetes warning and lifecycle events, optionally filtered to an exact involved object name.",
 			Parameters:  objectSchema(map[string]any{"namespace": namespaceProperty, "involved_object": stringProperty("Optional exact Pod, Deployment or other object name."), "type": stringProperty("Optional event type such as Warning."), "limit": integerProperty("Maximum events, default 100.", 1, 100)}),
 			Handler: func(ctx context.Context, raw json.RawMessage) (any, error) {
@@ -183,7 +184,7 @@ func (k *KubernetesToolset) tools() []agent.Tool {
 			},
 		},
 		{
-			Name: "k8s_get_deployment", Level: agent.LevelReadOnly,
+			Name: "k8s_get_deployment", Permission: authz.PermToolObserve,
 			Description: "Get Deployment replica status, conditions, container images and update strategy.",
 			Parameters:  objectSchema(map[string]any{"namespace": namespaceProperty, "name": stringProperty("Exact Deployment name.")}, "name"),
 			Handler: func(ctx context.Context, raw json.RawMessage) (any, error) {
@@ -212,7 +213,7 @@ func (k *KubernetesToolset) tools() []agent.Tool {
 			},
 		},
 		{
-			Name: "k8s_restart_pod", Level: agent.LevelOperator,
+			Name: "k8s_restart_pod", Permission: authz.PermToolK8sRestartPod,
 			Description: "Gracefully delete one evidenced faulty pod so its controller recreates it. Do not use without pod state, event or log evidence.",
 			Parameters:  objectSchema(map[string]any{"namespace": namespaceProperty, "pod": stringProperty("Exact pod name."), "reason": stringProperty("Evidence-based reason recorded in the audit log.")}, "pod", "reason"),
 			Handler: func(ctx context.Context, raw json.RawMessage) (any, error) {
@@ -243,7 +244,7 @@ func (k *KubernetesToolset) tools() []agent.Tool {
 			},
 		},
 		{
-			Name: "k8s_scale_deployment", Level: agent.LevelOperator,
+			Name: "k8s_scale_deployment", Permission: authz.PermToolK8sScale,
 			Description: "Scale a Deployment within the configured replica cap when metrics support a capacity-related fix.",
 			Parameters:  objectSchema(map[string]any{"namespace": namespaceProperty, "name": stringProperty("Exact Deployment name."), "replicas": integerProperty("Desired replica count.", 0, 100), "reason": stringProperty("Evidence-based scaling reason.")}, "name", "replicas", "reason"),
 			Handler: func(ctx context.Context, raw json.RawMessage) (any, error) {
@@ -290,7 +291,7 @@ func (k *KubernetesToolset) tools() []agent.Tool {
 			},
 		},
 		{
-			Name: "k8s_update_deployment_image", Level: agent.LevelFull,
+			Name: "k8s_update_deployment_image", Permission: authz.PermToolK8sUpdateImage,
 			Description: "Full-access emergency remediation: update one existing container image after verifying the exact Deployment and container name.",
 			Parameters:  objectSchema(map[string]any{"namespace": namespaceProperty, "name": stringProperty("Exact Deployment name."), "container": stringProperty("Existing container name."), "image": stringProperty("Complete container image reference."), "reason": stringProperty("Evidence-based image update reason.")}, "name", "container", "image", "reason"),
 			Handler: func(ctx context.Context, raw json.RawMessage) (any, error) {

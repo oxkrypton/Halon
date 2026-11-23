@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/oxkrypton/Halon/internal/authz"
 	"github.com/oxkrypton/Halon/internal/incident"
 )
 
@@ -59,7 +60,7 @@ type Tool struct {
 	Name        string
 	Description string
 	Parameters  map[string]any
-	Level       OperationLevel
+	Permission  authz.Permission
 	Handler     ToolHandler
 }
 
