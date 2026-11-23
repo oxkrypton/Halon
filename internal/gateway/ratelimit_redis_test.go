@@ -10,11 +10,89 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-func newTestRedisRateLimiter(t *testing.T, mr *miniredis.Miniredis, rps float64, burst int, onHealth func(bool)) *RedisRateLimiter {
+func newTestRedisRateLimiter(t *testing.T, mr *miniredis.Miniredis, rps float64, burst int, onHealth func(bool), opts ...RedisRateLimiterOption) *RedisRateLimiter {
 	t.Helper()
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
-	return NewRedisRateLimiter(client, rps, burst, 200*time.Millisecond, slog.Default(), onHealth)
+	return NewRedisRateLimiter(client, rps, burst, 200*time.Millisecond, slog.Default(), onHealth, opts...)
+}
+
+func TestRedisRateLimiterDefaultKeyPrefix(t *testing.T) {
+	t.Parallel()
+	mr := miniredis.RunT(t)
+	limiter := newTestRedisRateLimiter(t, mr, 1, 1, nil)
+
+	if !limiter.Allow("192.0.2.10") {
+		t.Fatal("Allow() = false with redis up")
+	}
+	if !mr.Exists("halon:ratelimit:192.0.2.10") {
+		t.Fatalf("default bucket key missing; keys = %v", mr.Keys())
+	}
+	if err := limiter.Update(3, 4); err != nil {
+		t.Fatal(err)
+	}
+	if !mr.Exists("halon:ratelimit:config") {
+		t.Fatalf("default config key missing; keys = %v", mr.Keys())
+	}
+}
+
+func TestRedisRateLimiterCustomKeyPrefix(t *testing.T) {
+	t.Parallel()
+	mr := miniredis.RunT(t)
+	const prefix = "halon:ratelimit:login:"
+	limiter := newTestRedisRateLimiter(t, mr, 1, 1, nil, WithRateLimitKeyPrefix(prefix))
+
+	if !limiter.Allow("192.0.2.11") {
+		t.Fatal("Allow() = false with redis up")
+	}
+	if !mr.Exists(prefix + "192.0.2.11") {
+		t.Fatalf("custom bucket key missing; keys = %v", mr.Keys())
+	}
+	if mr.Exists("halon:ratelimit:192.0.2.11") {
+		t.Error("custom prefix wrote into the default namespace")
+	}
+	if err := limiter.Update(3, 4); err != nil {
+		t.Fatal(err)
+	}
+	if !mr.Exists(prefix + "config") {
+		t.Fatalf("custom config key missing; keys = %v", mr.Keys())
+	}
+	if mr.Exists("halon:ratelimit:config") {
+		t.Error("custom prefix wrote the default config key")
+	}
+}
+
+func TestRedisRateLimiterPrefixesAreIsolated(t *testing.T) {
+	t.Parallel()
+	mr := miniredis.RunT(t)
+	const (
+		prefixA = "halon:ratelimit:data:"
+		prefixB = "halon:ratelimit:login:"
+	)
+	data := newTestRedisRateLimiter(t, mr, 1, 1, nil, WithRateLimitKeyPrefix(prefixA))
+	login := newTestRedisRateLimiter(t, mr, 1, 1, nil, WithRateLimitKeyPrefix(prefixB))
+
+	if !data.Allow("192.0.2.12") || data.Allow("192.0.2.12") {
+		t.Fatal("data-plane bucket did not exhaust at burst 1")
+	}
+	// The login limiter has its own bucket for the same client IP.
+	if !login.Allow("192.0.2.12") {
+		t.Fatal("login bucket was throttled by the data-plane bucket")
+	}
+	if login.Allow("192.0.2.12") {
+		t.Fatal("login bucket did not exhaust at its own burst 1")
+	}
+
+	// Config writes are isolated too.
+	if err := data.Update(9, 9); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := login.settings(); err != nil {
+		t.Fatal(err)
+	}
+	if rps, burst := login.Settings(); rps != 1 || burst != 1 {
+		t.Fatalf("login settings = %v/%v, want the seeded 1/1", rps, burst)
+	}
 }
 
 func TestRedisRateLimiterTokenBucketSemantics(t *testing.T) {
