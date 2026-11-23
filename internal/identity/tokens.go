@@ -158,6 +158,22 @@ func (s *Store) inspectUnusableToken(ctx context.Context, hash []byte) (RefreshR
 	return RefreshRotation{}, ErrRefreshTokenReuse
 }
 
+// RevokeRefreshTokenFamilyByToken invalidates the whole family that owns the
+// presented token. Unknown tokens are a no-op so logout stays idempotent.
+func (s *Store) RevokeRefreshTokenFamilyByToken(ctx context.Context, token string) error {
+	var familyID string
+	result := s.db.WithContext(ctx).Raw(`
+		SELECT family_id FROM auth_refresh_tokens
+		 WHERE token_hash = $1`, HashRefreshToken(token)).Scan(&familyID)
+	if errors.Is(result.Error, gorm.ErrRecordNotFound) || result.RowsAffected == 0 {
+		return nil
+	}
+	if result.Error != nil {
+		return fmt.Errorf("lookup refresh token family: %w", result.Error)
+	}
+	return s.RevokeTokenFamily(ctx, familyID)
+}
+
 // RevokeTokenFamily invalidates every refresh token descended from one login.
 // The service layer calls this when it observes a disabled user or a reuse
 // alert.

@@ -84,6 +84,11 @@ type AdminOptions struct {
 	// Auth is normally supplied from Config.Auth. Nil keeps the legacy
 	// single-token behaviour, which existing tests and callers rely on.
 	Auth *authz.Authenticator
+	// Local login is opt-in. Both LoginEnabled and AuthService must be set
+	// for /auth/* to be served; otherwise those paths answer LOGIN_DISABLED.
+	LoginEnabled bool
+	AuthService  AuthService
+	LoginLimiter RateLimitBackend
 }
 
 func NewAdminHandler(token string, rules BlacklistStore, limiter RateLimitBackend, logger *slog.Logger, metrics *Metrics, options AdminOptions) *gin.Engine {
@@ -191,6 +196,12 @@ func NewAdminHandler(token string, rules BlacklistStore, limiter RateLimitBacken
 		}
 		c.JSON(http.StatusOK, gin.H{"requests_per_second": request.RequestsPerSecond, "burst": request.Burst})
 	})
+
+	if options.LoginEnabled && options.AuthService != nil {
+		registerAuthRoutes(router, authenticator, options.AuthService, options.LoginLimiter, logger)
+	} else {
+		registerAuthDisabledRoutes(router)
+	}
 	return router
 }
 

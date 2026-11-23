@@ -31,9 +31,11 @@ var ErrNotFound = errors.New("identity user not found")
 const (
 	EventLoginSuccess         = "login_success"
 	EventLoginFailure         = "login_failure"
+	EventLogout               = "logout"
 	EventUserCreated          = "user_created"
 	EventUserDisabled         = "user_disabled"
 	EventRoleChanged          = "role_changed"
+	EventPasswordChanged      = "password_changed"
 	EventPasswordReset        = "password_reset"
 	EventRefreshReuseDetected = "refresh_reuse_detected"
 
@@ -247,6 +249,13 @@ func (s *Store) SetUserRole(ctx context.Context, username string, role authz.Rol
 // the next login.
 func (s *Store) SetMustChangePassword(ctx context.Context, username string, value bool) error {
 	return s.updateUser(ctx, username, map[string]any{"must_change_password": value})
+}
+
+// SetPasswordHashOnly replaces the hash after a successful login rehash. It
+// deliberately leaves password_changed_at and lockout state untouched: the
+// user did not choose a new password.
+func (s *Store) SetPasswordHashOnly(ctx context.Context, username, hash string) error {
+	return s.updateUser(ctx, username, map[string]any{"password_hash": hash})
 }
 
 // SetPasswordHash stores a new password hash and clears failed-login state.

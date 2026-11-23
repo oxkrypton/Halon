@@ -1,6 +1,7 @@
 package authz
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"encoding/base64"
 	"errors"
@@ -43,6 +44,15 @@ func ParseMode(value string) (Mode, error) {
 
 // LoadConfig reads the AUTH_* environment variables shared by both services.
 func LoadConfig() (Config, error) {
+	return LoadConfigWithExtraPublicKeys(nil)
+}
+
+// LoadConfigWithExtraPublicKeys behaves like LoadConfig but merges extra
+// keys into AUTH_JWT_PUBLIC_KEYS before validating. The gateway uses it to
+// add the public half of its own login signing key without requiring the
+// operator to duplicate it in configuration. A kid that already exists with
+// a different key is rejected rather than silently shadowed.
+func LoadConfigWithExtraPublicKeys(extra map[string]ed25519.PublicKey) (Config, error) {
 	mode, err := ParseMode(os.Getenv("AUTH_MODE"))
 	if err != nil {
 		return Config{}, err
@@ -50,6 +60,15 @@ func LoadConfig() (Config, error) {
 	keys, err := ParsePublicKeys(os.Getenv("AUTH_JWT_PUBLIC_KEYS"))
 	if err != nil {
 		return Config{}, err
+	}
+	for kid, key := range extra {
+		if existing, found := keys[kid]; found {
+			if !bytes.Equal(existing, key) {
+				return Config{}, fmt.Errorf("JWT kid %q already configured with a different public key", kid)
+			}
+			continue
+		}
+		keys[kid] = key
 	}
 	issuer := strings.TrimSpace(os.Getenv("AUTH_JWT_ISSUER"))
 	if issuer == "" {

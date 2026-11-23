@@ -14,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/oxkrypton/Halon/internal/authz"
 	"github.com/oxkrypton/Halon/internal/gateway"
+	"github.com/oxkrypton/Halon/internal/identity"
 	"github.com/oxkrypton/Halon/internal/incident"
 	"github.com/oxkrypton/Halon/internal/trafficlog"
 	"github.com/redis/go-redis/v9"
@@ -44,6 +45,22 @@ func run() error {
 	defer func() { _ = repository.Close() }()
 	if err := repository.Migrate(); err != nil {
 		return err
+	}
+
+	// Local login is opt-in. Identity uses its own migration version table,
+	// so it can share the database with trafficlog safely.
+	var identityStore *identity.Store
+	if cfg.LoginEnabled {
+		identityContext, cancelIdentity := context.WithTimeout(context.Background(), 15*time.Second)
+		identityStore, err = identity.OpenStore(identityContext, cfg.DatabaseDSN)
+		cancelIdentity()
+		if err != nil {
+			return fmt.Errorf("open identity store: %w", err)
+		}
+		defer func() { _ = identityStore.Close() }()
+		if err := identityStore.Migrate(); err != nil {
+			return fmt.Errorf("apply identity migrations: %w", err)
+		}
 	}
 
 	tracing, err := gateway.InitTracing(context.Background(), gateway.TracingConfig{
@@ -173,10 +190,48 @@ func run() error {
 	}
 	logger.Info("admin authentication mode", "mode", cfg.Auth.Mode)
 
+	var authService gateway.AuthService
+	var loginLimiter gateway.RateLimitBackend
+	if cfg.LoginEnabled {
+		privateKey, err := authz.ParsePrivateKeyBase64(cfg.JWTPrivateKey)
+		if err != nil {
+			return fmt.Errorf("parse AUTH_JWT_PRIVATE_KEY: %w", err)
+		}
+		signer, err := authz.NewSigner(privateKey, cfg.JWTKID, cfg.Auth.Issuer)
+		if err != nil {
+			return fmt.Errorf("configure login signer: %w", err)
+		}
+		authService, err = identity.NewService(identityStore, signer, identity.ServiceConfig{
+			AccessTokenTTL:     cfg.AccessTokenTTL,
+			RefreshTokenTTL:    cfg.RefreshTokenTTL,
+			RefreshMaxLifetime: cfg.RefreshMaxLifetime,
+			Audiences:          []authz.Audience{authz.AudienceGatewayAdmin, authz.AudienceAgent},
+			Issuer:             cfg.Auth.Issuer,
+			PasswordPolicy:     identity.PasswordPolicy{MinLength: cfg.PasswordMinLength},
+			MaxFailures:        cfg.LoginMaxFailures,
+			LockDuration:       cfg.LoginLockDuration,
+		}, logger)
+		if err != nil {
+			return fmt.Errorf("configure identity service: %w", err)
+		}
+		if redisClient != nil {
+			loginLimiter = gateway.NewRedisRateLimiter(redisClient,
+				cfg.LoginRateLimitRPS, cfg.LoginRateLimitBurst, cfg.RedisOpTimeout,
+				logger, metrics.SetRedisUp,
+				gateway.WithRateLimitKeyPrefix("halon:ratelimit:login:"))
+		} else {
+			loginLimiter = gateway.NewRateLimiter(cfg.LoginRateLimitRPS, cfg.LoginRateLimitBurst)
+		}
+		logger.Info("local login enabled", "kid", cfg.JWTKID)
+	}
+
 	adminServer := newHTTPServer(cfg.AdminAddr, gateway.NewAdminHandler(cfg.AdminToken, rules, limiter, logger, metrics, gateway.AdminOptions{
 		MetricsRequireAuth: cfg.MetricsRequireAuth,
 		Resilience:         resilience,
 		Auth:               authenticator,
+		LoginEnabled:       cfg.LoginEnabled,
+		AuthService:        authService,
+		LoginLimiter:       loginLimiter,
 	}))
 
 	serverErrors := make(chan error, 2)
