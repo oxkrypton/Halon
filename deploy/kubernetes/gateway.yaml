@@ -58,6 +58,19 @@ spec:
                 secretKeyRef:
                   name: halon-secrets
                   key: admin-token
+            # RBAC is opt-in. Default AUTH_MODE=legacy keeps ADMIN_TOKEN as a
+            # full-privilege credential. To migrate: set AUTH_MODE=hybrid with
+            # the public keys below, then switch to jwt once all clients use
+            # Ed25519 JWTs issued by halonctl.
+            # - name: AUTH_MODE
+            #   value: hybrid
+            # - name: AUTH_JWT_PUBLIC_KEYS
+            #   valueFrom:
+            #     configMapKeyRef:
+            #       name: halon-auth
+            #       key: jwt-public-keys
+            # - name: AUTH_REVOKED_JTIS
+            #   value: ""
             - name: AGENT_WEBHOOK_URL
               value: http://agent:8081/api/v1/incidents/timeout
             - name: AGENT_WEBHOOK_TOKEN

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/oxkrypton/Halon/internal/authz"
 	"github.com/oxkrypton/Halon/internal/gateway"
 	"github.com/oxkrypton/Halon/internal/incident"
 	"github.com/oxkrypton/Halon/internal/trafficlog"
@@ -166,9 +167,16 @@ func run() error {
 		SlowRequestThreshold: cfg.SlowRequestThreshold,
 		BodyCaptureLimit:     cfg.BodyCaptureLimit,
 	})))
+	authenticator, err := authz.NewAuthenticator(cfg.Auth, authz.AudienceGatewayAdmin, cfg.AdminToken)
+	if err != nil {
+		return fmt.Errorf("configure authentication: %w", err)
+	}
+	logger.Info("admin authentication mode", "mode", cfg.Auth.Mode)
+
 	adminServer := newHTTPServer(cfg.AdminAddr, gateway.NewAdminHandler(cfg.AdminToken, rules, limiter, logger, metrics, gateway.AdminOptions{
 		MetricsRequireAuth: cfg.MetricsRequireAuth,
 		Resilience:         resilience,
+		Auth:               authenticator,
 	}))
 
 	serverErrors := make(chan error, 2)

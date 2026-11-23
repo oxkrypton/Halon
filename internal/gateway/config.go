@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/oxkrypton/Halon/internal/authz"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -24,6 +25,7 @@ type Config struct {
 	Routes               string
 	DatabaseDSN          string
 	AdminToken           string
+	Auth                 authz.Config
 	AgentWebhookURL      string
 	AgentWebhookToken    string
 	GinMode              string
@@ -221,6 +223,12 @@ func LoadConfig() (Config, error) {
 		return Config{}, err
 	}
 
+	authConfig, err := authz.LoadConfig()
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.Auth = authConfig
+
 	var validationErrors []error
 	if _, err := ParseRoutes(cfg.Routes); err != nil {
 		validationErrors = append(validationErrors, fmt.Errorf("ROUTES: %w", err))
@@ -228,8 +236,8 @@ func LoadConfig() (Config, error) {
 	if cfg.DatabaseDSN == "" {
 		validationErrors = append(validationErrors, errors.New("DATABASE_DSN is required"))
 	}
-	if len(cfg.AdminToken) < minAdminTokenLength {
-		validationErrors = append(validationErrors, errors.New("ADMIN_TOKEN must contain at least 12 characters"))
+	if cfg.Auth.Mode != authz.ModeJWT && len(cfg.AdminToken) < minAdminTokenLength {
+		validationErrors = append(validationErrors, errors.New("ADMIN_TOKEN must contain at least 12 characters in legacy and hybrid modes"))
 	}
 	if cfg.AgentWebhookURL != "" && len(cfg.AgentWebhookToken) < minAdminTokenLength {
 		validationErrors = append(validationErrors, errors.New("AGENT_WEBHOOK_TOKEN must contain at least 12 characters when AGENT_WEBHOOK_URL is set"))

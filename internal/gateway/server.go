@@ -5,9 +5,11 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/oxkrypton/Halon/internal/authz"
 	"github.com/oxkrypton/Halon/internal/incident"
 	"github.com/oxkrypton/Halon/internal/trafficlog"
 )
@@ -79,6 +81,9 @@ func NewHTTPHandler(dependencies Dependencies) *gin.Engine {
 type AdminOptions struct {
 	MetricsRequireAuth bool
 	Resilience         *ResilienceSet
+	// Auth is normally supplied from Config.Auth. Nil keeps the legacy
+	// single-token behaviour, which existing tests and callers rely on.
+	Auth *authz.Authenticator
 }
 
 func NewAdminHandler(token string, rules BlacklistStore, limiter RateLimitBackend, logger *slog.Logger, metrics *Metrics, options AdminOptions) *gin.Engine {
@@ -86,25 +91,48 @@ func NewAdminHandler(token string, rules BlacklistStore, limiter RateLimitBacken
 	router.GET("/healthz", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
+	authenticator := options.Auth
+	if authenticator == nil {
+		// Legacy fallback: the original ADMIN_TOKEN maps to a full principal.
+		authenticator, _ = authz.NewAuthenticator(
+			authz.Config{Mode: authz.ModeLegacy, Issuer: authz.DefaultIssuer},
+			authz.AudienceGatewayAdmin, token,
+		)
+	}
+	adminMiddlewares := []gin.HandlerFunc{
+		auditAdminRequest(logger, metrics),
+		authz.Middleware(authenticator, abortWithError),
+	}
 	if metrics != nil {
 		metricsHandler := gin.WrapH(metrics.Handler())
 		if options.MetricsRequireAuth {
-			router.GET("/metrics", adminAuthentication(token), metricsHandler)
+			// Scrapes are high-frequency: authenticate and authorize them,
+			// but never write an audit log entry (or admin metric) per scrape.
+			// Build a fresh chain instead of appending to adminMiddlewares so
+			// the audit middleware cannot leak into this route.
+			metricsMiddlewares := slices.Concat(
+				[]gin.HandlerFunc{
+					authz.Middleware(authenticator, abortWithError),
+					authz.Require(authz.PermGatewayMetricsRead, abortWithError),
+				},
+				[]gin.HandlerFunc{metricsHandler},
+			)
+			router.GET("/metrics", metricsMiddlewares...)
 		} else {
 			router.GET("/metrics", metricsHandler)
 		}
 	}
 
-	admin := router.Group("/admin", adminAuthentication(token))
+	admin := router.Group("/admin", adminMiddlewares...)
 	if options.Resilience != nil {
-		admin.GET("/breakers", func(c *gin.Context) {
+		admin.GET("/breakers", authz.Require(authz.PermGatewayBreakerRead, abortWithError), func(c *gin.Context) {
 			c.JSON(http.StatusOK, gin.H{"breakers": options.Resilience.BreakerStatuses()})
 		})
 	}
-	admin.GET("/rules/blacklist", func(c *gin.Context) {
+	admin.GET("/rules/blacklist", authz.Require(authz.PermGatewayRulesRead, abortWithError), func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"ips": rules.List()})
 	})
-	admin.PUT("/rules/blacklist/:ip", func(c *gin.Context) {
+	admin.PUT("/rules/blacklist/:ip", authz.Require(authz.PermGatewayBlacklistWrite, abortWithError), func(c *gin.Context) {
 		created, err := rules.Add(c.Param("ip"))
 		if err != nil {
 			if errors.Is(err, ErrBlacklistUnavailable) {
@@ -124,7 +152,7 @@ func NewAdminHandler(token string, rules BlacklistStore, limiter RateLimitBacken
 		}
 		c.JSON(statusCode, body)
 	})
-	admin.DELETE("/rules/blacklist/:ip", func(c *gin.Context) {
+	admin.DELETE("/rules/blacklist/:ip", authz.Require(authz.PermGatewayBlacklistWrite, abortWithError), func(c *gin.Context) {
 		removed, err := rules.Remove(c.Param("ip"))
 		if err != nil {
 			if errors.Is(err, ErrBlacklistUnavailable) {
@@ -140,11 +168,11 @@ func NewAdminHandler(token string, rules BlacklistStore, limiter RateLimitBacken
 		}
 		c.Status(http.StatusNoContent)
 	})
-	admin.GET("/rules/rate-limit", func(c *gin.Context) {
+	admin.GET("/rules/rate-limit", authz.Require(authz.PermGatewayRulesRead, abortWithError), func(c *gin.Context) {
 		rps, burst := limiter.Settings()
 		c.JSON(http.StatusOK, gin.H{"requests_per_second": rps, "burst": burst})
 	})
-	admin.PUT("/rules/rate-limit", func(c *gin.Context) {
+	admin.PUT("/rules/rate-limit", authz.Require(authz.PermGatewayRateLimitWrite, abortWithError), func(c *gin.Context) {
 		var request struct {
 			RequestsPerSecond float64 `json:"requests_per_second" binding:"required,gt=0"`
 			Burst             int     `json:"burst" binding:"required,gt=0"`
@@ -185,6 +213,45 @@ func newRouter(logger *slog.Logger, middleware ...gin.HandlerFunc) *gin.Engine {
 		abortWithError(c, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
 	})
 	return router
+}
+
+// auditAdminRequest records every authenticated admin call, including
+// authentication and permission failures, without adding a database table.
+func auditAdminRequest(logger *slog.Logger, metrics *Metrics) gin.HandlerFunc {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return func(c *gin.Context) {
+		c.Next()
+		principal := authz.PrincipalFromContext(c)
+		role, subject, typ, jti := "unknown", "", "", ""
+		if principal != nil {
+			role = principal.Role.String()
+			subject = principal.Subject
+			typ = string(principal.Type)
+			jti = principal.JTI
+		}
+		permission := authz.PermissionFromContext(c).String()
+		result := "allow"
+		if c.IsAborted() {
+			result = "deny"
+		}
+		logger.Info("admin request",
+			"sub", subject,
+			"typ", typ,
+			"role", role,
+			"jti", jti,
+			"permission", permission,
+			"result", result,
+			"status", c.Writer.Status(),
+			"method", c.Request.Method,
+			"path", c.Request.URL.Path,
+			"request_id", requestIDFromContext(c),
+		)
+		if metrics != nil {
+			metrics.IncAdminRequest(role, permission, result)
+		}
+	}
 }
 
 func readinessHandler(repository Pinger) gin.HandlerFunc {

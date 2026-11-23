@@ -37,11 +37,12 @@ const (
 type Metrics struct {
 	registry *prometheus.Registry
 
-	requests *prometheus.CounterVec
-	duration *prometheus.HistogramVec
-	inFlight prometheus.Gauge
-	respSize *prometheus.HistogramVec
-	rejected *prometheus.CounterVec
+	requests      *prometheus.CounterVec
+	duration      *prometheus.HistogramVec
+	inFlight      prometheus.Gauge
+	respSize      *prometheus.HistogramVec
+	rejected      *prometheus.CounterVec
+	adminRequests *prometheus.CounterVec
 
 	upstreamRequests *prometheus.CounterVec
 	upstreamDuration *prometheus.HistogramVec
@@ -84,6 +85,10 @@ func NewMetrics() *Metrics {
 			Name: "halon_gateway_rejected_requests_total",
 			Help: "Requests rejected before reaching an upstream, by reason.",
 		}, []string{"reason"}),
+		adminRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "halon_gateway_admin_requests_total",
+			Help: "Admin API requests by role, permission and decision.",
+		}, []string{"role", "permission", "result"}),
 		upstreamRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "halon_gateway_upstream_requests_total",
 			Help: "Upstream call attempts by route and result (success/timeout/error).",
@@ -132,7 +137,7 @@ func NewMetrics() *Metrics {
 	}
 	m.redisUp.Set(1)
 	m.registry.MustRegister(
-		m.requests, m.duration, m.inFlight, m.respSize, m.rejected,
+		m.requests, m.duration, m.inFlight, m.respSize, m.rejected, m.adminRequests,
 		m.upstreamRequests, m.upstreamDuration, m.upstreamInFlight,
 		m.retries, m.retriesExhausted, m.breakerState, m.breakerTrips,
 		m.trafficlogDropped, m.timeoutEventsDropped, m.webhookNotifyFailures,
@@ -168,6 +173,12 @@ func (m *Metrics) DecInFlight() {
 func (m *Metrics) IncRejected(reason string) {
 	if m != nil {
 		m.rejected.WithLabelValues(reason).Inc()
+	}
+}
+
+func (m *Metrics) IncAdminRequest(role, permission, result string) {
+	if m != nil {
+		m.adminRequests.WithLabelValues(role, permission, result).Inc()
 	}
 }
 
