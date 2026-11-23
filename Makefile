@@ -28,6 +28,7 @@ run-demo:
 build:
 	CGO_ENABLED=0 go build -trimpath -o bin/gateway ./cmd/gateway
 	CGO_ENABLED=0 go build -trimpath -o bin/agent ./cmd/agent
+	CGO_ENABLED=0 go build -trimpath -o bin/halonctl ./cmd/halonctl
 
 build-demo:
 	CGO_ENABLED=0 go build -trimpath -o bin/user-service-demo ./examples/user-service
