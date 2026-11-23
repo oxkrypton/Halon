@@ -121,3 +121,64 @@ func TestIntegrationCountEnabledFullUsers(t *testing.T) {
 		t.Fatalf("count after disabling full user = %d, %v; want %d", afterDisable, err, baseline)
 	}
 }
+
+// TestIntegrationConcurrentBootstrapSingleWinner needs a dedicated empty
+// PostgreSQL database pointed at HALON_TEST_BOOTSTRAP_DSN. It is skipped by
+// default so the normal test suite never destroys real auth_users rows.
+func TestIntegrationConcurrentBootstrapSingleWinner(t *testing.T) {
+	dsn := os.Getenv("HALON_TEST_BOOTSTRAP_DSN")
+	if dsn == "" {
+		t.Skip("set HALON_TEST_BOOTSTRAP_DSN to a dedicated empty database")
+	}
+	ctx := context.Background()
+	first, err := identity.OpenStore(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open first store: %v", err)
+	}
+	t.Cleanup(func() { _ = first.Close() })
+	second, err := identity.OpenStore(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open second store: %v", err)
+	}
+	t.Cleanup(func() { _ = second.Close() })
+	if err := first.Migrate(); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	sqlDB, err := first.SQLDB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqlDB.Exec(`DELETE FROM auth_users`); err != nil {
+		t.Fatalf("clear dedicated database: %v", err)
+	}
+	t.Cleanup(func() { _, _ = sqlDB.Exec(`DELETE FROM auth_users`) })
+
+	username := fmt.Sprintf("boot-%d", time.Now().UnixNano())
+	password := "bootstrap-secret-phrase-123"
+	stores := []*identity.Store{first, second, first, second}
+	results := make(chan bool, len(stores))
+	var wg sync.WaitGroup
+	for _, store := range stores {
+		wg.Add(1)
+		go func(store *identity.Store) {
+			defer wg.Done()
+			created, err := store.BootstrapAdmin(ctx, username, password, identity.DefaultPasswordPolicy())
+			if err != nil {
+				t.Errorf("bootstrap: %v", err)
+			}
+			results <- created
+		}(store)
+	}
+	wg.Wait()
+	close(results)
+
+	winners := 0
+	for created := range results {
+		if created {
+			winners++
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("successful bootstraps = %d, want exactly 1", winners)
+	}
+}

@@ -50,6 +50,8 @@ func run() error {
 	// Local login is opt-in. Identity uses its own migration version table,
 	// so it can share the database with trafficlog safely.
 	var identityStore *identity.Store
+	var cleaner *identity.Cleaner
+	cleanerDone := make(chan struct{})
 	if cfg.LoginEnabled {
 		identityContext, cancelIdentity := context.WithTimeout(context.Background(), 15*time.Second)
 		identityStore, err = identity.OpenStore(identityContext, cfg.DatabaseDSN)
@@ -61,7 +63,34 @@ func run() error {
 		if err := identityStore.Migrate(); err != nil {
 			return fmt.Errorf("apply identity migrations: %w", err)
 		}
+		if cfg.BootstrapAdminUser != "" {
+			bootstrapContext, cancelBootstrap := context.WithTimeout(context.Background(), 15*time.Second)
+			created, err := identityStore.BootstrapAdmin(bootstrapContext,
+				cfg.BootstrapAdminUser, cfg.BootstrapAdminPassword,
+				identity.PasswordPolicy{MinLength: cfg.PasswordMinLength})
+			cancelBootstrap()
+			if err != nil {
+				return fmt.Errorf("bootstrap administrator: %w", err)
+			}
+			if created {
+				// One line only: the password is never logged.
+				logger.Info("bootstrap administrator created", "username", cfg.BootstrapAdminUser)
+			}
+		}
+		cleaner = identity.NewCleaner(identityStore, cfg.AuthEventRetention, logger)
+		go func() {
+			cleaner.Run(context.Background())
+			close(cleanerDone)
+		}()
+	} else {
+		close(cleanerDone)
 	}
+	// Also covers startup failures that happen after the cleaner was started.
+	defer func() {
+		if cleaner != nil {
+			cleaner.Close()
+		}
+	}()
 
 	tracing, err := gateway.InitTracing(context.Background(), gateway.TracingConfig{
 		Enabled:      cfg.OTELEnabled,
@@ -282,6 +311,14 @@ func run() error {
 	case <-notifierDone:
 	case <-shutdownContext.Done():
 		shutdownResult = append(shutdownResult, errors.New("timeout notifier shutdown timed out"))
+	}
+	if cleaner != nil {
+		cleaner.Close()
+		select {
+		case <-cleanerDone:
+		case <-shutdownContext.Done():
+			shutdownResult = append(shutdownResult, errors.New("auth data cleaner shutdown timed out"))
+		}
 	}
 	return errors.Join(append(shutdownResult, runError)...)
 }
