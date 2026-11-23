@@ -147,13 +147,13 @@ func issueToken(request issueRequest) (string, error) {
 		return "", err
 	}
 	return signer.Issue(authz.IssueOptions{
-		Subject:  request.Subject,
-		Type:     principalType,
-		Role:     role,
-		Audience: audience,
-		TTL:      request.TTL,
-		Issuer:   request.Issuer,
-		JTI:      request.JTI,
+		Subject:   request.Subject,
+		Type:      principalType,
+		Role:      role,
+		Audiences: []authz.Audience{audience},
+		TTL:       request.TTL,
+		Issuer:    request.Issuer,
+		JTI:       request.JTI,
 	})
 }
 

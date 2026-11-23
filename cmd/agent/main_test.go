@@ -20,11 +20,11 @@ const (
 func issueGatewayToken(t *testing.T, signer *authz.Signer, typ authz.PrincipalType, role authz.Role) string {
 	t.Helper()
 	token, err := signer.Issue(authz.IssueOptions{
-		Subject:  "agent-1",
-		Type:     typ,
-		Role:     role,
-		Audience: authz.AudienceGatewayAdmin,
-		TTL:      time.Hour,
+		Subject:   "agent-1",
+		Type:      typ,
+		Role:      role,
+		Audiences: []authz.Audience{authz.AudienceGatewayAdmin},
+		TTL:       time.Hour,
 	})
 	if err != nil {
 		t.Fatal(err)

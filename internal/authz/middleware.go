@@ -38,11 +38,17 @@ func unauthorized(c *gin.Context, abort AbortFunc) {
 	abort(c, http.StatusUnauthorized, "UNAUTHORIZED", "valid bearer token required")
 }
 
-// Require denies a request whose principal lacks permission.
+// Require denies a request whose principal lacks permission, or whose user
+// still has to change their password. Endpoints needed to perform that change
+// (such as /auth/password and /auth/me) must not be guarded by this middleware.
 func Require(permission Permission, abort AbortFunc) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Set(permissionContextKey, permission)
 		principal := PrincipalFromContext(c)
+		if principal != nil && principal.PasswordChangeRequired {
+			abort(c, http.StatusForbidden, "PASSWORD_CHANGE_REQUIRED", "password change required")
+			return
+		}
 		if principal == nil || !principal.Role.Allows(permission) {
 			abort(c, http.StatusForbidden, "FORBIDDEN", "permission required: "+permission.String())
 			return

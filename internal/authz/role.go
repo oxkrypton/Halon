@@ -33,6 +33,8 @@ const (
 	PermToolK8sRestartPod     Permission = "tool:k8s:restart_pod"
 	PermToolK8sScale          Permission = "tool:k8s:scale"
 	PermToolK8sUpdateImage    Permission = "tool:k8s:update_image"
+	PermAuthUserRead          Permission = "auth:user:read"
+	PermAuthUserManage        Permission = "auth:user:manage"
 )
 
 var permissionRoles = map[Permission]Role{
@@ -46,6 +48,8 @@ var permissionRoles = map[Permission]Role{
 	PermToolK8sScale:          RoleOperator,
 	PermGatewayRateLimitWrite: RoleFull,
 	PermToolK8sUpdateImage:    RoleFull,
+	PermAuthUserRead:          RoleFull,
+	PermAuthUserManage:        RoleFull,
 }
 
 func ParseRole(value string) (Role, error) {

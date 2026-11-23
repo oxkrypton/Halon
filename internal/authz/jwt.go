@@ -19,6 +19,12 @@ type Claims struct {
 	jwt.RegisteredClaims
 	Type PrincipalType `json:"typ"`
 	Role Role          `json:"role"`
+	// UID identifies the user record behind a human session token. It is
+	// empty for agent and static credentials.
+	UID string `json:"uid"`
+	// PCR marks a token whose user must change their password before any
+	// permission-guarded endpoint may be used.
+	PCR bool `json:"pcr,omitempty"`
 }
 
 // Verifier verifies EdDSA/JWTs against a set of public keys.
@@ -51,9 +57,18 @@ func NewVerifier(keys map[string]ed25519.PublicKey, issuer string, revoked map[s
 
 // Verify validates signature, issuer, audience, expiry, role/type claims and
 // the emergency revocation list. Only EdDSA is accepted.
-func (v *Verifier) Verify(raw string, audience Audience) (*Principal, error) {
+//
+// The variadic audiences are the components that are willing to accept the
+// token. A token may carry several audiences in its "aud" claim (for example
+// both the gateway admin API and the agent API); verification succeeds when
+// at least one token audience appears in the expected list. Passing a single
+// audience keeps the historical single-audience behaviour unchanged.
+func (v *Verifier) Verify(raw string, audiences ...Audience) (*Principal, error) {
 	if v == nil {
 		return nil, errors.New("JWT verifier is not configured")
+	}
+	if len(audiences) == 0 {
+		return nil, errors.New("verify JWT: expected audience is required")
 	}
 	claims := &Claims{}
 	token, err := jwt.ParseWithClaims(raw, claims, func(token *jwt.Token) (any, error) {
@@ -92,8 +107,20 @@ func (v *Verifier) Verify(raw string, audience Audience) (*Principal, error) {
 	if _, revoked := v.revoked[claims.ID]; revoked {
 		return nil, errors.New("verify JWT: jti is revoked")
 	}
-	if len(claims.Audience) != 1 || claims.Audience[0] != string(audience) {
-		return nil, fmt.Errorf("verify JWT: audience must be exactly %q", audience)
+	var matched Audience
+	for _, expected := range audiences {
+		for _, tokenAudience := range claims.Audience {
+			if Audience(tokenAudience) == expected {
+				matched = expected
+				break
+			}
+		}
+		if matched != "" {
+			break
+		}
+	}
+	if matched == "" {
+		return nil, fmt.Errorf("verify JWT: audience must include one of %v", audiences)
 	}
 	typ, err := ParsePrincipalType(string(claims.Type))
 	if err != nil {
@@ -104,12 +131,14 @@ func (v *Verifier) Verify(raw string, audience Audience) (*Principal, error) {
 		return nil, fmt.Errorf("verify JWT: %w", err)
 	}
 	return &Principal{
-		Subject:  claims.Subject,
-		Type:     typ,
-		Role:     role,
-		Audience: audience,
-		Issuer:   claims.Issuer,
-		JTI:      claims.ID,
+		Subject:                claims.Subject,
+		UserID:                 claims.UID,
+		Type:                   typ,
+		Role:                   role,
+		Audience:               matched,
+		Issuer:                 claims.Issuer,
+		JTI:                    claims.ID,
+		PasswordChangeRequired: claims.PCR,
 	}, nil
 }
 
@@ -133,13 +162,19 @@ func ParsePrincipalType(value string) (PrincipalType, error) {
 
 // IssueOptions describes one token to sign.
 type IssueOptions struct {
-	Subject  string
-	Type     PrincipalType
-	Role     Role
-	Audience Audience
-	TTL      time.Duration
-	Issuer   string
-	JTI      string
+	Subject string
+	Type    PrincipalType
+	Role    Role
+	// Audiences lists every component willing to accept the token. A single
+	// element preserves the original single-audience behaviour.
+	Audiences []Audience
+	// UserID is the auth user record behind a session token.
+	UserID string
+	// PasswordChangeRequired forces a password change before protected use.
+	PasswordChangeRequired bool
+	TTL                    time.Duration
+	Issuer                 string
+	JTI                    string
 }
 
 // Signer holds the signing key. Only the offline CLI should ever hold it.
@@ -172,8 +207,20 @@ func (s *Signer) Issue(options IssueOptions) (string, error) {
 	if _, err := ParseRole(string(options.Role)); err != nil {
 		return "", err
 	}
-	if options.Audience != AudienceGatewayAdmin && options.Audience != AudienceAgent {
-		return "", fmt.Errorf("unsupported audience %q", options.Audience)
+	if len(options.Audiences) == 0 {
+		return "", errors.New("at least one audience is required")
+	}
+	audiences := make(jwt.ClaimStrings, 0, len(options.Audiences))
+	seen := make(map[Audience]struct{}, len(options.Audiences))
+	for _, audience := range options.Audiences {
+		if audience != AudienceGatewayAdmin && audience != AudienceAgent {
+			return "", fmt.Errorf("unsupported audience %q", audience)
+		}
+		if _, duplicate := seen[audience]; duplicate {
+			continue
+		}
+		seen[audience] = struct{}{}
+		audiences = append(audiences, string(audience))
 	}
 	if options.TTL <= 0 {
 		return "", errors.New("ttl must be positive")
@@ -195,13 +242,15 @@ func (s *Signer) Issue(options IssueOptions) (string, error) {
 		RegisteredClaims: jwt.RegisteredClaims{
 			Issuer:    issuer,
 			Subject:   options.Subject,
-			Audience:  jwt.ClaimStrings{string(options.Audience)},
+			Audience:  audiences,
 			ExpiresAt: jwt.NewNumericDate(now.Add(options.TTL)),
 			IssuedAt:  jwt.NewNumericDate(now),
 			ID:        jti,
 		},
 		Type: options.Type,
 		Role: options.Role,
+		UID:  options.UserID,
+		PCR:  options.PasswordChangeRequired,
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodEdDSA, claims)
 	token.Header["kid"] = s.kid

@@ -2,6 +2,7 @@ package authz
 
 import (
 	"crypto/ed25519"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -31,6 +32,8 @@ func TestRolePermissionMatrix(t *testing.T) {
 		{PermToolK8sScale, false, true, true},
 		{PermGatewayRateLimitWrite, false, false, true},
 		{PermToolK8sUpdateImage, false, false, true},
+		{PermAuthUserRead, false, false, true},
+		{PermAuthUserManage, false, false, true},
 	}
 	for _, test := range cases {
 		if got := RoleReadOnly.Allows(test.permission); got != test.readonly {
@@ -79,12 +82,12 @@ func newJWTFixture(t *testing.T, revoked ...string) jwtFixture {
 
 func validOptions() IssueOptions {
 	return IssueOptions{
-		Subject:  "alice",
-		Type:     TypeHuman,
-		Role:     RoleOperator,
-		Audience: AudienceGatewayAdmin,
-		TTL:      time.Hour,
-		JTI:      "jti-1",
+		Subject:   "alice",
+		Type:      TypeHuman,
+		Role:      RoleOperator,
+		Audiences: []Audience{AudienceGatewayAdmin},
+		TTL:       time.Hour,
+		JTI:       "jti-1",
 	}
 }
 
@@ -124,6 +127,112 @@ func (o IssueOptions) withGeneratedJTI() IssueOptions {
 	return o
 }
 
+func TestJWTMultipleAudiences(t *testing.T) {
+	t.Parallel()
+	fixture := newJWTFixture(t)
+
+	options := validOptions()
+	options.Audiences = []Audience{AudienceGatewayAdmin, AudienceAgent}
+	raw, err := fixture.signer.Issue(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Both components accept the shared token.
+	for _, expected := range []Audience{AudienceGatewayAdmin, AudienceAgent} {
+		principal, err := fixture.verifier.Verify(raw, expected)
+		if err != nil {
+			t.Fatalf("verify for %s: %v", expected, err)
+		}
+		if principal.Audience != expected {
+			t.Fatalf("principal audience = %s, want %s", principal.Audience, expected)
+		}
+	}
+	// An explicit list of expected audiences also works.
+	if _, err := fixture.verifier.Verify(raw, AudienceGatewayAdmin, AudienceAgent); err != nil {
+		t.Fatalf("verify against audience list: %v", err)
+	}
+	// Components outside the token audience list remain rejected.
+	if _, err := fixture.verifier.Verify(raw, Audience("other")); err == nil {
+		t.Error("unexpected audience was accepted")
+	}
+	if _, err := fixture.verifier.Verify(raw); err == nil {
+		t.Error("empty expected audience list was accepted")
+	}
+
+	// Single-audience tokens keep their historical behaviour.
+	single, err := fixture.signer.Issue(validOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.verifier.Verify(single, AudienceGatewayAdmin, AudienceAgent); err != nil {
+		t.Fatalf("single-audience token rejected by audience list: %v", err)
+	}
+	if _, err := fixture.verifier.Verify(single, AudienceAgent); err == nil {
+		t.Error("cross-audience single-audience token was accepted")
+	}
+}
+
+func TestIssueValidatesAudiences(t *testing.T) {
+	t.Parallel()
+	fixture := newJWTFixture(t)
+
+	empty := validOptions()
+	empty.Audiences = nil
+	if _, err := fixture.signer.Issue(empty); err == nil {
+		t.Error("issuing without an audience succeeded")
+	}
+	unknown := validOptions()
+	unknown.Audiences = []Audience{"other"}
+	if _, err := fixture.signer.Issue(unknown); err == nil {
+		t.Error("issuing for an unknown audience succeeded")
+	}
+	duplicate := validOptions()
+	duplicate.Audiences = []Audience{AudienceGatewayAdmin, AudienceGatewayAdmin}
+	raw, err := fixture.signer.Issue(duplicate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal, err := fixture.verifier.Verify(raw, AudienceGatewayAdmin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if principal.Audience != AudienceGatewayAdmin {
+		t.Fatalf("principal audience = %s, want gateway admin", principal.Audience)
+	}
+}
+
+func TestJWTUserClaimsRoundTrip(t *testing.T) {
+	t.Parallel()
+	fixture := newJWTFixture(t)
+
+	options := validOptions()
+	options.UserID = "user-42"
+	options.PasswordChangeRequired = true
+	raw, err := fixture.signer.Issue(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal, err := fixture.verifier.Verify(raw, AudienceGatewayAdmin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if principal.UserID != "user-42" || !principal.PasswordChangeRequired {
+		t.Fatalf("user claims did not round-trip: %+v", principal)
+	}
+
+	plain, err := fixture.signer.Issue(validOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	plainPrincipal, err := fixture.verifier.Verify(plain, AudienceGatewayAdmin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plainPrincipal.UserID != "" || plainPrincipal.PasswordChangeRequired {
+		t.Fatalf("unexpected user claims on plain token: %+v", plainPrincipal)
+	}
+}
+
 func TestVerifierRejectsInvalidTokens(t *testing.T) {
 	t.Parallel()
 	fixture := newJWTFixture(t, "revoked-1")
@@ -145,7 +254,7 @@ func TestVerifierRejectsInvalidTokens(t *testing.T) {
 			RegisteredClaims: jwt.RegisteredClaims{
 				Issuer:    DefaultIssuer,
 				Subject:   options.Subject,
-				Audience:  jwt.ClaimStrings{string(options.Audience)},
+				Audience:  jwt.ClaimStrings{string(options.Audiences[0])},
 				ExpiresAt: jwt.NewNumericDate(now.Add(time.Hour)),
 				IssuedAt:  jwt.NewNumericDate(now),
 				ID:        options.JTI,
@@ -163,6 +272,7 @@ func TestVerifierRejectsInvalidTokens(t *testing.T) {
 	}{
 		{"expired", signWith(fixture.private, claimsWithExpiry(claims(), time.Now().Add(-time.Minute)), fixture.kid), AudienceGatewayAdmin, "expired"},
 		{"wrong audience", signWith(fixture.private, claimsWithAudience(claims(), "other"), fixture.kid), AudienceGatewayAdmin, "audience"},
+		{"empty audience", signWith(fixture.private, claimsWithoutAudience(claims()), fixture.kid), AudienceGatewayAdmin, "audience"},
 		{"alg none", sign(claims(), fixture.kid, jwt.SigningMethodNone, jwt.UnsafeAllowNoneSignatureType), AudienceGatewayAdmin, "signing method"},
 		{"HS confusion", sign(claims(), fixture.kid, jwt.SigningMethodHS256, []byte(fixture.key)), AudienceGatewayAdmin, "signing method"},
 		{"unknown kid", sign(claims(), "unknown", jwt.SigningMethodEdDSA, testPrivateKey(t)), AudienceGatewayAdmin, "kid"},
@@ -211,6 +321,10 @@ func claimsWithoutExp(c *Claims) *Claims {
 }
 func claimsWithAudience(c *Claims, audience string) *Claims {
 	c.Audience = jwt.ClaimStrings{audience}
+	return c
+}
+func claimsWithoutAudience(c *Claims) *Claims {
+	c.Audience = nil
 	return c
 }
 func claimsWithJTI(c *Claims, jti string) *Claims {
@@ -314,6 +428,66 @@ func TestAuthenticatorModes(t *testing.T) {
 	}
 	if _, err := strict.Authenticate(raw); err != nil {
 		t.Fatalf("jwt mode rejected JWT: %v", err)
+	}
+}
+
+func TestRequireRejectsPasswordChangeRequired(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	fixture := newJWTFixture(t)
+	options := validOptions()
+	options.Role = RoleFull
+	options.PasswordChangeRequired = true
+	raw, err := fixture.signer.Issue(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plainOptions := validOptions()
+	plainOptions.Role = RoleFull
+	plain, err := fixture.signer.Issue(plainOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := Config{Mode: ModeJWT, Issuer: DefaultIssuer, PublicKeys: map[string]ed25519.PublicKey{fixture.kid: fixture.key}}
+	authenticator, err := NewAuthenticator(config, AudienceGatewayAdmin, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	abort := func(c *gin.Context, status int, code, message string) {
+		c.AbortWithStatusJSON(status, gin.H{"code": code, "message": message})
+	}
+	router := gin.New()
+	group := router.Group("/", Middleware(authenticator, abort))
+	group.GET("/read", Require(PermIncidentRead, abort), func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	for _, test := range []struct {
+		name   string
+		token  string
+		status int
+		code   string
+	}{
+		{"password change required", raw, http.StatusForbidden, "PASSWORD_CHANGE_REQUIRED"},
+		{"no password change needed", plain, http.StatusOK, ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, "/read", nil)
+			request.Header.Set("Authorization", "Bearer "+test.token)
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			if response.Code != test.status {
+				t.Fatalf("status = %d, want %d; body = %s", response.Code, test.status, response.Body.String())
+			}
+			if test.code != "" {
+				var body struct {
+					Code string `json:"code"`
+				}
+				if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+					t.Fatal(err)
+				}
+				if body.Code != test.code {
+					t.Fatalf("error code = %q, want %q", body.Code, test.code)
+				}
+			}
+		})
 	}
 }
 

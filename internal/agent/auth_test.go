@@ -15,11 +15,11 @@ import (
 func agentTokenFor(t *testing.T, signer *authz.Signer, role authz.Role) string {
 	t.Helper()
 	token, err := signer.Issue(authz.IssueOptions{
-		Subject:  "human-1",
-		Type:     authz.TypeHuman,
-		Role:     role,
-		Audience: authz.AudienceAgent,
-		TTL:      time.Hour,
+		Subject:   "human-1",
+		Type:      authz.TypeHuman,
+		Role:      role,
+		Audiences: []authz.Audience{authz.AudienceAgent},
+		TTL:       time.Hour,
 	})
 	if err != nil {
 		t.Fatal(err)

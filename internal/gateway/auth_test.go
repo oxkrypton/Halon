@@ -16,11 +16,11 @@ import (
 func adminTokenFor(t *testing.T, signer *authz.Signer, role authz.Role) string {
 	t.Helper()
 	token, err := signer.Issue(authz.IssueOptions{
-		Subject:  "admin-" + role.String(),
-		Type:     authz.TypeHuman,
-		Role:     role,
-		Audience: authz.AudienceGatewayAdmin,
-		TTL:      time.Hour,
+		Subject:   "admin-" + role.String(),
+		Type:      authz.TypeHuman,
+		Role:      role,
+		Audiences: []authz.Audience{authz.AudienceGatewayAdmin},
+		TTL:       time.Hour,
 	})
 	if err != nil {
 		t.Fatal(err)
