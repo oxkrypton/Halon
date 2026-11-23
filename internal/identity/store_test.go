@@ -296,3 +296,93 @@ func TestJSONBRejectsInvalidJSON(t *testing.T) {
 		t.Fatalf("empty JSONB value = %v, %v; want nil, nil", value, err)
 	}
 }
+
+func fullUserRows() *sqlmock.Rows {
+	now := time.Date(2026, 11, 23, 10, 0, 0, 0, time.UTC)
+	return sqlmock.NewRows([]string{
+		"id", "username", "display_name", "password_hash", "role",
+		"disabled", "must_change_password", "failed_login_count", "locked_until",
+		"password_changed_at", "last_login_at", "created_by", "created_at", "updated_at",
+	}).AddRow("user-uuid", "alice", "Alice", sampleHash, "full",
+		false, false, 0, nil, now, nil, nil, now, now)
+}
+
+func TestListUsers(t *testing.T) {
+	t.Parallel()
+	store, mock := newMockStore(t)
+	mock.ExpectQuery(`SELECT count\(\*\) FROM "auth_users"`).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	mock.ExpectQuery(`SELECT \* FROM "auth_users" ORDER BY created_at DESC LIMIT \$1 OFFSET \$2`).
+		WithArgs(10, 5).
+		WillReturnRows(userRows())
+
+	users, total, err := store.ListUsers(context.Background(), 5, 10)
+	if err != nil || total != 1 || len(users) != 1 || users[0].Username != "alice" {
+		t.Fatalf("list users = %+v, %d, %v", users, total, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRevokeAllUserRefreshTokens(t *testing.T) {
+	t.Parallel()
+	store, mock := newMockStore(t)
+	mock.ExpectExec(`UPDATE auth_refresh_tokens SET revoked_at = NOW\(\) WHERE user_id = \$1 AND revoked_at IS NULL`).
+		WithArgs("user-uuid").
+		WillReturnResult(sqlmock.NewResult(0, 3))
+	if err := store.RevokeAllUserRefreshTokens(context.Background(), "user-uuid"); err != nil {
+		t.Fatalf("revoke user tokens: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUpdateUserGuardedDisplayName(t *testing.T) {
+	t.Parallel()
+	store, mock := newMockStore(t)
+	name := "Alice Updated"
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT "id" FROM "auth_users" WHERE role = \$1 AND disabled = FALSE FOR UPDATE`).
+		WithArgs("full").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("user-1").AddRow("user-uuid"))
+	mock.ExpectQuery(`SELECT \* FROM "auth_users" WHERE id = \$1 LIMIT \$2 FOR UPDATE`).
+		WithArgs("user-uuid", 1).
+		WillReturnRows(userRows())
+	mock.ExpectExec(`UPDATE "auth_users" SET`).
+		WithArgs(name, sqlmock.AnyArg(), "user-uuid").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	if err := store.UpdateUserGuarded(context.Background(), "user-uuid", "actor-id",
+		identity.UserUpdate{DisplayName: &name}); err != nil {
+		t.Fatalf("update user: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUpdateUserGuardedRejectsLastAdmin(t *testing.T) {
+	t.Parallel()
+	store, mock := newMockStore(t)
+	disabled := true
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT "id" FROM "auth_users" WHERE role = \$1 AND disabled = FALSE FOR UPDATE`).
+		WithArgs("full").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("user-uuid"))
+	mock.ExpectQuery(`SELECT \* FROM "auth_users" WHERE id = \$1 LIMIT \$2 FOR UPDATE`).
+		WithArgs("user-uuid", 1).
+		WillReturnRows(fullUserRows())
+	mock.ExpectRollback()
+
+	err := store.UpdateUserGuarded(context.Background(), "user-uuid", "actor-id",
+		identity.UserUpdate{Disabled: &disabled})
+	if !errors.Is(err, identity.ErrLastAdmin) {
+		t.Fatalf("error = %v, want ErrLastAdmin", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}

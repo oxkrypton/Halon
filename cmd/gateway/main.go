@@ -190,7 +190,9 @@ func run() error {
 	}
 	logger.Info("admin authentication mode", "mode", cfg.Auth.Mode)
 
+	var identityService *identity.Service
 	var authService gateway.AuthService
+	var userService gateway.UserService
 	var loginLimiter gateway.RateLimitBackend
 	if cfg.LoginEnabled {
 		privateKey, err := authz.ParsePrivateKeyBase64(cfg.JWTPrivateKey)
@@ -201,7 +203,7 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("configure login signer: %w", err)
 		}
-		authService, err = identity.NewService(identityStore, signer, identity.ServiceConfig{
+		identityService, err = identity.NewService(identityStore, signer, identity.ServiceConfig{
 			AccessTokenTTL:     cfg.AccessTokenTTL,
 			RefreshTokenTTL:    cfg.RefreshTokenTTL,
 			RefreshMaxLifetime: cfg.RefreshMaxLifetime,
@@ -214,6 +216,8 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("configure identity service: %w", err)
 		}
+		authService = identityService
+		userService = identityService
 		if redisClient != nil {
 			loginLimiter = gateway.NewRedisRateLimiter(redisClient,
 				cfg.LoginRateLimitRPS, cfg.LoginRateLimitBurst, cfg.RedisOpTimeout,
@@ -231,6 +235,7 @@ func run() error {
 		Auth:               authenticator,
 		LoginEnabled:       cfg.LoginEnabled,
 		AuthService:        authService,
+		UserService:        userService,
 		LoginLimiter:       loginLimiter,
 	}))
 

@@ -174,6 +174,19 @@ func (s *Store) RevokeRefreshTokenFamilyByToken(ctx context.Context, token strin
 	return s.RevokeTokenFamily(ctx, familyID)
 }
 
+// RevokeAllUserRefreshTokens invalidates every active token family of a user.
+// It is called when an administrator resets that user's password.
+func (s *Store) RevokeAllUserRefreshTokens(ctx context.Context, userID string) error {
+	result := s.db.WithContext(ctx).Exec(`
+		UPDATE auth_refresh_tokens
+		   SET revoked_at = NOW()
+		 WHERE user_id = $1 AND revoked_at IS NULL`, userID)
+	if result.Error != nil {
+		return fmt.Errorf("revoke user refresh tokens: %w", result.Error)
+	}
+	return nil
+}
+
 // RevokeTokenFamily invalidates every refresh token descended from one login.
 // The service layer calls this when it observes a disabled user or a reuse
 // alert.

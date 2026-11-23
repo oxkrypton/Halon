@@ -88,6 +88,7 @@ type AdminOptions struct {
 	// for /auth/* to be served; otherwise those paths answer LOGIN_DISABLED.
 	LoginEnabled bool
 	AuthService  AuthService
+	UserService  UserService
 	LoginLimiter RateLimitBackend
 }
 
@@ -201,6 +202,11 @@ func NewAdminHandler(token string, rules BlacklistStore, limiter RateLimitBacken
 		registerAuthRoutes(router, authenticator, options.AuthService, options.LoginLimiter, logger)
 	} else {
 		registerAuthDisabledRoutes(router)
+	}
+	if options.LoginEnabled && options.UserService != nil {
+		registerUserRoutes(router, authenticator, options.UserService, logger, metrics)
+	} else {
+		registerUserDisabledRoutes(router)
 	}
 	return router
 }

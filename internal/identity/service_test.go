@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -20,6 +21,7 @@ type memoryStore struct {
 	byID   map[string]*identity.User
 	tokens map[string]*memoryToken
 	events []identity.AuthEvent
+	nextID int
 }
 
 type memoryToken struct {
@@ -40,14 +42,20 @@ func newMemoryStore() *memoryStore {
 }
 
 func (m *memoryStore) addUser(t *testing.T, role authz.Role, mustChange bool) *identity.User {
-	username, password := "alice", testPassword
 	t.Helper()
+	return m.addNamedUser(t, "alice", role, mustChange)
+}
+
+func (m *memoryStore) addNamedUser(t *testing.T, username string, role authz.Role, mustChange bool) *identity.User {
+	t.Helper()
+	password := testPassword
 	hash, err := identity.HashPassword(password)
 	if err != nil {
 		t.Fatal(err)
 	}
+	m.nextID++
 	user := &identity.User{
-		ID:                 "user-" + username,
+		ID:                 fmt.Sprintf("user-%d", m.nextID),
 		Username:           username,
 		PasswordHash:       hash,
 		Role:               role,
@@ -78,6 +86,83 @@ func (m *memoryStore) GetUserByID(_ context.Context, id string) (*identity.User,
 		return nil, identity.ErrNotFound
 	}
 	return user, nil
+}
+
+func (m *memoryStore) ListUsers(_ context.Context, offset, limit int) ([]identity.User, int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	all := make([]identity.User, 0, len(m.users))
+	for _, user := range m.users {
+		all = append(all, *user)
+	}
+	if offset > len(all) {
+		offset = len(all)
+	}
+	end := offset + limit
+	if end > len(all) {
+		end = len(all)
+	}
+	return all[offset:end], int64(len(all)), nil
+}
+
+func (m *memoryStore) CreateUser(_ context.Context, user *identity.User) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, taken := m.users[user.Username]; taken {
+		return identity.ErrUsernameTaken
+	}
+	if user.ID == "" {
+		m.nextID++
+		user.ID = fmt.Sprintf("user-%d", m.nextID)
+	}
+	m.users[user.Username] = user
+	m.byID[user.ID] = user
+	return nil
+}
+
+func (m *memoryStore) UpdateUserGuarded(_ context.Context, targetID, actorID string, update identity.UserUpdate) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	target, ok := m.byID[targetID]
+	if !ok {
+		return identity.ErrNotFound
+	}
+	enabledFull := 0
+	for _, user := range m.users {
+		if user.Role == authz.RoleFull && !user.Disabled {
+			enabledFull++
+		}
+	}
+	if targetID == actorID && (update.Role != nil || (update.Disabled != nil && *update.Disabled)) {
+		return identity.ErrCannotModifySelf
+	}
+	losesFull := target.Role == authz.RoleFull && !target.Disabled &&
+		((update.Role != nil && *update.Role != authz.RoleFull) || (update.Disabled != nil && *update.Disabled))
+	if losesFull && enabledFull <= 1 {
+		return identity.ErrLastAdmin
+	}
+	if update.Role != nil {
+		target.Role = *update.Role
+	}
+	if update.Disabled != nil {
+		target.Disabled = *update.Disabled
+	}
+	if update.DisplayName != nil {
+		target.DisplayName = *update.DisplayName
+	}
+	return nil
+}
+
+func (m *memoryStore) RevokeAllUserRefreshTokens(_ context.Context, userID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, token := range m.tokens {
+		if token.userID == userID {
+			now := time.Now().UTC()
+			token.revokedAt = &now
+		}
+	}
+	return nil
 }
 
 func (m *memoryStore) SetPasswordHashOnly(_ context.Context, username, hash string) error {

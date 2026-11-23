@@ -18,6 +18,14 @@ var (
 	ErrInvalidCredentials = errors.New("invalid username or password")
 	// ErrWeakPassword wraps the password policy rejection.
 	ErrWeakPassword = errors.New("password does not satisfy the policy")
+	// ErrUsernameTaken marks a create that collided with an existing name.
+	ErrUsernameTaken = errors.New("username is already taken")
+	// ErrLastAdmin protects the final enabled full-role user from being
+	// demoted or disabled, which would lock everyone out of administration.
+	ErrLastAdmin = errors.New("cannot demote or disable the last enabled administrator")
+	// ErrCannotModifySelf stops an administrator from changing their own
+	// role or disabling themselves through the user-management API.
+	ErrCannotModifySelf = errors.New("cannot change own role or disable self")
 )
 
 // AuthStore is the slice of Store that the authentication service needs.
@@ -26,6 +34,10 @@ var (
 type AuthStore interface {
 	GetUserByUsername(ctx context.Context, username string) (*User, error)
 	GetUserByID(ctx context.Context, id string) (*User, error)
+	ListUsers(ctx context.Context, offset, limit int) ([]User, int64, error)
+	CreateUser(ctx context.Context, user *User) error
+	UpdateUserGuarded(ctx context.Context, targetID, actorID string, update UserUpdate) error
+	RevokeAllUserRefreshTokens(ctx context.Context, userID string) error
 	SetPasswordHashOnly(ctx context.Context, username, hash string) error
 	SetPasswordHash(ctx context.Context, username, hash string) error
 	SetMustChangePassword(ctx context.Context, username string, value bool) error
@@ -126,7 +138,7 @@ func (s *Service) Login(
 	if errors.Is(err, ErrNotFound) {
 		// #nosec G104 -- verification result is deliberately discarded.
 		_, _ = VerifyPassword(FakePasswordHash(), password)
-		s.auditFailure(ctx, EventLoginFailure, username, clientIP, requestID, "unknown_user")
+		s.auditFailure(ctx, EventLoginFailure, username, username, clientIP, requestID, "unknown_user")
 		return nil, ErrInvalidCredentials
 	}
 	if err != nil {
@@ -139,10 +151,10 @@ func (s *Service) Login(
 	now := time.Now().UTC()
 	switch {
 	case user.Disabled:
-		s.auditFailure(ctx, EventLoginFailure, username, clientIP, requestID, "disabled_user")
+		s.auditFailure(ctx, EventLoginFailure, username, username, clientIP, requestID, "disabled_user")
 		return nil, ErrInvalidCredentials
 	case user.LockedUntil != nil && user.LockedUntil.After(now):
-		s.auditFailure(ctx, EventLoginFailure, username, clientIP, requestID, "locked_user")
+		s.auditFailure(ctx, EventLoginFailure, username, username, clientIP, requestID, "locked_user")
 		return nil, ErrInvalidCredentials
 	case verifyErr != nil || !matched:
 		failed := user.FailedLoginCount + 1
@@ -158,7 +170,7 @@ func (s *Service) Login(
 		if lockUntil != nil {
 			reason = "account_locked"
 		}
-		s.auditFailure(ctx, EventLoginFailure, username, clientIP, requestID, reason)
+		s.auditFailure(ctx, EventLoginFailure, username, username, clientIP, requestID, reason)
 		return nil, ErrInvalidCredentials
 	}
 
@@ -181,7 +193,7 @@ func (s *Service) Login(
 	if err != nil {
 		return nil, err
 	}
-	s.auditSuccess(ctx, EventLoginSuccess, username, clientIP, requestID)
+	s.auditSuccess(ctx, EventLoginSuccess, username, username, clientIP, requestID)
 	return session, nil
 }
 
@@ -210,7 +222,7 @@ func (s *Service) Refresh(
 	}
 	if user.Disabled {
 		s.revokeFamily(ctx, rotation.FamilyID)
-		s.auditFailure(ctx, EventLoginFailure, user.Username, clientIP, requestID, "disabled_user_refresh")
+		s.auditFailure(ctx, EventLoginFailure, user.Username, user.Username, clientIP, requestID, "disabled_user_refresh")
 		return nil, ErrInvalidRefreshToken
 	}
 	session, err := s.newSession(user, rotation)
@@ -226,7 +238,7 @@ func (s *Service) Logout(ctx context.Context, token, requestID string) error {
 	if err := s.store.RevokeRefreshTokenFamilyByToken(ctx, token); err != nil {
 		return fmt.Errorf("logout: %w", err)
 	}
-	s.auditSuccess(ctx, EventLogout, "", "", requestID)
+	s.auditSuccess(ctx, EventLogout, "", "", "", requestID)
 	return nil
 }
 
@@ -246,7 +258,7 @@ func (s *Service) ChangePassword(
 	}
 	matched, err := VerifyPassword(user.PasswordHash, currentPassword)
 	if err != nil || !matched {
-		s.auditFailure(ctx, EventPasswordChanged, user.Username, clientIP, requestID, "bad_current_password")
+		s.auditFailure(ctx, EventPasswordChanged, user.Username, user.Username, clientIP, requestID, "bad_current_password")
 		return ErrInvalidCredentials
 	}
 	if err := s.cfg.PasswordPolicy.Validate(user.Username, newPassword); err != nil {
@@ -262,7 +274,7 @@ func (s *Service) ChangePassword(
 	if err := s.store.SetMustChangePassword(ctx, user.Username, false); err != nil {
 		return fmt.Errorf("clear password change flag: %w", err)
 	}
-	s.auditSuccess(ctx, EventPasswordChanged, user.Username, clientIP, requestID)
+	s.auditSuccess(ctx, EventPasswordChanged, user.Username, user.Username, clientIP, requestID)
 	return nil
 }
 
@@ -301,19 +313,20 @@ func (s *Service) revokeFamily(ctx context.Context, familyID string) {
 	}
 }
 
-func (s *Service) auditSuccess(ctx context.Context, action, username, clientIP, requestID string) {
-	s.audit(ctx, action, EventResultSuccess, username, clientIP, requestID, "")
+func (s *Service) auditSuccess(ctx context.Context, action, actor, target, clientIP, requestID string) {
+	s.audit(ctx, action, EventResultSuccess, actor, target, clientIP, requestID, "")
 }
 
-func (s *Service) auditFailure(ctx context.Context, action, username, clientIP, requestID, reason string) {
-	s.audit(ctx, action, EventResultFailure, username, clientIP, requestID, reason)
+func (s *Service) auditFailure(ctx context.Context, action, actor, target, clientIP, requestID, reason string) {
+	s.audit(ctx, action, EventResultFailure, actor, target, clientIP, requestID, reason)
 }
 
-func (s *Service) audit(ctx context.Context, action, result, username, clientIP, requestID, reason string) {
+func (s *Service) audit(ctx context.Context, action, result, actor, target, clientIP, requestID, reason string) {
 	event := AuthEvent{
 		Action:         action,
 		Result:         result,
-		TargetUsername: username,
+		ActorUsername:  actor,
+		TargetUsername: target,
 		ClientIP:       clientIP,
 		RequestID:      requestID,
 	}
