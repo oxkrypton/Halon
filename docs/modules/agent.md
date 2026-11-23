@@ -11,12 +11,12 @@
 
 | 文件 | 内容 |
 | --- | --- |
-| `types.go` | `OperationLevel`(readonly < operator < full)、消息/工具调用类型、`RunResult`、`ErrMaxSteps` |
-| `registry.go` | `Registry`:按操作级别过滤工具、排序定义、执行时做 JSON 校验并把错误回传给模型 |
+| `types.go` | `OperationLevel`(readonly < operator < full)、消息/工具调用类型、`Tool.Permission`、`RunResult`、`ErrMaxSteps` |
+| `registry.go` | `Registry`:按角色×权限过滤工具、排序定义、执行时再校验一次权限与 JSON 并把错误回传给模型 |
 | `loop.go` | `Loop.Run`:系统提示词 + 事件 JSON → 多轮 `Complete` → 工具执行 → 最终中文报告;工具输出双上限截断(UTF-8 安全):喂模型按 `AGENT_MAX_TOOL_OUTPUT`,落库按更宽的 `AGENT_MAX_STORED_TOOL_OUTPUT` 并置 `output_truncated` 标记 |
 | `openai.go` | `OpenAIClient`:OpenAI 兼容 `/chat/completions`;429/5xx 重试最多 3 次,尊重 `Retry-After`;4xx 不重试 |
 | `orchestrator.go` | `Orchestrator`:`Submit`(校验→Claim→入队)→ worker 池 `investigate`(限时运行 + 落库)→ `Close` 排空;`RecoverUnfinished` 启动时回收悬挂报告(仅内存模式) |
-| `server.go` | HTTP API:事件接收、报告查询、健康探针 |
+| `server.go` | HTTP API:事件接收(仅 INGEST_TOKEN)、报告查询(`incident:read` JWT,兼容期内可用 INGEST_TOKEN)、健康探针 |
 | `config.go` | `LoadConfig()`:全部环境变量与启动校验 |
 
 工具实现在独立的 [agent-tools](agent-tools.md) 模块。
@@ -27,13 +27,13 @@
 
 ## HTTP API
 
-均需 `Authorization: Bearer <INGEST_TOKEN>`(常量时间比较);事件体最大 64 KiB。
+事件体最大 64 KiB。鉴权分两条:`POST /api/v1/incidents/timeout` 只认 `Authorization: Bearer <INGEST_TOKEN>`(常量时间比较),不进入角色体系;报告查询要求 `incident:read`,即 `AUTH_MODE=hybrid/legacy` 下可用 INGEST_TOKEN 兼容,`jwt` 下必须用 `aud=halon-agent` 的 JWT。详见 [auth.md](auth.md)。
 
-| 接口 | 行为 |
-| --- | --- |
-| `POST /api/v1/incidents/timeout` | 校验事件 → `Deduper.Seen`(内存去重)→ `Orchestrator.Submit`(存储幂等)。新事件 `202 {accepted:true}`;重复 `200 {duplicate:true}`;队列满 `503 QUEUE_FULL` |
-| `GET /api/v1/incidents?limit=` | 报告列表(1..200,默认 50) |
-| `GET /api/v1/incidents/:event_id` | 单条报告;不存在 `404 REPORT_NOT_FOUND` |
+| 接口 | 权限 | 行为 |
+| --- | --- | --- |
+| `POST /api/v1/incidents/timeout` | INGEST_TOKEN | 校验事件 → `Deduper.Seen`(内存去重)→ `Orchestrator.Submit`(存储幂等)。新事件 `202 {accepted:true}`;重复 `200 {duplicate:true}`;队列满 `503 QUEUE_FULL` |
+| `GET /api/v1/incidents?limit=` | `incident:read` | 报告列表(1..200,默认 50) |
+| `GET /api/v1/incidents/:event_id` | `incident:read` | 单条报告;不存在 `404 REPORT_NOT_FOUND` |
 | `GET /healthz` / `GET /readyz` | 存活 / PostgreSQL 就绪 |
 | `GET /metrics` | Prometheus 指标(无需鉴权);当前含 `halon_agent_redis_up`(共享模式 Redis 可达性,内存模式恒 1) |
 
@@ -49,7 +49,7 @@
 
 ## 配置(环境变量)
 
-完整表格见根 `README.md` 的「Agent 配置」。必填:`DATABASE_DSN`、`INGEST_TOKEN`(≥12 字符)、`OPENAI_API_KEY`、`OPENAI_MODEL`。`AGENT_OPERATION_LEVEL` 默认 `readonly`(最安全),生产开放变更操作需谨慎评估。
+完整表格见根 `README.md` 的「Agent 配置」。必填:`DATABASE_DSN`、`INGEST_TOKEN`(≥12 字符)、`OPENAI_API_KEY`、`OPENAI_MODEL`。`AGENT_OPERATION_LEVEL` 默认 `readonly`(最安全),生产开放变更操作需谨慎评估。`AUTH_MODE`/`AUTH_JWT_PUBLIC_KEYS` 等鉴权配置见 [auth.md](auth.md)。
 
 ## cmd/agent 装配顺序
 
@@ -60,6 +60,7 @@
 - `loop_test.go`:`modelFunc` 桩覆盖工具调用、错误回传、最大轮数、截断(模型视图与落库双上限);
 - `openai_test.go`:httptest 假服务器覆盖重试与错误;
 - `orchestrator_test.go`:完成/失败/重复/非法事件/队列满/启动恢复(重入队 + 超龄标记)/恢复读库失败七个场景;
+- `auth_test.go`:三种 `AUTH_MODE` 下的 ingest 与报告读取、JWT 与 INGEST_TOKEN 边界;
 - `server_test.go`:gin 测试路由覆盖鉴权、去重、校验、查询、探针。
 
 ## 修改本模块时必须同步检查
@@ -68,4 +69,5 @@
 - [agent-tools.md](agent-tools.md):若改了 `Tool`/`ToolCall` 结构或级别语义;
 - [gateway.md](gateway.md):若改了事件接收协议;
 - `deploy/kubernetes/agent.yaml`:若改了端口、环境变量或 RBAC 需求;
-- `AGENTS.md`:若改了架构速览或约定。
+- `AGENTS.md`:若改了架构速览或约定;
+- [auth.md](auth.md):若改了 API 权限或启动自检规则。

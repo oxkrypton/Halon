@@ -15,7 +15,7 @@
 | --- | --- |
 | `make test` | `go test -race ./...` + `go vet ./...`,**每次提交前必跑** |
 | `make lint` | `golangci-lint run ./...`(配置见 `.golangci.yml`),**每次提交前必跑** |
-| `make build` / `make build-demo` | 构建产品二进制 `bin/gateway`、`bin/agent` 与演示二进制 `bin/user-service-demo` |
+| `make build` / `make build-demo` | 构建产品二进制 `bin/gateway`、`bin/agent`、`bin/halonctl` 与演示二进制 `bin/user-service-demo` |
 | `make run-gateway` / `make run-agent` / `make run-demo` | 本地运行(环境变量见各模块文档) |
 | `make docker-build` / `make docker-build-demo` | 构建产品镜像与演示镜像 |
 | `make deploy` | `kubectl apply -f deploy/kubernetes/`(适用于任意 K8s 集群) |
@@ -48,6 +48,7 @@ docs/                      # 本文档中心
 5. **安全**:Token 用 `subtle.ConstantTimeCompare` 比较;不信任代理头(`SetTrustedProxies(nil)`);请求体读取一律 `http.MaxBytesReader` 限长;容器 `runAsNonRoot` + 只读根文件系统 + drop ALL capabilities。
 6. **优雅退出**:`signal.NotifyContext` 监听 SIGINT/SIGTERM → 停 HTTP(有超时)→ 排空队列 → 关闭数据库。
 7. **解耦**:产品组件之间只能通过契约通信(TimeoutEvent webhook、管理 HTTP API、PostgreSQL 表结构),禁止共享内部包之外的状态;网关不得出现具体业务服务名。
+8. **鉴权**:新增 HTTP 接口或工具必须复用 `internal/authz` 的 `Permission` 常量,网关侧挂 `Require`,Agent 工具侧写 `Tool.Permission`;角色映射只在代码中维护,签发工具为 `cmd/halonctl`,详见 [modules/auth.md](modules/auth.md)。
 
 ## 测试约定
 

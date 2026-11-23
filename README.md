@@ -148,24 +148,26 @@ curl -s http://localhost:8081/api/v1/incidents -H 'Authorization: Bearer halon-l
 
 ### 网关(`:8080` 业务 / `:9090` 管理)
 
-| 接口 | 说明 |
-| --- | --- |
-| `ANY <ROUTES 配置的前缀>` | 反向代理到对应上游,响应原样透传 |
-| `GET /healthz` | 进程存活检查,不依赖外部服务 |
-| `GET /readyz` | 检查 PostgreSQL 是否可用 |
-| `GET /admin/rules/blacklist` | 查询黑名单,需要管理鉴权 |
-| `PUT /admin/rules/blacklist/:ip` | 添加黑名单 IP,需要管理鉴权 |
-| `DELETE /admin/rules/blacklist/:ip` | 删除黑名单 IP,需要管理鉴权 |
-| `GET /admin/rules/rate-limit` | 查询限流参数,需要管理鉴权 |
-| `PUT /admin/rules/rate-limit` | 更新限流参数,需要管理鉴权 |
-| `GET /admin/breakers` | 查询各路由熔断器状态,需要管理鉴权 |
-| `GET /metrics` | Prometheus 指标(管理端口;`METRICS_REQUIRE_AUTH=true` 时需管理鉴权) |
+| 接口 | 权限 | 说明 |
+| --- | --- | --- |
+| `ANY <ROUTES 配置的前缀>` | — | 反向代理到对应上游,响应原样透传 |
+| `GET /healthz` | — | 进程存活检查,不依赖外部服务 |
+| `GET /readyz` | — | 检查 PostgreSQL 是否可用 |
+| `GET /admin/rules/blacklist` | `gateway:rules:read` | 查询黑名单 |
+| `PUT /admin/rules/blacklist/:ip` | `gateway:blacklist:write` | 添加黑名单 IP |
+| `DELETE /admin/rules/blacklist/:ip` | `gateway:blacklist:write` | 删除黑名单 IP |
+| `GET /admin/rules/rate-limit` | `gateway:rules:read` | 查询限流参数 |
+| `PUT /admin/rules/rate-limit` | `gateway:ratelimit:write` | 更新限流参数 |
+| `GET /admin/breakers` | `gateway:breaker:read` | 查询各路由熔断器状态 |
+| `GET /metrics` | — | Prometheus 指标(管理端口;`METRICS_REQUIRE_AUTH=true` 时需 `gateway:metrics:read` 的 Bearer 令牌,抓取不写审计日志) |
 
-管理接口鉴权头:
+管理接口鉴权头(Bearer JWT 或兼容模式下的静态 Token):
 
 ```text
-Authorization: Bearer <ADMIN_TOKEN>
+Authorization: Bearer <JWT | ADMIN_TOKEN>
 ```
+
+无令牌/验签失败 `401 UNAUTHORIZED`,权限不足 `403 FORBIDDEN`。角色、claim 与签发工具见 [docs/modules/auth.md](docs/modules/auth.md)。
 
 动态更新限流示例:
 
@@ -189,14 +191,16 @@ curl -X PUT http://localhost:9090/admin/rules/rate-limit \
 | 上游响应超时 | 504 | `UPSTREAM_TIMEOUT`(同时触发故障事件) |
 | 上游连接失败 | 502 | `UPSTREAM_ERROR` |
 
-### Agent 服务(`:8081`,均需 `Authorization: Bearer <INGEST_TOKEN>`)
+### Agent 服务(`:8081`)
 
-| 接口 | 说明 |
-| --- | --- |
-| `POST /api/v1/incidents/timeout` | 接收超时事件并排队排查;重复事件返回 `duplicate: true` |
-| `GET /api/v1/incidents` | 列出最近的故障报告,`limit` 参数最大 200 |
-| `GET /api/v1/incidents/:event_id` | 查询单个事件的排查报告与工具调用轨迹 |
-| `GET /healthz` / `GET /readyz` | 存活检查 / PostgreSQL 就绪检查 |
+| 接口 | 凭据 | 说明 |
+| --- | --- | --- |
+| `POST /api/v1/incidents/timeout` | `INGEST_TOKEN` | 接收超时事件并排队排查;重复事件返回 `duplicate: true` |
+| `GET /api/v1/incidents` | `incident:read` | 列出最近的故障报告,`limit` 参数最大 200 |
+| `GET /api/v1/incidents/:event_id` | `incident:read` | 查询单个事件的排查报告与工具调用轨迹 |
+| `GET /healthz` / `GET /readyz` | — | 存活检查 / PostgreSQL 就绪检查 |
+
+`legacy`/`hybrid` 下 `INGEST_TOKEN` 也可读报告(兼容),`jwt` 下读接口只接受 `aud=halon-agent` 的 JWT。
 
 ## 部署到 Kubernetes(任意集群)
 
@@ -289,7 +293,11 @@ kubectl rollout restart deployment/agent
 | `ADMIN_ADDR` | `:9090` | 管理 HTTP 监听地址 |
 | `ROUTES` | 空 | 路由表,`前缀=上游地址` 逗号分隔,如 `/api/v1/users/=http://user-service:8090,/api/v1/orders/=http://order-service:8092` |
 | `DATABASE_DSN` | 必填 | PostgreSQL 连接串 |
-| `ADMIN_TOKEN` | 必填,至少 12 字符 | 管理接口 Bearer Token |
+| `ADMIN_TOKEN` | `legacy`/`hybrid` 下必填,至少 12 字符 | 管理接口静态 Token,映射为 `full` 主体;`jwt` 下可为空 |
+| `AUTH_MODE` | `legacy` | `legacy` / `hybrid` / `jwt`,见 [auth.md](docs/modules/auth.md) |
+| `AUTH_JWT_PUBLIC_KEYS` | 空 | `kid=base64公钥,...`;`hybrid`/`jwt` 下必填 |
+| `AUTH_JWT_ISSUER` | `halon` | JWT 期望 issuer |
+| `AUTH_REVOKED_JTIS` | 空 | 逗号分隔的紧急撤销 jti |
 | `RATE_LIMIT_RPS` | `20` | 每个 IP 每秒补充的令牌数 |
 | `RATE_LIMIT_BURST` | `40` | 每个 IP 的突发容量 |
 | `LOG_QUEUE_SIZE` | `1024` | 有界日志队列容量 |
@@ -330,7 +338,8 @@ kubectl rollout restart deployment/agent
 | --- | --- | --- |
 | `HTTP_ADDR` | `:8081` | 事件接收与报告查询监听地址 |
 | `DATABASE_DSN` | 必填 | PostgreSQL 连接串,与网关共用数据库 |
-| `INGEST_TOKEN` | 必填,至少 12 字符 | 事件接收与报告查询的 Bearer Token |
+| `INGEST_TOKEN` | 必填,至少 12 字符 | webhook 事件接收凭据;兼容期内也可读报告,`jwt` 下仅用于 ingest |
+| `AUTH_MODE` / `AUTH_JWT_PUBLIC_KEYS` / `AUTH_JWT_ISSUER` / `AUTH_REVOKED_JTIS` | `legacy` / 空 / `halon` / 空 | 与网关同名的鉴权配置,见 [auth.md](docs/modules/auth.md) |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI 兼容 API 地址 |
 | `OPENAI_API_KEY` / `OPENAI_MODEL` | 必填 | 大模型凭据与模型名 |
 | `AGENT_OPERATION_LEVEL` | `readonly` | 工具开放级别:`readonly` / `operator` / `full` |
@@ -344,7 +353,7 @@ kubectl rollout restart deployment/agent
 | `AGENT_RUN_TIMEOUT` | `5m` | 单次排查的超时时间 |
 | `AGENT_DEDUP_TTL` | `10m` | 事件去重窗口 |
 | `AGENT_RECOVERY_MAX_AGE` | `30m` | 启动恢复重新入队的事件最大龄期,超龄的未完成报告标记 failed;仅内存模式生效 |
-| `GATEWAY_ADMIN_URL` / `GATEWAY_ADMIN_TOKEN` | 空 | 网关管理接口地址与 Token,供封禁工具使用 |
+| `GATEWAY_ADMIN_URL` / `GATEWAY_ADMIN_TOKEN` | 空 | 网关管理接口地址与凭据;权限不足时封禁工具不可用。`readonly` 可不配;非 `readonly` 在 `jwt` 模式下必须配 `typ=agent` 且角色与操作级别一致的 JWT(启动自检) |
 | `PROMETHEUS_URL` | 空 | Prometheus 查询地址,为空时 PromQL 工具不可用 |
 | `REDIS_URL` | 空 | 共享状态 Redis 地址;语义与网关一致,两端必须同时配置或同时留空 |
 | `REDIS_DIAL_TIMEOUT` | `1s` | Redis 拨号超时 |
@@ -357,6 +366,7 @@ kubectl rollout restart deployment/agent
 - 异步日志采用有界、尽力投递队列,数据库长期不可用或队列饱和时会丢弃日志,避免拖垮业务请求。
 - 网关与上游之间、Agent 与网关管理接口之间使用集群内明文 HTTP;跨集群或不可信网络应启用 TLS。
 - 弹性策略依赖 failsafe-go(v0.x,API 可能变动),全部封装在 `internal/gateway/resilience.go`;追踪依赖 OpenTelemetry Go SDK,默认关闭。
+- 鉴权默认 `AUTH_MODE=legacy`(行为不变);切到 `hybrid`/`jwt` 需两端同时配公钥,并先把调用方换成 JWT。`INGEST_TOKEN` 不进入角色体系;长期有效的 Agent JWT 靠 K8s Secret 保护,私钥离线保管。详见 [docs/modules/auth.md](docs/modules/auth.md)。
 - 观测栈(`deploy/kubernetes/observability/`)是可选参考件,单副本小资源配置,生产使用需自行扩容与加固。
 - PostgreSQL 清单面向本地开发,生产环境还需要高可用、备份、密钥管理和网络策略。
 
@@ -366,11 +376,13 @@ kubectl rollout restart deployment/agent
 .
 ├── cmd/
 │   ├── agent/                    # Agent 故障排查服务入口
-│   └── gateway/                  # 通用网关入口
+│   ├── gateway/                  # 通用网关入口
+│   └── halonctl/                 # 离线密钥生成与 JWT 签发/查看 CLI
 ├── internal/
 │   ├── agent/                    # 排查循环、编排器、事件 API 和配置
 │   ├── agent/tools/              # 日志/PromQL/K8s/封禁工具及测试
 │   ├── gateway/                  # 反向代理、弹性策略(resilience.go)、OTel(tracing.go)、中间件、规则和测试
+│   ├── authz/                    # 角色×权限、Ed25519 JWT 验证、gin 中间件
 │   ├── incident/                 # 超时事件、去重、报告持久化及测试
 │   └── trafficlog/               # PostgreSQL、迁移、批写器和测试
 ├── examples/

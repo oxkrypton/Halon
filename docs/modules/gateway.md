@@ -21,7 +21,7 @@
 | `proxy.go` | `RouteTable`:`ParseRoutes` 解析 `前缀=上游` 配置(最长前缀优先、启动时校验);`ProxyHandler` 反向代理(保留完整路径、注入 `X-Forwarded-For`、按请求限时、请求体上限与重试体缓冲);`newUpstreamTransport` 分阶段超时(拨号/TLS/响应头)与连接池;`upstreamErrorHandler` 错误分类(超时 504、熔断 503、并发满 429、体过大 413、其余 502);`routeLabel` 统一指标/事件的路由标签 |
 | `resilience.go` | 弹性策略组合(`failsafe-go`):每路由 bulkhead(并发上限)→ circuit breaker(熔断)→ retry(仅传输层错误、仅幂等);`observingTransport` 记录上游调用指标与单次请求结果;`ResilienceSet.BreakerStatuses` 供管理接口查询 |
 | `tracing.go` | OpenTelemetry 接入:`OTEL_ENABLED=true` 时初始化 OTLP gRPC exporter 与 TracerProvider;`WrapHandler` 给业务端口打 server span,`WrapTransport` 给上游调用打 client span 并注入 `traceparent`;禁用时全部透传零开销 |
-| `server.go` | `NewHTTPHandler`:探针路由 + 把代理链(黑名单 → 限流 → 路由表)挂载到 `NoRoute`(任意前缀无需注册路由);`NewAdminHandler`(`/admin/rules/*` + `/admin/breakers` + `/metrics`,`METRICS_REQUIRE_AUTH` 可给 `/metrics` 加 Bearer 鉴权);`readinessHandler`(只查数据库) |
+| `server.go` | `NewHTTPHandler`:探针路由 + 把代理链(黑名单 → 限流 → 路由表)挂载到 `NoRoute`(任意前缀无需注册路由);`NewAdminHandler`(`/admin/rules/*` + `/admin/breakers` + `/metrics`,`authz.Middleware` 认证 + 按路由 `authz.Require` 授权,写/读请求统一审计日志与指标);`readinessHandler`(只查数据库) |
 | `errors.go` | 统一错误响应结构 `abortWithError` 与 `upstream_timeout` 标记键 |
 | `accesslog.go` | `AccessLog` 中间件:采集请求/响应体(各自最多 `BODY_CAPTURE_BYTES`),投递日志队列;检测超时标记并投递超时事件队列;日志字段含 `route`、`trace_id`(启用 OTel 时)、`upstream_result`、`retries`;维护在途请求 gauge 与队列丢弃计数 |
 | `notify.go` | `TimeoutNotifier`:消费超时事件队列,POST JSON 到 `AGENT_WEBHOOK_URL`,带 Bearer Token,最多 3 次指数退避重试;最终失败计入 `halon_gateway_webhook_notify_failures_total` |
@@ -30,7 +30,7 @@
 | `ratelimit.go` | `RateLimitBackend` 接口(Allow/Update/Settings)与 `ErrRateLimitUnavailable`;`RateLimiter`:内存实现(内存模式),每 IP 独立令牌桶(`golang.org/x/time/rate`);`RateLimitMiddleware` 拦截并计数拒绝 |
 | `ratelimit_redis.go` | `RedisRateLimiter`:共享实现——每 IP 一个令牌桶存 Redis,Lua 脚本原子 refill/扣减(时钟取 Redis `TIME`,副本间无漂移),语义与 `x/time/rate` 一致;参数存 `halon:ratelimit:config`,进程内缓存 10s;读失败 fail-open 到内存桶,写失败返回 `ErrRateLimitUnavailable`(管理接口 503) |
 | `metrics.go` | Prometheus 指标与 `/metrics` Handler(独立 Registry,全部方法 nil-safe) |
-| `request.go` | `RequestID` 中间件(校验/生成)、`Recovery`、`adminAuthentication`(常量时间比较) |
+| `request.go` | `RequestID` 中间件(校验/生成)、`Recovery`;Bearer 鉴权已迁到 `internal/authz` |
 | `config.go` | `LoadConfig()`:全部环境变量与启动校验(含 `ROUTES` 语法校验、响应头超时 ≤ 总超时的交叉校验) |
 
 ## 关键流程
@@ -88,7 +88,7 @@ ProxyHandler 带 UPSTREAM_TIMEOUT 的 context 调上游
 
 ## 配置(环境变量)
 
-完整表格见根 `README.md` 的「网关配置」。必填:`DATABASE_DSN`、`ADMIN_TOKEN`(≥12 字符);`ROUTES` 为空是合法的(网关只提供探针,业务请求一律 404);设置 `AGENT_WEBHOOK_URL` 时 `AGENT_WEBHOOK_TOKEN` 必填(≥12 字符)。
+完整表格见根 `README.md` 的「网关配置」。必填:`DATABASE_DSN`;`ADMIN_TOKEN`(≥12 字符)在 `legacy`/`hybrid` 下必填,`jwt` 模式下可为空。`ROUTES` 为空是合法的(网关只提供探针,业务请求一律 404);设置 `AGENT_WEBHOOK_URL` 时 `AGENT_WEBHOOK_TOKEN` 必填(≥12 字符)。鉴权模式与公钥见 [auth.md](auth.md)。
 
 弹性与可观测性配置要点:
 
@@ -101,7 +101,7 @@ ProxyHandler 带 UPSTREAM_TIMEOUT 的 context 调上游
 ## 错误语义
 
 - 上游响应(包括 4xx/5xx)**原样透传**,网关不包装;
-- 网关自身错误统一 `{error:{code,message,request_id}}`:404 `ROUTE_NOT_FOUND`、403 `IP_BLOCKED`、429 `RATE_LIMITED` / `CONCURRENCY_LIMIT`、413 `REQUEST_TOO_LARGE`、503 `UPSTREAM_UNAVAILABLE`(熔断开启,带 `Retry-After`)、503 `BLACKLIST_UNAVAILABLE` / `RATELIMIT_UNAVAILABLE`(共享模式写时 Redis 不可达)、504 `UPSTREAM_TIMEOUT`(同时触发超时事件)、502 `UPSTREAM_ERROR`。
+- 网关自身错误统一 `{error:{code,message,request_id}}`:401 `UNAUTHORIZED` / 403 `FORBIDDEN`(管理接口鉴权,见 [auth.md](auth.md))、404 `ROUTE_NOT_FOUND`、403 `IP_BLOCKED`、429 `RATE_LIMITED` / `CONCURRENCY_LIMIT`、413 `REQUEST_TOO_LARGE`、503 `UPSTREAM_UNAVAILABLE`(熔断开启,带 `Retry-After`)、503 `BLACKLIST_UNAVAILABLE` / `RATELIMIT_UNAVAILABLE`(共享模式写时 Redis 不可达)、504 `UPSTREAM_TIMEOUT`(同时触发超时事件)、502 `UPSTREAM_ERROR`。
 
 ## 指标清单(`/metrics`,管理端口)
 
@@ -114,6 +114,7 @@ ProxyHandler 带 UPSTREAM_TIMEOUT 的 context 调上游
 | `halon_gateway_response_size_bytes` | Histogram | route | 响应体大小 |
 | `halon_gateway_in_flight_requests` | Gauge | — | 网关在途请求 |
 | `halon_gateway_rejected_requests_total` | Counter | reason(blacklist/rate_limit/concurrency_limit/body_too_large) | 前置拒绝 |
+| `halon_gateway_admin_requests_total` | Counter | role, permission, result(allow/deny) | 管理接口鉴权决策(`/metrics` 抓取不计,避免抓取自身放大计数) |
 | `halon_gateway_upstream_requests_total` | Counter | route, result(success/timeout/error) | 上游调用尝试 |
 | `halon_gateway_upstream_request_duration_seconds` | Histogram | route | 上游调用耗时(与端到端差值 ≈ 网关开销) |
 | `halon_gateway_upstream_in_flight` | Gauge | route | 上游在途(bulkhead 占用) |
@@ -126,7 +127,7 @@ ProxyHandler 带 UPSTREAM_TIMEOUT 的 context 调上游
 
 ## 测试
 
-`server_test.go`(代理转发/透传/超时/不可达/404、路由表解析、探针、管理接口、限流)、`observability_test.go`(超时事件与指标、webhook 投递)、`resilience_test.go`(重试与体重放、熔断迁移与 503 快速失败、bulkhead 打满 429、请求体上限 413、响应头超时归类 504、`/metrics` 鉴权、`/admin/breakers`;上游传输用桩 RoundTripper 保证确定性)、`tracing_test.go`(OTel 禁用透传、server/client span 同 trace、`traceparent` 透传,用 in-memory span recorder)、`rules_redis_test.go`(共享黑名单增删、外部写入刷新、双副本 pub/sub 传播、TTL 兜底、降级读缓存/写 503;`alicebob/miniredis` 进程内仿真)、`ratelimit_redis_test.go`(Lua 令牌桶 refill/突发边界、双副本合计限额、参数跨副本传播、降级 fail-open/写 503)、`config_test.go`(配置校验)。真实上游一律用 `httptest.NewServer`。
+`auth_test.go`(管理接口角色×端点矩阵、legacy/hybrid/jwt 模式、审计指标)、`server_test.go`(代理转发/透传/超时/不可达/404、路由表解析、探针、管理接口、限流)、`observability_test.go`(超时事件与指标、webhook 投递)、`resilience_test.go`(重试与体重放、熔断迁移与 503 快速失败、bulkhead 打满 429、请求体上限 413、响应头超时归类 504、`/metrics` 鉴权、`/admin/breakers`;上游传输用桩 RoundTripper 保证确定性)、`tracing_test.go`(OTel 禁用透传、server/client span 同 trace、`traceparent` 透传,用 in-memory span recorder)、`rules_redis_test.go`(共享黑名单增删、外部写入刷新、双副本 pub/sub 传播、TTL 兜底、降级读缓存/写 503;`alicebob/miniredis` 进程内仿真)、`ratelimit_redis_test.go`(Lua 令牌桶 refill/突发边界、双副本合计限额、参数跨副本传播、降级 fail-open/写 503)、`config_test.go`(配置校验)。真实上游一律用 `httptest.NewServer`。
 
 ## 修改本模块时必须同步检查
 
@@ -134,7 +135,8 @@ ProxyHandler 带 UPSTREAM_TIMEOUT 的 context 调上游
 - `docs/deployment.md`:若改了端口、环境变量或 Secret 键;
 - `deploy/kubernetes/gateway.yaml`:若改了端口或新增环境变量;
 - [modules/incident.md](incident.md):若改了 `TimeoutEvent` 的生成时机或字段;
-- [modules/agent.md](agent.md):若改了 webhook 协议(路径/鉴权/事件体)。
+- [modules/agent.md](agent.md):若改了 webhook 协议(路径/鉴权/事件体);
+- [modules/auth.md](auth.md):若改了管理接口权限项、鉴权模式或审计字段。
 
 ## 已知边界
 
@@ -143,4 +145,4 @@ ProxyHandler 带 UPSTREAM_TIMEOUT 的 context 调上游
 - 与上游之间是明文 HTTP,跨集群或不可信网络应启用 TLS;
 - 熔断/限流等弹性策略基于 `failsafe-go`(v0.x,API 可能随版本变动),全部封装在 `resilience.go`,升级依赖时只改这一处;
 - 追踪默认关闭;开启后 span 经 OTLP 发往 Collector,Collector 不可达时 span 由 SDK 有界队列丢弃,不影响业务请求;
-- `/metrics` 默认无鉴权(便于 Prometheus 抓取),跨不信任网络暴露时设 `METRICS_REQUIRE_AUTH=true`。
+- `/metrics` 默认无鉴权(便于 Prometheus 抓取),跨不信任网络暴露时设 `METRICS_REQUIRE_AUTH=true`:此时只要求 `gateway:metrics:read`(`readonly` 即可),不挂审计中间件,每次抓取不写审计日志也不计 `halon_gateway_admin_requests_total`。
