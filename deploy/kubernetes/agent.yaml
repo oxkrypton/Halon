@@ -85,6 +85,15 @@ spec:
               value: release
             - name: AGENT_OPERATION_LEVEL
               value: readonly
+            # Same AUTH_MODE as the gateway. In jwt mode INGEST_TOKEN stays
+            # valid only for POST /api/v1/incidents/timeout.
+            # - name: AUTH_MODE
+            #   value: legacy
+            # - name: AUTH_JWT_PUBLIC_KEYS
+            #   valueFrom:
+            #     configMapKeyRef:
+            #       name: halon-auth
+            #       key: jwt-public-keys
             - name: K8S_NAMESPACES
               value: default
             - name: GATEWAY_ADMIN_URL
@@ -108,11 +117,14 @@ spec:
                 secretKeyRef:
                   name: halon-secrets
                   key: openai-api-key
-            - name: GATEWAY_ADMIN_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: halon-secrets
-                  key: admin-token
+            # A readonly agent has no gateway write tool, so it needs no
+            # gateway token at all. For operator/full, issue an agent JWT
+            # whose role matches AGENT_OPERATION_LEVEL and mount it here:
+            # - name: GATEWAY_ADMIN_TOKEN
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: halon-secrets
+            #       key: agent-gateway-token
             # Shared-state mode is off by default. After deploying Redis
             # (make deploy-redis) uncomment on BOTH gateway and agent,
             # then replicas may be raised above 1:
