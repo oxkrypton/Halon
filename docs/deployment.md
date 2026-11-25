@@ -101,18 +101,21 @@ done
 | `ingest-token` | webhook 事件接收凭据 | agent、gateway(webhook 推送) |
 | `openai-api-key` | 大模型凭据 | agent |
 | `agent-gateway-token` | 可选:`typ=agent` 的 JWT,角色须等于 Agent 操作级别 | agent(operator/full 需访问网关时) |
+| `jwt-private-key` | 可选:base64 Ed25519 私钥(`AUTH_LOGIN_ENABLED=true` 时必填) | gateway(本地登录签发会话 JWT) |
+| `bootstrap-admin-user` / `bootstrap-admin-password` | 可选:首次引导创建的 `full` 管理员账号与初始密码 | gateway(`AUTH_LOGIN_ENABLED=true` 首次启动时) |
 
 创建命令见根 `README.md` 的「部署到 Kubernetes」。**新增密钥键时同步更新本表与 README。**
 
 ### 鉴权配置
 
-默认 `AUTH_MODE=legacy`,清单无需改动。`hybrid`/`jwt` 模式需要:
+默认 `AUTH_MODE=legacy`、`AUTH_LOGIN_ENABLED=false`,清单无需改动。`hybrid`/`jwt` 模式需要:
 
 1. 用 `make build` 产出的 `bin/halonctl keygen` 离线生成密钥;`keygen` 输出的 `public_keys_env` 直接放进 ConfigMap 的 `jwt-public-keys` 键(公钥不是机密)。
 2. 两端同时设置 `AUTH_MODE` 与 `AUTH_JWT_PUBLIC_KEYS`(从 ConfigMap `halon-auth` 挂载,清单中已有注释示例),`jwt` 模式下 Agent 读接口不再接受 `INGEST_TOKEN`。
 3. 人类管理员用 `halonctl token issue --type human --role <role> --ttl 8h` 签发;Agent 访问网关用 `--type agent --role <与 AGENT_OPERATION_LEVEL 一致>` 签发,写入 `agent-gateway-token`。
+4. 若需开启本地账号登录与用户管理(`AUTH_LOGIN_ENABLED=true`),取消 `deploy/kubernetes/gateway.yaml` 中对应环境变量注释并写入 `jwt-private-key`、`bootstrap-admin-user`/`bootstrap-admin-password`(Argon2id 并发上限 4 × 64 MiB,清单已将网关内存上限设为 `384Mi`)。
 
-迁移顺序与撤销手段见 [modules/auth.md](modules/auth.md)。私钥不要放进集群。
+迁移顺序与撤销手段见 [modules/auth.md](modules/auth.md)。未开启本地登录时私钥不要放进集群。
 
 ## 本地运行(无 K8s)
 

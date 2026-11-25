@@ -27,7 +27,7 @@
 | 超时事件与故障报告 | [modules/incident.md](modules/incident.md) | 事件模型、去重、报告表与存储层 |
 | Agent 核心 | [modules/agent.md](modules/agent.md) | LLM 循环、工具注册、编排器、事件 API、服务配置 |
 | Agent 工具层 | [modules/agent-tools.md](modules/agent-tools.md) | 日志/PromQL/K8s/封禁工具的清单、权限与安全约束 |
-| RBAC 与 JWT 鉴权 | [modules/auth.md](modules/auth.md) | 角色×权限矩阵、Ed25519 JWT、AUTH_MODE、halonctl 与升级路径 |
+| RBAC 与 JWT 鉴权 | [modules/auth.md](modules/auth.md) | 角色×权限矩阵、Ed25519 JWT、`AUTH_MODE`、可选本地登录/用户管理(`internal/identity`)与 `halonctl` |
 | 演示后端(非产品) | [../examples/user-service/README.md](../examples/user-service/README.md)、[../examples/order-service/README.md](../examples/order-service/README.md) | 演练用 HTTP 服务与故障注入 |
 
 ### 历史设计稿

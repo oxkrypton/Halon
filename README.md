@@ -159,6 +159,10 @@ curl -s http://localhost:8081/api/v1/incidents -H 'Authorization: Bearer halon-l
 | `GET /admin/rules/rate-limit` | `gateway:rules:read` | 查询限流参数 |
 | `PUT /admin/rules/rate-limit` | `gateway:ratelimit:write` | 更新限流参数 |
 | `GET /admin/breakers` | `gateway:breaker:read` | 查询各路由熔断器状态 |
+| `POST /auth/login` / `refresh` / `logout` | — | 本地登录、Refresh Token 轮转与登出(仅 `AUTH_LOGIN_ENABLED=true`,否则 `404 LOGIN_DISABLED`) |
+| `GET /auth/me` / `POST /auth/password` | Bearer JWT | 查看当前主体与自助改密(允许 `pcr=true` 令牌;仅 `AUTH_LOGIN_ENABLED=true`) |
+| `GET /admin/users` / `GET /admin/users/:id` | `auth:user:read` | 查询本地用户列表或单个用户(仅 `AUTH_LOGIN_ENABLED=true`) |
+| `POST /admin/users` / `PATCH /admin/users/:id` / `POST /admin/users/:id/password` | `auth:user:manage` | 创建用户、修改角色/启禁用/显示名、重置临时密码(仅 `AUTH_LOGIN_ENABLED=true`) |
 | `GET /metrics` | — | Prometheus 指标(管理端口;`METRICS_REQUIRE_AUTH=true` 时需 `gateway:metrics:read` 的 Bearer 令牌,抓取不写审计日志) |
 
 管理接口鉴权头(Bearer JWT 或兼容模式下的静态 Token):
@@ -299,6 +303,14 @@ kubectl rollout restart deployment/agent
 | `AUTH_JWT_PUBLIC_KEYS` | 空 | `kid=base64公钥,...`;`hybrid`/`jwt` 下必填 |
 | `AUTH_JWT_ISSUER` | `halon` | JWT 期望 issuer |
 | `AUTH_REVOKED_JTIS` | 空 | 逗号分隔的紧急撤销 jti |
+| `AUTH_LOGIN_ENABLED` | `false` | 是否启用 `/auth/*` 与 `/admin/users/*` 本地登录与用户管理(需 `AUTH_MODE=hybrid/jwt`) |
+| `AUTH_JWT_PRIVATE_KEY` / `AUTH_JWT_KID` | 空 / 自动派生 | 本地登录签发用的 base64 Ed25519 私钥与可选 `kid`(`AUTH_LOGIN_ENABLED=true` 时私钥必填) |
+| `AUTH_ACCESS_TOKEN_TTL` / `AUTH_REFRESH_TOKEN_TTL` / `AUTH_REFRESH_MAX_LIFETIME` | `15m` / `168h` / `720h` | 本地会话 Access Token 有效期(`1m..1h`)、Refresh Token TTL 与 family 最长寿命 |
+| `AUTH_PASSWORD_MIN_LENGTH` | `12` | 密码策略最小长度(`8..128`) |
+| `AUTH_LOGIN_RATE_LIMIT_RPS` / `AUTH_LOGIN_RATE_LIMIT_BURST` | `0.2` / `5` | `/auth/{login,refresh,logout}` 单 IP 限流参数 |
+| `AUTH_LOGIN_MAX_FAILURES` / `AUTH_LOGIN_LOCK_DURATION` | `10` / `5m` | 连续登录失败锁定阈值与锁定时长 |
+| `AUTH_EVENT_RETENTION` | `2160h` | `auth_events` 审计记录保留时长 |
+| `AUTH_BOOTSTRAP_ADMIN_USER` / `AUTH_BOOTSTRAP_ADMIN_PASSWORD` | 空 | 首次启动(`auth_users` 为空)原子引导的 `full` 管理员账号与初始密码(需成对设置) |
 | `RATE_LIMIT_RPS` | `20` | 每个 IP 每秒补充的令牌数 |
 | `RATE_LIMIT_BURST` | `40` | 每个 IP 的突发容量 |
 | `LOG_QUEUE_SIZE` | `1024` | 有界日志队列容量 |
@@ -370,7 +382,7 @@ kubectl rollout restart deployment/agent
 - 异步日志采用有界、尽力投递队列,数据库长期不可用或队列饱和时会丢弃日志,避免拖垮业务请求。
 - 网关与上游之间、Agent 与网关管理接口之间使用集群内明文 HTTP;跨集群或不可信网络应启用 TLS。
 - 弹性策略依赖 failsafe-go(v0.x,API 可能变动),全部封装在 `internal/gateway/resilience.go`;追踪依赖 OpenTelemetry Go SDK,默认关闭。
-- 鉴权默认 `AUTH_MODE=legacy`(行为不变);切到 `hybrid`/`jwt` 需两端同时配公钥,并先把调用方换成 JWT。`INGEST_TOKEN` 不进入角色体系;长期有效的 Agent JWT 靠 K8s Secret 保护,私钥离线保管。详见 [docs/modules/auth.md](docs/modules/auth.md)。
+- 鉴权默认 `AUTH_MODE=legacy` 且 `AUTH_LOGIN_ENABLED=false`(行为不变);切到 `hybrid`/`jwt` 需两端同时配公钥,并先把调用方换成 JWT。`INGEST_TOKEN` 不进入角色体系;长期有效的 Agent JWT 靠 K8s Secret 保护。开启 `AUTH_LOGIN_ENABLED=true` 时使用独立迁移表 `auth_schema_migrations`,详见 [docs/modules/auth.md](docs/modules/auth.md)。
 - 观测栈(`deploy/kubernetes/observability/`)是可选参考件,单副本小资源配置,生产使用需自行扩容与加固。
 - PostgreSQL 清单面向本地开发,生产环境还需要高可用、备份、密钥管理和网络策略。
 
@@ -387,6 +399,7 @@ kubectl rollout restart deployment/agent
 │   ├── agent/tools/              # 日志/PromQL/K8s/封禁工具及测试
 │   ├── gateway/                  # 反向代理、弹性策略(resilience.go)、OTel(tracing.go)、中间件、规则和测试
 │   ├── authz/                    # 角色×权限、Ed25519 JWT 验证、gin 中间件
+│   ├── identity/                 # 可选本地用户、Argon2id 密码策略、Refresh Token 轮转与清理
 │   ├── incident/                 # 超时事件、去重、报告持久化及测试
 │   └── trafficlog/               # PostgreSQL、迁移、批写器和测试
 ├── examples/
