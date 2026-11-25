@@ -71,6 +71,26 @@ spec:
             #       key: jwt-public-keys
             # - name: AUTH_REVOKED_JTIS
             #   value: ""
+            # Optional local username/password login (requires AUTH_MODE=hybrid
+            # or jwt). When enabled, Argon2id caps concurrency at 4 x 64 MiB;
+            # keep memory limit >= 384Mi.
+            # - name: AUTH_LOGIN_ENABLED
+            #   value: "true"
+            # - name: AUTH_JWT_PRIVATE_KEY
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: halon-secrets
+            #       key: jwt-private-key
+            # - name: AUTH_BOOTSTRAP_ADMIN_USER
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: halon-secrets
+            #       key: bootstrap-admin-user
+            # - name: AUTH_BOOTSTRAP_ADMIN_PASSWORD
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: halon-secrets
+            #       key: bootstrap-admin-password
             - name: AGENT_WEBHOOK_URL
               value: http://agent:8081/api/v1/incidents/timeout
             - name: AGENT_WEBHOOK_TOKEN
@@ -116,7 +136,9 @@ spec:
               memory: 64Mi
             limits:
               cpu: 300m
-              memory: 192Mi
+              # Argon2id limits concurrency to 4 x 64 MiB (256 MiB peak) when
+              # AUTH_LOGIN_ENABLED=true; 384Mi prevents OOMKills under concurrent logins.
+              memory: 384Mi
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
