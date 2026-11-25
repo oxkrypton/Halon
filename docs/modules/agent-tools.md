@@ -1,10 +1,10 @@
 # 模块:Agent 工具层(agent/tools)
 
-代码:`internal/agent/tools/`。被 `cmd/agent` 装配进 `agent.Registry`,按操作级别过滤后暴露给 LLM。
+代码:`internal/agent/tools/`。被 `cmd/agent` 装配进 `agent.Registry`,按 `AGENT_OPERATION_LEVEL` 对应的角色×权限过滤后暴露给 LLM。
 
 ## 安全模型
 
-- 工具分三级:`readonly`(默认)/ `operator` / `full`,由 `AGENT_OPERATION_LEVEL` 总开关控制,低于级别的工具对模型不可见也不可执行;
+- 工具通过 `Tool.Permission`(`authz.Permission`)声明权限,与网关管理接口共用同一套权限字符串:`tool:observe` / `tool:k8s:restart_pod` / `tool:k8s:scale` / `tool:k8s:update_image` / `gateway:blacklist:write`。角色映射见 [auth.md](auth.md),由 `AGENT_OPERATION_LEVEL`(默认 `readonly`)总开关控制:注册时过滤、执行时再校验一次;低于角色的工具对模型不可见也不可执行;
 - 所有工具参数经 `decodeArguments` 严格解码(`DisallowUnknownFields`,且只允许一个 JSON 对象);
 - 所有 SQL 参数化;K8s 操作受命名空间白名单(`K8S_NAMESPACES`,`*` 表示全部)约束;
 - 变更类操作(重启/扩容/改镜像/封禁)共用 `KubernetesToolset.allowAction` 冷却窗口(`K8S_ACTION_COOLDOWN`,默认 2 分钟),同一对象冷却期内拒绝重复操作。冷却由 `CooldownStore` 裁决:内存模式为进程内 map(单副本);共享模式(`REDIS_URL` 非空)为 `RedisCooldownStore`,`SET halon:cooldown:<key> NX PX` 原子抢占,N 个副本同一窗口内只有一个能执行,未抢到的拿到 `PTTL` 剩余时间;Redis 不可达时**拒绝变更**(`ErrCooldownUnavailable`,安全功能不侥幸放行),只读工具不受影响;
@@ -12,7 +12,7 @@
 
 ## 工具清单
 
-### 只读(readonly)
+### 只读(readonly,`tool:observe`)
 
 | 工具 | 说明 | 关键参数约束 |
 | --- | --- | --- |
@@ -25,19 +25,21 @@
 | `k8s_list_events` | 列 K8s 事件,可按对象名/类型过滤 | limit 1..100 |
 | `k8s_get_deployment` | Deployment 副本、状态、镜像、更新策略 | namespace + name |
 
-### 变更(operator)
+### operator 级变更
 
-| 工具 | 说明 | 保护 |
-| --- | --- | --- |
-| `k8s_restart_pod` | 删除一个故障 Pod 让控制器重建 | 必须提供 reason;冷却;先 Get 确认存在 |
-| `k8s_scale_deployment` | 调整 Deployment 副本数 | 上限 `K8S_MAX_REPLICAS`;冷却;写入 `halon.dev/last-agent-action` 注解审计 |
-| `gateway_block_ip` | 调网关管理接口把 IP 加入黑名单 | IP 必须 `net.ParseIP` 通过;reason 必填;冷却;网关返回非 2xx 视为失败 |
+| 工具 | 权限 | 说明 | 保护 |
+| --- | --- | --- | --- |
+| `k8s_restart_pod` | `tool:k8s:restart_pod` | 删除一个故障 Pod 让控制器重建 | 必须提供 reason;冷却;先 Get 确认存在 |
+| `k8s_scale_deployment` | `tool:k8s:scale` | 调整 Deployment 副本数 | 上限 `K8S_MAX_REPLICAS`;冷却;写入 `halon.dev/last-agent-action` 注解审计 |
+| `gateway_block_ip` | `gateway:blacklist:write` | 调网关管理接口把 IP 加入黑名单 | IP 必须 `net.ParseIP` 通过;reason 必填;冷却;网关返回非 2xx 视为失败 |
 
-### 变更(full)
+`gateway_block_ip` 必须携带 `typ=agent` 的 JWT(网关按令牌里的角色放行);仅靠 Agent 进程内的级别过滤已不再足够。
 
-| 工具 | 说明 | 保护 |
-| --- | --- | --- |
-| `k8s_update_deployment_image` | 更新 Deployment 中已存在容器的镜像 | 镜像名长度/非法字符校验;容器名必须存在;冷却;审计注解 |
+### full 级变更
+
+| 工具 | 权限 | 说明 | 保护 |
+| --- | --- | --- | --- |
+| `k8s_update_deployment_image` | `tool:k8s:update_image` | 更新 Deployment 中已存在容器的镜像 | 镜像名长度/非法字符校验;容器名必须存在;冷却;审计注解 |
 
 ## 文件结构
 
@@ -51,7 +53,7 @@
 
 ## 新增一个工具的流程
 
-1. 在合适的文件里定义 `agent.Tool`:唯一 Name、清晰的 Description(模型靠它决策)、JSON Schema 参数、Handler;
+1. 在合适的文件里定义 `agent.Tool`:唯一 Name、清晰的 Description(模型靠它决策)、JSON Schema 参数、`Permission`(复用 `internal/authz` 常量,不要新建权限字符串)、Handler;
 2. Handler 内严格校验参数并遵守只读 15s 超时;变更类必须要求 `reason` 并接入冷却;
 3. 在 `cmd/agent/main.go` 的装配处把工具加入列表;
 4. 补单测(参数校验、级别过滤、冷却,参考 `kubernetes_test.go` / `observability_test.go`);
@@ -62,4 +64,5 @@
 - 本文档工具清单与根 `README.md` 的 Agent 功能列表;
 - [trafficlog.md](trafficlog.md):SQL 工具依赖其表结构;
 - `deploy/kubernetes/agent.yaml`:新增 K8s 操作可能需要扩展 RBAC;
-- `AGENTS.md` 的已知边界。
+- `AGENTS.md` 的已知边界;
+- [auth.md](auth.md):新增权限项或改变角色映射时。

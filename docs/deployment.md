@@ -97,11 +97,22 @@ done
 | --- | --- | --- |
 | `postgres-user` / `postgres-password` | 数据库账号 | postgres |
 | `database-dsn` | 连接串 | gateway、agent |
-| `admin-token` | 网关管理接口 Token | gateway、agent(封禁工具) |
-| `ingest-token` | 事件接收/报告查询 Token | agent、gateway(webhook 推送) |
+| `admin-token` | 网关管理接口静态 Token(`full`) | gateway;`legacy`/`hybrid` 下 agent 可选(不推荐) |
+| `ingest-token` | webhook 事件接收凭据 | agent、gateway(webhook 推送) |
 | `openai-api-key` | 大模型凭据 | agent |
+| `agent-gateway-token` | 可选:`typ=agent` 的 JWT,角色须等于 Agent 操作级别 | agent(operator/full 需访问网关时) |
 
 创建命令见根 `README.md` 的「部署到 Kubernetes」。**新增密钥键时同步更新本表与 README。**
+
+### 鉴权配置
+
+默认 `AUTH_MODE=legacy`,清单无需改动。`hybrid`/`jwt` 模式需要:
+
+1. 用 `make build` 产出的 `bin/halonctl keygen` 离线生成密钥;`keygen` 输出的 `public_keys_env` 直接放进 ConfigMap 的 `jwt-public-keys` 键(公钥不是机密)。
+2. 两端同时设置 `AUTH_MODE` 与 `AUTH_JWT_PUBLIC_KEYS`(从 ConfigMap `halon-auth` 挂载,清单中已有注释示例),`jwt` 模式下 Agent 读接口不再接受 `INGEST_TOKEN`。
+3. 人类管理员用 `halonctl token issue --type human --role <role> --ttl 8h` 签发;Agent 访问网关用 `--type agent --role <与 AGENT_OPERATION_LEVEL 一致>` 签发,写入 `agent-gateway-token`。
+
+迁移顺序与撤销手段见 [modules/auth.md](modules/auth.md)。私钥不要放进集群。
 
 ## 本地运行(无 K8s)
 
@@ -130,4 +141,4 @@ kubectl exec postgres-0 -- psql -U halon -d halon \
 
 ## 配置总表
 
-网关与 Agent 的全部环境变量见根 `README.md` 的「网关配置」「Agent 配置」两节;改配置定义(`internal/*/config.go`)时必须同步这两节。
+网关与 Agent 的全部环境变量见根 `README.md` 的「网关配置」「Agent 配置」两节;改配置定义(`internal/*/config.go`)时必须同步这两节。鉴权公共配置集中在 `internal/authz/config.go`,说明见 [modules/auth.md](modules/auth.md)。

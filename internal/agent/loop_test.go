@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/oxkrypton/Halon/internal/authz"
 	"github.com/oxkrypton/Halon/internal/incident"
 )
 
@@ -40,7 +41,7 @@ func TestLoopExecutesToolsAndReturnsFinalReport(t *testing.T) {
 		return NewTextMessage("assistant", "## 事件摘要\n已确认上游超时"), Usage{PromptTokens: 20, CompletionTokens: 5, TotalTokens: 25}, nil
 	})
 	tool := Tool{
-		Name: "query_logs", Description: "Query logs", Level: LevelReadOnly,
+		Name: "query_logs", Description: "Query logs", Permission: authz.PermToolObserve,
 		Parameters: map[string]any{"type": "object"},
 		Handler: func(_ context.Context, arguments json.RawMessage) (any, error) {
 			var input map[string]string
@@ -71,7 +72,7 @@ func TestRegistryEnforcesOperationLevel(t *testing.T) {
 	readTool := Tool{Name: "read", Description: "Read", Handler: func(context.Context, json.RawMessage) (any, error) {
 		return "ok", nil
 	}}
-	restartTool := Tool{Name: "restart", Description: "Restart", Level: LevelOperator, Handler: func(context.Context, json.RawMessage) (any, error) {
+	restartTool := Tool{Name: "restart", Description: "Restart", Permission: authz.PermToolK8sRestartPod, Handler: func(context.Context, json.RawMessage) (any, error) {
 		return "restarted", nil
 	}}
 	registry, err := NewRegistry(LevelReadOnly, readTool, restartTool)

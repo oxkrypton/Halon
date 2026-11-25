@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/oxkrypton/Halon/internal/agent"
+	"github.com/oxkrypton/Halon/internal/authz"
 )
 
 func NewGatewayActionTool(kubernetes *KubernetesToolset, adminBaseURL, adminToken string, client *http.Client) agent.Tool {
@@ -19,7 +20,7 @@ func NewGatewayActionTool(kubernetes *KubernetesToolset, adminBaseURL, adminToke
 		client = &http.Client{Timeout: 5 * time.Second}
 	}
 	return agent.Tool{
-		Name: "gateway_block_ip", Level: agent.LevelOperator,
+		Name: "gateway_block_ip", Permission: authz.PermGatewayBlacklistWrite,
 		Description: "Add one IP to the live gateway blacklist. Use only when query_top_ips or error logs show abuse; this does not fix ordinary upstream timeouts.",
 		Parameters:  objectSchema(map[string]any{"ip": stringProperty("IPv4 or IPv6 address supported by request evidence."), "reason": stringProperty("Evidence-based blocking reason.")}, "ip", "reason"),
 		Handler: func(ctx context.Context, raw json.RawMessage) (any, error) {

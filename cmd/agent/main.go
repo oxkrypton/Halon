@@ -20,6 +20,7 @@ import (
 
 	"github.com/oxkrypton/Halon/internal/agent"
 	"github.com/oxkrypton/Halon/internal/agent/tools"
+	"github.com/oxkrypton/Halon/internal/authz"
 	"github.com/oxkrypton/Halon/internal/incident"
 )
 
@@ -38,6 +39,9 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("load configuration: %w", err)
 	}
 	gin.SetMode(cfg.GinMode)
+	if err := checkGatewayCredential(logger, cfg.Auth, cfg.GatewayAdminURL, cfg.GatewayAdminToken, cfg.OperationLevel); err != nil {
+		return fmt.Errorf("gateway credential: %w", err)
+	}
 
 	startupContext, cancelStartup := context.WithTimeout(context.Background(), 15*time.Second)
 	store, err := incident.OpenStore(startupContext, cfg.DatabaseDSN)
@@ -144,6 +148,18 @@ func run(logger *slog.Logger) error {
 		logger.Info("startup incident recovery skipped in shared mode")
 	}
 
+	// In jwt mode INGEST_TOKEN is only a webhook credential; it must not
+	// grant report reads through the static-token fallback.
+	staticToken := cfg.IngestToken
+	if cfg.Auth.Mode == authz.ModeJWT {
+		staticToken = ""
+	}
+	authenticator, err := authz.NewAuthenticator(cfg.Auth, authz.AudienceAgent, staticToken)
+	if err != nil {
+		return fmt.Errorf("configure agent authentication: %w", err)
+	}
+	logger.Info("agent authentication mode", "mode", cfg.Auth.Mode)
+
 	server := &http.Server{
 		Addr: cfg.HTTPAddr,
 		Handler: agent.NewHTTPHandler(agent.ServerDeps{
@@ -151,6 +167,7 @@ func run(logger *slog.Logger) error {
 			Deduper:      incident.NewDeduper(cfg.DedupTTL),
 			Reports:      store,
 			IngestToken:  cfg.IngestToken,
+			Auth:         authenticator,
 			Logger:       logger,
 			Metrics:      metrics,
 		}),
@@ -194,6 +211,52 @@ func run(logger *slog.Logger) error {
 		shutdownErrors = append(shutdownErrors, errors.New("orchestrator drain timed out"))
 	}
 	return errors.Join(append(shutdownErrors, runError)...)
+}
+
+// checkGatewayCredential binds the agent's gateway identity to its operation
+// level. Static tokens cannot be scoped, so a lower role gets a warning in
+// legacy/hybrid mode and is rejected outright in jwt mode.
+func checkGatewayCredential(logger *slog.Logger, config authz.Config, gatewayAdminURL, token string, level agent.OperationLevel) error {
+	// With a gateway admin URL configured, operator/full agents will make
+	// write calls at runtime. An empty credential would only surface as a
+	// 401 on the first tool call, so fail startup instead. Read-only agents
+	// and an unconfigured gateway URL keep the historical behaviour.
+	if token == "" && gatewayAdminURL != "" && level.Allows(agent.LevelOperator) {
+		return errors.New("GATEWAY_ADMIN_TOKEN is required when GATEWAY_ADMIN_URL is set and AGENT_OPERATION_LEVEL is operator or full")
+	}
+	if !authz.LooksLikeJWT(token) {
+		if config.Mode == authz.ModeJWT {
+			if token == "" && level == agent.LevelReadOnly {
+				return nil
+			}
+			return errors.New("GATEWAY_ADMIN_TOKEN must be a signed JWT in jwt mode")
+		}
+		if token != "" && level != agent.LevelFull {
+			logger.Warn("static GATEWAY_ADMIN_TOKEN grants full gateway access; operation level is lower",
+				"operation_level", level, "auth_mode", config.Mode)
+		}
+		return nil
+	}
+	verifier, err := config.Verifier()
+	if err != nil {
+		return err
+	}
+	if verifier == nil {
+		return errors.New("JWT GATEWAY_ADMIN_TOKEN requires AUTH_MODE hybrid or jwt")
+	}
+	principal, err := verifier.Verify(token, authz.AudienceGatewayAdmin)
+	if err != nil {
+		return fmt.Errorf("verify GATEWAY_ADMIN_TOKEN: %w", err)
+	}
+	// The startup self-check is only for agent credentials: a human token
+	// must never be reused as the agent's gateway identity.
+	if principal.Type != authz.TypeAgent {
+		return fmt.Errorf("GATEWAY_ADMIN_TOKEN typ %q must be %q", principal.Type, authz.TypeAgent)
+	}
+	if principal.Role.String() != string(level) {
+		return fmt.Errorf("GATEWAY_ADMIN_TOKEN role %q does not match AGENT_OPERATION_LEVEL %q", principal.Role, level)
+	}
+	return nil
 }
 
 // kubernetesClientset prefers the in-cluster configuration and falls back

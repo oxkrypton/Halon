@@ -1,14 +1,18 @@
 package gateway
 
 import (
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"log/slog"
 	"math"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
+	"github.com/oxkrypton/Halon/internal/authz"
+	"github.com/oxkrypton/Halon/internal/identity"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -24,6 +28,7 @@ type Config struct {
 	Routes               string
 	DatabaseDSN          string
 	AdminToken           string
+	Auth                 authz.Config
 	AgentWebhookURL      string
 	AgentWebhookToken    string
 	GinMode              string
@@ -68,6 +73,23 @@ type Config struct {
 	BlacklistCacheTTL time.Duration
 	RedisDialTimeout  time.Duration
 	RedisOpTimeout    time.Duration
+
+	// Local username/password login. Disabled by default; when enabled the
+	// gateway holds the Ed25519 signing key and AUTH_MODE must be hybrid/jwt.
+	LoginEnabled           bool
+	JWTPrivateKey          string
+	JWTKID                 string
+	AccessTokenTTL         time.Duration
+	RefreshTokenTTL        time.Duration
+	RefreshMaxLifetime     time.Duration
+	PasswordMinLength      int
+	LoginRateLimitRPS      float64
+	LoginRateLimitBurst    int
+	LoginMaxFailures       int
+	LoginLockDuration      time.Duration
+	AuthEventRetention     time.Duration
+	BootstrapAdminUser     string
+	BootstrapAdminPassword string
 }
 
 func LoadConfig() (Config, error) {
@@ -114,6 +136,20 @@ func LoadConfig() (Config, error) {
 		BlacklistCacheTTL: 10 * time.Second,
 		RedisDialTimeout:  time.Second,
 		RedisOpTimeout:    500 * time.Millisecond,
+
+		JWTPrivateKey:          os.Getenv("AUTH_JWT_PRIVATE_KEY"),
+		JWTKID:                 strings.TrimSpace(os.Getenv("AUTH_JWT_KID")),
+		AccessTokenTTL:         15 * time.Minute,
+		RefreshTokenTTL:        168 * time.Hour,
+		RefreshMaxLifetime:     720 * time.Hour,
+		PasswordMinLength:      identity.DefaultMinPasswordLength,
+		LoginRateLimitRPS:      0.2,
+		LoginRateLimitBurst:    5,
+		LoginMaxFailures:       10,
+		LoginLockDuration:      5 * time.Minute,
+		AuthEventRetention:     2160 * time.Hour,
+		BootstrapAdminUser:     os.Getenv("AUTH_BOOTSTRAP_ADMIN_USER"),
+		BootstrapAdminPassword: os.Getenv("AUTH_BOOTSTRAP_ADMIN_PASSWORD"),
 	}
 
 	var err error
@@ -222,14 +258,74 @@ func LoadConfig() (Config, error) {
 	}
 
 	var validationErrors []error
+
+	// Login is opt-in. Parse its variables centrally here and, when enabled,
+	// merge the public half of the signing key into the verifier set so the
+	// tokens this gateway issues are accepted by its own admin middleware.
+	if cfg.LoginEnabled, err = envBool("AUTH_LOGIN_ENABLED", false); err != nil {
+		return Config{}, err
+	}
+	if cfg.AccessTokenTTL, err = envDuration("AUTH_ACCESS_TOKEN_TTL", cfg.AccessTokenTTL); err != nil {
+		return Config{}, err
+	}
+	if cfg.RefreshTokenTTL, err = envDuration("AUTH_REFRESH_TOKEN_TTL", cfg.RefreshTokenTTL); err != nil {
+		return Config{}, err
+	}
+	if cfg.RefreshMaxLifetime, err = envDuration("AUTH_REFRESH_MAX_LIFETIME", cfg.RefreshMaxLifetime); err != nil {
+		return Config{}, err
+	}
+	if cfg.PasswordMinLength, err = envInt("AUTH_PASSWORD_MIN_LENGTH", cfg.PasswordMinLength); err != nil {
+		return Config{}, err
+	}
+	if cfg.LoginRateLimitRPS, err = envFloat("AUTH_LOGIN_RATE_LIMIT_RPS", cfg.LoginRateLimitRPS); err != nil {
+		return Config{}, err
+	}
+	if cfg.LoginRateLimitBurst, err = envInt("AUTH_LOGIN_RATE_LIMIT_BURST", cfg.LoginRateLimitBurst); err != nil {
+		return Config{}, err
+	}
+	if cfg.LoginMaxFailures, err = envInt("AUTH_LOGIN_MAX_FAILURES", cfg.LoginMaxFailures); err != nil {
+		return Config{}, err
+	}
+	if cfg.LoginLockDuration, err = envDuration("AUTH_LOGIN_LOCK_DURATION", cfg.LoginLockDuration); err != nil {
+		return Config{}, err
+	}
+	if cfg.AuthEventRetention, err = envDuration("AUTH_EVENT_RETENTION", cfg.AuthEventRetention); err != nil {
+		return Config{}, err
+	}
+
+	var extraKeys map[string]ed25519.PublicKey
+	if cfg.LoginEnabled {
+		if mode, parseErr := authz.ParseMode(os.Getenv("AUTH_MODE")); parseErr == nil &&
+			mode != authz.ModeHybrid && mode != authz.ModeJWT {
+			validationErrors = append(validationErrors,
+				errors.New("AUTH_LOGIN_ENABLED requires AUTH_MODE=hybrid or jwt"))
+		}
+		privateKey, parseErr := authz.ParsePrivateKeyBase64(cfg.JWTPrivateKey)
+		if parseErr != nil {
+			validationErrors = append(validationErrors, fmt.Errorf("AUTH_JWT_PRIVATE_KEY: %w", parseErr))
+		} else {
+			publicKey := privateKey.Public().(ed25519.PublicKey)
+			if cfg.JWTKID == "" {
+				cfg.JWTKID = authz.KeyID(publicKey)
+			}
+			extraKeys = map[string]ed25519.PublicKey{cfg.JWTKID: publicKey}
+		}
+	}
+	authConfig, authErr := authz.LoadConfigWithExtraPublicKeys(extraKeys)
+	if authErr != nil {
+		validationErrors = append(validationErrors, fmt.Errorf("auth configuration: %w", authErr))
+	} else {
+		cfg.Auth = authConfig
+	}
+
 	if _, err := ParseRoutes(cfg.Routes); err != nil {
 		validationErrors = append(validationErrors, fmt.Errorf("ROUTES: %w", err))
 	}
 	if cfg.DatabaseDSN == "" {
 		validationErrors = append(validationErrors, errors.New("DATABASE_DSN is required"))
 	}
-	if len(cfg.AdminToken) < minAdminTokenLength {
-		validationErrors = append(validationErrors, errors.New("ADMIN_TOKEN must contain at least 12 characters"))
+	if cfg.Auth.Mode != authz.ModeJWT && len(cfg.AdminToken) < minAdminTokenLength {
+		validationErrors = append(validationErrors, errors.New("ADMIN_TOKEN must contain at least 12 characters in legacy and hybrid modes"))
 	}
 	if cfg.AgentWebhookURL != "" && len(cfg.AgentWebhookToken) < minAdminTokenLength {
 		validationErrors = append(validationErrors, errors.New("AGENT_WEBHOOK_TOKEN must contain at least 12 characters when AGENT_WEBHOOK_URL is set"))
@@ -283,6 +379,39 @@ func LoadConfig() (Config, error) {
 	}
 	if cfg.BlacklistCacheTTL <= 0 || cfg.RedisDialTimeout <= 0 || cfg.RedisOpTimeout <= 0 {
 		validationErrors = append(validationErrors, errors.New("blacklist cache TTL and redis timeouts must be positive"))
+	}
+	if cfg.LoginEnabled {
+		if cfg.AccessTokenTTL < time.Minute || cfg.AccessTokenTTL > time.Hour {
+			validationErrors = append(validationErrors, errors.New("AUTH_ACCESS_TOKEN_TTL must be between 1m and 1h"))
+		}
+		if cfg.RefreshTokenTTL <= 0 || cfg.RefreshMaxLifetime < cfg.RefreshTokenTTL {
+			validationErrors = append(validationErrors,
+				errors.New("AUTH_REFRESH_TOKEN_TTL must be positive and not exceed AUTH_REFRESH_MAX_LIFETIME"))
+		}
+		if cfg.PasswordMinLength < identity.MinPasswordLength || cfg.PasswordMinLength > identity.MaxPasswordLength {
+			validationErrors = append(validationErrors, fmt.Errorf("AUTH_PASSWORD_MIN_LENGTH must be %d..%d", identity.MinPasswordLength, identity.MaxPasswordLength))
+		}
+		if math.IsNaN(cfg.LoginRateLimitRPS) || math.IsInf(cfg.LoginRateLimitRPS, 0) ||
+			cfg.LoginRateLimitRPS <= 0 || cfg.LoginRateLimitBurst <= 0 {
+			validationErrors = append(validationErrors, errors.New("login rate limit values must be positive"))
+		}
+		if cfg.LoginMaxFailures <= 0 || cfg.LoginLockDuration <= 0 || cfg.AuthEventRetention <= 0 {
+			validationErrors = append(validationErrors,
+				errors.New("login max failures, lock duration and event retention must be positive"))
+		}
+		if (cfg.BootstrapAdminUser == "") != (cfg.BootstrapAdminPassword == "") {
+			validationErrors = append(validationErrors,
+				errors.New("AUTH_BOOTSTRAP_ADMIN_USER and AUTH_BOOTSTRAP_ADMIN_PASSWORD must be set together"))
+		}
+		if cfg.BootstrapAdminUser != "" {
+			if err := identity.ValidateUsername(cfg.BootstrapAdminUser); err != nil {
+				validationErrors = append(validationErrors, fmt.Errorf("AUTH_BOOTSTRAP_ADMIN_USER: %w", err))
+			}
+			policy := identity.PasswordPolicy{MinLength: cfg.PasswordMinLength}
+			if err := policy.Validate(cfg.BootstrapAdminUser, cfg.BootstrapAdminPassword); err != nil {
+				validationErrors = append(validationErrors, fmt.Errorf("AUTH_BOOTSTRAP_ADMIN_PASSWORD: %w", err))
+			}
+		}
 	}
 	return cfg, errors.Join(validationErrors...)
 }

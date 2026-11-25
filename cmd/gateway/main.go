@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/oxkrypton/Halon/internal/authz"
 	"github.com/oxkrypton/Halon/internal/gateway"
+	"github.com/oxkrypton/Halon/internal/identity"
 	"github.com/oxkrypton/Halon/internal/incident"
 	"github.com/oxkrypton/Halon/internal/trafficlog"
 	"github.com/redis/go-redis/v9"
@@ -44,6 +46,51 @@ func run() error {
 	if err := repository.Migrate(); err != nil {
 		return err
 	}
+
+	// Local login is opt-in. Identity uses its own migration version table,
+	// so it can share the database with trafficlog safely.
+	var identityStore *identity.Store
+	var cleaner *identity.Cleaner
+	cleanerDone := make(chan struct{})
+	if cfg.LoginEnabled {
+		identityContext, cancelIdentity := context.WithTimeout(context.Background(), 15*time.Second)
+		identityStore, err = identity.OpenStore(identityContext, cfg.DatabaseDSN)
+		cancelIdentity()
+		if err != nil {
+			return fmt.Errorf("open identity store: %w", err)
+		}
+		defer func() { _ = identityStore.Close() }()
+		if err := identityStore.Migrate(); err != nil {
+			return fmt.Errorf("apply identity migrations: %w", err)
+		}
+		if cfg.BootstrapAdminUser != "" {
+			bootstrapContext, cancelBootstrap := context.WithTimeout(context.Background(), 15*time.Second)
+			created, err := identityStore.BootstrapAdmin(bootstrapContext,
+				cfg.BootstrapAdminUser, cfg.BootstrapAdminPassword,
+				identity.PasswordPolicy{MinLength: cfg.PasswordMinLength})
+			cancelBootstrap()
+			if err != nil {
+				return fmt.Errorf("bootstrap administrator: %w", err)
+			}
+			if created {
+				// One line only: the password is never logged.
+				logger.Info("bootstrap administrator created", "username", cfg.BootstrapAdminUser)
+			}
+		}
+		cleaner = identity.NewCleaner(identityStore, cfg.AuthEventRetention, logger)
+		go func() {
+			cleaner.Run(context.Background())
+			close(cleanerDone)
+		}()
+	} else {
+		close(cleanerDone)
+	}
+	// Also covers startup failures that happen after the cleaner was started.
+	defer func() {
+		if cleaner != nil {
+			cleaner.Close()
+		}
+	}()
 
 	tracing, err := gateway.InitTracing(context.Background(), gateway.TracingConfig{
 		Enabled:      cfg.OTELEnabled,
@@ -166,9 +213,59 @@ func run() error {
 		SlowRequestThreshold: cfg.SlowRequestThreshold,
 		BodyCaptureLimit:     cfg.BodyCaptureLimit,
 	})))
+	authenticator, err := authz.NewAuthenticator(cfg.Auth, authz.AudienceGatewayAdmin, cfg.AdminToken)
+	if err != nil {
+		return fmt.Errorf("configure authentication: %w", err)
+	}
+	logger.Info("admin authentication mode", "mode", cfg.Auth.Mode)
+
+	var identityService *identity.Service
+	var authService gateway.AuthService
+	var userService gateway.UserService
+	var loginLimiter gateway.RateLimitBackend
+	if cfg.LoginEnabled {
+		privateKey, err := authz.ParsePrivateKeyBase64(cfg.JWTPrivateKey)
+		if err != nil {
+			return fmt.Errorf("parse AUTH_JWT_PRIVATE_KEY: %w", err)
+		}
+		signer, err := authz.NewSigner(privateKey, cfg.JWTKID, cfg.Auth.Issuer)
+		if err != nil {
+			return fmt.Errorf("configure login signer: %w", err)
+		}
+		identityService, err = identity.NewService(identityStore, signer, identity.ServiceConfig{
+			AccessTokenTTL:     cfg.AccessTokenTTL,
+			RefreshTokenTTL:    cfg.RefreshTokenTTL,
+			RefreshMaxLifetime: cfg.RefreshMaxLifetime,
+			Audiences:          []authz.Audience{authz.AudienceGatewayAdmin, authz.AudienceAgent},
+			Issuer:             cfg.Auth.Issuer,
+			PasswordPolicy:     identity.PasswordPolicy{MinLength: cfg.PasswordMinLength},
+			MaxFailures:        cfg.LoginMaxFailures,
+			LockDuration:       cfg.LoginLockDuration,
+		}, logger)
+		if err != nil {
+			return fmt.Errorf("configure identity service: %w", err)
+		}
+		authService = identityService
+		userService = identityService
+		if redisClient != nil {
+			loginLimiter = gateway.NewRedisRateLimiter(redisClient,
+				cfg.LoginRateLimitRPS, cfg.LoginRateLimitBurst, cfg.RedisOpTimeout,
+				logger, metrics.SetRedisUp,
+				gateway.WithRateLimitKeyPrefix("halon:ratelimit:login:"))
+		} else {
+			loginLimiter = gateway.NewRateLimiter(cfg.LoginRateLimitRPS, cfg.LoginRateLimitBurst)
+		}
+		logger.Info("local login enabled", "kid", cfg.JWTKID)
+	}
+
 	adminServer := newHTTPServer(cfg.AdminAddr, gateway.NewAdminHandler(cfg.AdminToken, rules, limiter, logger, metrics, gateway.AdminOptions{
 		MetricsRequireAuth: cfg.MetricsRequireAuth,
 		Resilience:         resilience,
+		Auth:               authenticator,
+		LoginEnabled:       cfg.LoginEnabled,
+		AuthService:        authService,
+		UserService:        userService,
+		LoginLimiter:       loginLimiter,
 	}))
 
 	serverErrors := make(chan error, 2)
@@ -214,6 +311,14 @@ func run() error {
 	case <-notifierDone:
 	case <-shutdownContext.Done():
 		shutdownResult = append(shutdownResult, errors.New("timeout notifier shutdown timed out"))
+	}
+	if cleaner != nil {
+		cleaner.Close()
+		select {
+		case <-cleanerDone:
+		case <-shutdownContext.Done():
+			shutdownResult = append(shutdownResult, errors.New("auth data cleaner shutdown timed out"))
+		}
 	}
 	return errors.Join(append(shutdownResult, runError)...)
 }

@@ -12,6 +12,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/oxkrypton/Halon/internal/authz"
 	"github.com/oxkrypton/Halon/internal/incident"
 )
 
@@ -29,6 +30,7 @@ type ServerDeps struct {
 	Deduper      *incident.Deduper
 	Reports      ReportReader
 	IngestToken  string
+	Auth         *authz.Authenticator
 	Logger       *slog.Logger
 	Metrics      *Metrics
 }
@@ -63,10 +65,22 @@ func NewHTTPHandler(deps ServerDeps) *gin.Engine {
 		router.GET("/metrics", gin.WrapH(deps.Metrics.Handler()))
 	}
 
-	api := router.Group("/api/v1", bearerAuth(deps.IngestToken))
-	api.POST("/incidents/timeout", ingestTimeout(deps, logger))
-	api.GET("/incidents", listReports(deps.Reports))
-	api.GET("/incidents/:event_id", getReport(deps.Reports))
+	authenticator := deps.Auth
+	if authenticator == nil {
+		// Legacy fallback used by existing callers: INGEST_TOKEN also grants
+		// report reads, matching the pre-RBAC behaviour.
+		authenticator, _ = authz.NewAuthenticator(
+			authz.Config{Mode: authz.ModeLegacy, Issuer: authz.DefaultIssuer},
+			authz.AudienceAgent, deps.IngestToken,
+		)
+	}
+
+	api := router.Group("/api/v1")
+	// The webhook keeps its single-purpose service credential in every mode.
+	api.POST("/incidents/timeout", bearerAuth(deps.IngestToken), ingestTimeout(deps, logger))
+	reports := api.Group("", authz.Middleware(authenticator, abortWithAPIError), authz.Require(authz.PermIncidentRead, abortWithAPIError))
+	reports.GET("/incidents", listReports(deps.Reports))
+	reports.GET("/incidents/:event_id", getReport(deps.Reports))
 
 	router.NoRoute(func(c *gin.Context) {
 		abortWithAPIError(c, http.StatusNotFound, "ROUTE_NOT_FOUND", "route not found")

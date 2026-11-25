@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"math"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -13,10 +14,12 @@ import (
 )
 
 const (
-	rateLimitConfigKey   = "halon:ratelimit:config"
-	rateLimitKeyPrefix   = "halon:ratelimit:"
-	rateLimitConfigCache = 10 * time.Second
-	rateLimitIdleMargin  = time.Minute
+	// DefaultRateLimitKeyPrefix keeps the historical data-plane namespace.
+	// Other limiters (for example login throttling) can use a distinct
+	// prefix so their buckets and config never collide with it.
+	DefaultRateLimitKeyPrefix = "halon:ratelimit:"
+	rateLimitConfigCache      = 10 * time.Second
+	rateLimitIdleMargin       = time.Minute
 )
 
 // rateLimitScript is a token bucket executed atomically inside Redis. The
@@ -49,7 +52,8 @@ return allowed
 // RedisRateLimiter is the shared-mode RateLimitBackend. The token buckets
 // live in Redis (one hash per IP), so N replicas together admit exactly the
 // configured rate instead of N times it. Limit parameters live in
-// halon:ratelimit:config and are cached per process for rateLimitConfigCache.
+// halon:ratelimit:config (or the configured prefix's config key) and are
+// cached per process for rateLimitConfigCache.
 //
 // Degradation: when Redis is unreachable, Allow fails open to the embedded
 // in-memory RateLimiter (weaker protection beats rejecting everything),
@@ -60,6 +64,7 @@ type RedisRateLimiter struct {
 	onHealth  func(bool)
 	opTimeout time.Duration
 	fallback  *RateLimiter
+	prefix    string
 
 	cfgMu     sync.Mutex
 	rps       float64
@@ -69,19 +74,45 @@ type RedisRateLimiter struct {
 
 var _ RateLimitBackend = (*RedisRateLimiter)(nil)
 
-func NewRedisRateLimiter(client *redis.Client, rps float64, burst int, opTimeout time.Duration, logger *slog.Logger, onHealth func(bool)) *RedisRateLimiter {
+// RedisRateLimiterOption customises a RedisRateLimiter at construction time.
+type RedisRateLimiterOption func(*RedisRateLimiter)
+
+// WithRateLimitKeyPrefix overrides the Redis namespace for both bucket keys
+// and the shared config key. The prefix is used verbatim, so include the
+// trailing colon (for example "halon:ratelimit:login:"). An empty prefix
+// keeps DefaultRateLimitKeyPrefix.
+func WithRateLimitKeyPrefix(prefix string) RedisRateLimiterOption {
+	return func(l *RedisRateLimiter) {
+		if strings.TrimSpace(prefix) != "" {
+			l.prefix = prefix
+		}
+	}
+}
+
+func NewRedisRateLimiter(client *redis.Client, rps float64, burst int, opTimeout time.Duration, logger *slog.Logger, onHealth func(bool), opts ...RedisRateLimiterOption) *RedisRateLimiter {
 	if opTimeout <= 0 {
 		opTimeout = 500 * time.Millisecond
 	}
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &RedisRateLimiter{
+	limiter := &RedisRateLimiter{
 		client: client, logger: logger, onHealth: onHealth, opTimeout: opTimeout,
 		fallback: NewRateLimiter(rps, burst),
 		rps:      rps, burst: burst,
+		prefix: DefaultRateLimitKeyPrefix,
 	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(limiter)
+		}
+	}
+	return limiter
 }
+
+// configKey is derived from the bucket prefix so two limiters with different
+// prefixes never share their rps/burst settings.
+func (l *RedisRateLimiter) configKey() string { return l.prefix + "config" }
 
 func (l *RedisRateLimiter) Allow(ip string) bool {
 	rps, burst, err := l.settings()
@@ -92,7 +123,7 @@ func (l *RedisRateLimiter) Allow(ip string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), l.opTimeout)
 	defer cancel()
 	ttlMs := bucketTTLMs(rps, burst)
-	allowed, err := rateLimitScript.Run(ctx, l.client, []string{rateLimitKeyPrefix + ip}, rps, burst, ttlMs).Int()
+	allowed, err := rateLimitScript.Run(ctx, l.client, []string{l.prefix + ip}, rps, burst, ttlMs).Int()
 	if err != nil {
 		l.reportHealth(false)
 		l.logger.Warn("redis rate limit failed; failing open to memory bucket", "error", err)
@@ -105,7 +136,7 @@ func (l *RedisRateLimiter) Allow(ip string) bool {
 func (l *RedisRateLimiter) Update(rps float64, burst int) error {
 	ctx, cancel := context.WithTimeout(context.Background(), l.opTimeout)
 	defer cancel()
-	if err := l.client.HSet(ctx, rateLimitConfigKey, "rps", rps, "burst", burst).Err(); err != nil {
+	if err := l.client.HSet(ctx, l.configKey(), "rps", rps, "burst", burst).Err(); err != nil {
 		l.reportHealth(false)
 		return fmt.Errorf("%w: %v", ErrRateLimitUnavailable, err)
 	}
@@ -135,7 +166,7 @@ func (l *RedisRateLimiter) settings() (float64, int, error) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), l.opTimeout)
 	defer cancel()
-	values, err := l.client.HGetAll(ctx, rateLimitConfigKey).Result()
+	values, err := l.client.HGetAll(ctx, l.configKey()).Result()
 	if err != nil {
 		// Keep serving the last known parameters; just extend them briefly
 		// so every request does not pay for the outage.

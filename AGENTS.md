@@ -35,6 +35,7 @@ Agent 服务:事件去重 → 编排器队列 → LLM 排查循环(工具调用)
 | Gin 网关 | [docs/modules/gateway.md](docs/modules/gateway.md) | `internal/gateway`、`cmd/gateway` |
 | Agent 核心(循环/编排/API/配置) | [docs/modules/agent.md](docs/modules/agent.md) | `internal/agent`、`cmd/agent` |
 | Agent 工具层 | [docs/modules/agent-tools.md](docs/modules/agent-tools.md) | `internal/agent/tools` |
+| RBAC 与 JWT 鉴权 | [docs/modules/auth.md](docs/modules/auth.md) | `internal/authz`、`cmd/halonctl` |
 | 超时事件与故障报告 | [docs/modules/incident.md](docs/modules/incident.md) | `internal/incident` |
 | 流量日志存储 | [docs/modules/trafficlog.md](docs/modules/trafficlog.md) | `internal/trafficlog` |
 | 演示后端(示例,非产品) | [examples/user-service/README.md](examples/user-service/README.md)、[examples/order-service/README.md](examples/order-service/README.md) | `examples/` |
@@ -47,7 +48,7 @@ Agent 服务:事件去重 → 编排器队列 → LLM 排查循环(工具调用)
 ```bash
 make test            # go test -race ./... && go vet ./...(每次提交前必跑)
 make lint            # golangci-lint(每次提交前必跑;CI 在 push/PR 上强制同样检查)
-make build           # 构建 gateway / agent 两个产品二进制
+make build           # 构建 gateway / agent / halonctl 三个二进制
 make build-demo      # 构建演示后端二进制
 make run-gateway / run-agent / run-demo   # 本地运行(环境变量见各模块文档)
 make docker-build    # 构建网关与 Agent 镜像;make docker-build-demo 构建演示镜像
@@ -64,6 +65,7 @@ make deploy          # kubectl apply -f deploy/kubernetes/(适用于任意 K8s)
 6. **提交**:Conventional Commits(`feat:` / `fix:` / `docs:` / `build:` / `test:`),一次提交只做一件事,主题用英文小写。
 7. **安全**:Token 比较用 `subtle.ConstantTimeCompare`;K8s RBAC 最小权限;容器非 root、只读根文件系统。
 8. **解耦**:产品代码(`cmd/`、`internal/`)禁止 import `examples/` 下的任何包;网关不得出现具体业务服务的名字。
+9. **鉴权**:新增管理接口或工具必须复用 `internal/authz` 的 `Permission` 常量并在两端声明权限要求;角色映射表只在代码中维护,禁止散落角色判断。私钥离线保管,运维 CLI 为 `cmd/halonctl`。
 
 ## 当前已知边界(改动前先读)
 
@@ -73,3 +75,4 @@ make deploy          # kubectl apply -f deploy/kubernetes/(适用于任意 K8s)
 - `OPENAI_API_KEY` 等密钥只走 `halon-secrets`,禁止入库或写入代码。
 - 网关弹性策略基于 failsafe-go(v0.x),封装在 `internal/gateway/resilience.go`;OpenTelemetry 追踪默认关闭(`OTEL_ENABLED`)。
 - `deploy/kubernetes/observability/` 是可选观测栈参考件,不在 `make deploy` 主路径内,用 `make deploy-observability` 单独部署。
+- 鉴权默认 `AUTH_MODE=legacy`(行为与升级前一致);切到 `hybrid`/`jwt` 前两端都必须配 `AUTH_JWT_PUBLIC_KEYS`,且必须先把所有调用方换成 Ed25519 JWT。`INGEST_TOKEN` 永远只用于 webhook ingest,不进入角色体系;只读 Agent 可不配 `GATEWAY_ADMIN_TOKEN`。详见 `docs/modules/auth.md`。

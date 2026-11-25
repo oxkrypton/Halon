@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net/http"
 	"runtime/debug"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -67,27 +66,4 @@ func Recovery(logger *slog.Logger) gin.HandlerFunc {
 		)
 		abortWithError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "internal server error")
 	})
-}
-
-func adminAuthentication(token string) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		scheme, credentials, found := strings.Cut(c.GetHeader("Authorization"), " ")
-		if !found || !strings.EqualFold(scheme, "Bearer") || !constantTimeEqual(credentials, token) {
-			c.Header("WWW-Authenticate", "Bearer")
-			abortWithError(c, http.StatusUnauthorized, "UNAUTHORIZED", "valid bearer token required")
-			return
-		}
-		c.Next()
-	}
-}
-
-func constantTimeEqual(left, right string) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	var difference byte
-	for i := range left {
-		difference |= left[i] ^ right[i]
-	}
-	return difference == 0
 }

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/oxkrypton/Halon/internal/agent"
+	"github.com/oxkrypton/Halon/internal/authz"
 )
 
 const queryTimeout = 15 * time.Second
@@ -53,7 +54,7 @@ func ObservabilityTools(database *sql.DB, prometheusBaseURL string, httpClient *
 	}
 	return []agent.Tool{
 		{
-			Name: "query_error_logs", Level: agent.LevelReadOnly,
+			Name: "query_error_logs", Permission: authz.PermToolObserve,
 			Description: "Query PostgreSQL error and slow request details. Use the incident request_id first, then path and time window to find related failures.",
 			Parameters: objectSchema(map[string]any{
 				"request_id": stringProperty("Optional exact gateway X-Request-ID."),
@@ -84,7 +85,7 @@ func ObservabilityTools(database *sql.DB, prometheusBaseURL string, httpClient *
 			},
 		},
 		{
-			Name: "query_traffic_stats", Level: agent.LevelReadOnly,
+			Name: "query_traffic_stats", Permission: authz.PermToolObserve,
 			Description: "Aggregate PostgreSQL request counts, latency and server errors by exact path and status code.",
 			Parameters: objectSchema(map[string]any{
 				"path":    stringProperty("Optional exact request path."),
@@ -108,7 +109,7 @@ func ObservabilityTools(database *sql.DB, prometheusBaseURL string, httpClient *
 			},
 		},
 		{
-			Name: "query_top_ips", Level: agent.LevelReadOnly,
+			Name: "query_top_ips", Permission: authz.PermToolObserve,
 			Description: "Find clients with unusually high request or error counts. Use this as evidence before calling gateway_block_ip.",
 			Parameters: objectSchema(map[string]any{
 				"path":    stringProperty("Optional exact request path."),
@@ -137,7 +138,7 @@ func ObservabilityTools(database *sql.DB, prometheusBaseURL string, httpClient *
 			},
 		},
 		{
-			Name: "query_prometheus", Level: agent.LevelReadOnly,
+			Name: "query_prometheus", Permission: authz.PermToolObserve,
 			Description: "Run a read-only Prometheus instant query. Useful queries include rate(halon_gateway_http_requests_total[5m]), histogram_quantile(0.95, sum by (le, route) (rate(halon_gateway_http_request_duration_seconds_bucket[5m]))), and kube_pod_container_status_restarts_total.",
 			Parameters: objectSchema(map[string]any{
 				"query": stringProperty("PromQL instant query."),
