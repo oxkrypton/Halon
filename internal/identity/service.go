@@ -41,7 +41,7 @@ type AuthStore interface {
 	SetPasswordHashOnly(ctx context.Context, username, hash string) error
 	SetPasswordHash(ctx context.Context, username, hash string) error
 	SetMustChangePassword(ctx context.Context, username string, value bool) error
-	RecordFailedLogin(ctx context.Context, username string, failedCount int, lockUntil *time.Time) error
+	RecordFailedLogin(ctx context.Context, username string, maxFailures int, lockDuration time.Duration) (bool, error)
 	RecordSuccessfulLogin(ctx context.Context, username string, at time.Time) error
 	RecordAuthEvent(ctx context.Context, event AuthEvent) error
 	IssueRefreshToken(ctx context.Context, userID string, ttl, maxLifetime time.Duration, clientIP, userAgent string) (RefreshRotation, error)
@@ -157,17 +157,12 @@ func (s *Service) Login(
 		s.auditFailure(ctx, EventLoginFailure, username, username, clientIP, requestID, "locked_user")
 		return nil, ErrInvalidCredentials
 	case verifyErr != nil || !matched:
-		failed := user.FailedLoginCount + 1
-		var lockUntil *time.Time
-		if failed >= s.cfg.MaxFailures {
-			until := now.Add(s.cfg.LockDuration)
-			lockUntil = &until
-		}
-		if err := s.store.RecordFailedLogin(ctx, username, failed, lockUntil); err != nil {
+		locked, err := s.store.RecordFailedLogin(ctx, username, s.cfg.MaxFailures, s.cfg.LockDuration)
+		if err != nil {
 			return nil, fmt.Errorf("record failed login: %w", err)
 		}
 		reason := "bad_password"
-		if lockUntil != nil {
+		if locked {
 			reason = "account_locked"
 		}
 		s.auditFailure(ctx, EventLoginFailure, username, username, clientIP, requestID, reason)
@@ -273,6 +268,9 @@ func (s *Service) ChangePassword(
 	}
 	if err := s.store.SetMustChangePassword(ctx, user.Username, false); err != nil {
 		return fmt.Errorf("clear password change flag: %w", err)
+	}
+	if err := s.store.RevokeAllUserRefreshTokens(ctx, user.ID); err != nil {
+		return fmt.Errorf("revoke user refresh tokens: %w", err)
 	}
 	s.auditSuccess(ctx, EventPasswordChanged, user.Username, user.Username, clientIP, requestID)
 	return nil

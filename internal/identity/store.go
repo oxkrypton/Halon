@@ -36,6 +36,7 @@ const (
 	EventUserCreated          = "user_created"
 	EventUserUpdated          = "user_updated"
 	EventUserDisabled         = "user_disabled"
+	EventUserEnabled          = "user_enabled"
 	EventRoleChanged          = "role_changed"
 	EventPasswordChanged      = "password_changed"
 	EventPasswordReset        = "password_reset"
@@ -293,6 +294,14 @@ func (s *Store) UpdateUserGuarded(ctx context.Context, targetID, actorID string,
 		if err := tx.Model(&User{}).Where("id = ?", targetID).Updates(changes).Error; err != nil {
 			return fmt.Errorf("update identity user: %w", err)
 		}
+		if update.Disabled != nil && *update.Disabled {
+			if err := tx.Exec(`
+				UPDATE auth_refresh_tokens
+				   SET revoked_at = NOW()
+				 WHERE user_id = $1 AND revoked_at IS NULL`, targetID).Error; err != nil {
+				return fmt.Errorf("revoke disabled user refresh tokens: %w", err)
+			}
+		}
 		return nil
 	})
 }
@@ -343,12 +352,39 @@ func (s *Store) SetPasswordHash(ctx context.Context, username, hash string) erro
 	})
 }
 
-// RecordFailedLogin stores the incremented counter and any backoff deadline.
-func (s *Store) RecordFailedLogin(ctx context.Context, username string, failedCount int, lockUntil *time.Time) error {
-	return s.updateUser(ctx, username, map[string]any{
-		"failed_login_count": failedCount,
-		"locked_until":       lockUntil,
-	})
+// RecordFailedLogin atomically increments the failure counter (resetting an
+// expired lockout window first) and locks the account once maxFailures is
+// reached. It reports whether the account is now locked.
+func (s *Store) RecordFailedLogin(ctx context.Context, username string, maxFailures int, lockDuration time.Duration) (bool, error) {
+	lockUntil := time.Now().UTC().Add(lockDuration)
+	var resultRow struct {
+		LockedUntil *time.Time
+	}
+	result := s.db.WithContext(ctx).Raw(`
+		UPDATE auth_users
+		   SET failed_login_count = CASE
+		           WHEN locked_until IS NOT NULL AND locked_until <= NOW() THEN 1
+		           ELSE failed_login_count + 1
+		       END,
+		       locked_until = CASE
+		           WHEN (CASE
+		                   WHEN locked_until IS NOT NULL AND locked_until <= NOW() THEN 1
+		                   ELSE failed_login_count + 1
+		                 END) >= $1
+		           THEN $2
+		           ELSE NULL
+		       END,
+		       updated_at = NOW()
+		 WHERE username = $3
+		RETURNING locked_until`,
+		maxFailures, lockUntil, username).Scan(&resultRow)
+	if result.Error != nil {
+		return false, fmt.Errorf("record failed login: %w", result.Error)
+	}
+	if result.RowsAffected == 0 {
+		return false, fmt.Errorf("%w: %s", ErrNotFound, username)
+	}
+	return resultRow.LockedUntil != nil, nil
 }
 
 // RecordSuccessfulLogin clears failed-login state and stamps last_login_at.

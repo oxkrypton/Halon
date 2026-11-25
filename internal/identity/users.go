@@ -61,14 +61,27 @@ type CreateUserResult struct {
 	GeneratedPassword string
 }
 
+const defaultTempPasswordLength = 24
+
 // GenerateTemporaryPassword returns 24 URL-safe characters of randomness.
-// It comfortably satisfies the configured 8..128 byte policy.
+// It comfortably satisfies the default 12-byte policy.
 func GenerateTemporaryPassword() (string, error) {
-	buf := make([]byte, 18)
+	return GenerateTemporaryPasswordLength(defaultTempPasswordLength)
+}
+
+// GenerateTemporaryPasswordLength returns at least minLength URL-safe random
+// characters (with a floor of 24), bounded by MaxPasswordLength.
+func GenerateTemporaryPasswordLength(minLength int) (string, error) {
+	length := max(defaultTempPasswordLength, minLength)
+	if length > MaxPasswordLength {
+		return "", fmt.Errorf("%w: temporary password length %d exceeds %d", ErrInvalidPasswordPolicy, length, MaxPasswordLength)
+	}
+	rawBytes := (length*3 + 3) / 4
+	buf := make([]byte, rawBytes)
 	if _, err := rand.Read(buf); err != nil {
 		return "", fmt.Errorf("generate temporary password: %w", err)
 	}
-	return base64.RawURLEncoding.EncodeToString(buf), nil
+	return base64.RawURLEncoding.EncodeToString(buf)[:length], nil
 }
 
 // ListUsers returns one page of users plus the total count.
@@ -114,7 +127,7 @@ func (s *Service) CreateUser(ctx context.Context, input CreateUserInput) (*Creat
 	password := input.Password
 	generated := password == ""
 	if generated {
-		password, err = GenerateTemporaryPassword()
+		password, err = GenerateTemporaryPasswordLength(s.cfg.PasswordPolicy.MinLength)
 		if err != nil {
 			return nil, err
 		}
@@ -170,12 +183,20 @@ func (s *Service) UpdateUser(
 	if err != nil {
 		return nil, fmt.Errorf("reload updated user: %w", err)
 	}
-	switch {
-	case update.Role != nil:
+	audited := false
+	if update.Role != nil {
 		s.auditSuccess(ctx, EventRoleChanged, actorUsername, user.Username, clientIP, requestID)
-	case update.Disabled != nil:
-		s.auditSuccess(ctx, EventUserDisabled, actorUsername, user.Username, clientIP, requestID)
-	default:
+		audited = true
+	}
+	if update.Disabled != nil {
+		action := EventUserEnabled
+		if *update.Disabled {
+			action = EventUserDisabled
+		}
+		s.auditSuccess(ctx, action, actorUsername, user.Username, clientIP, requestID)
+		audited = true
+	}
+	if !audited {
 		s.auditSuccess(ctx, EventUserUpdated, actorUsername, user.Username, clientIP, requestID)
 	}
 	view := toUserView(user)
@@ -192,7 +213,7 @@ func (s *Service) ResetPassword(
 	if err != nil {
 		return "", err
 	}
-	password, err := GenerateTemporaryPassword()
+	password, err := GenerateTemporaryPasswordLength(s.cfg.PasswordPolicy.MinLength)
 	if err != nil {
 		return "", err
 	}

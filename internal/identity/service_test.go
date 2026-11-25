@@ -146,6 +146,14 @@ func (m *memoryStore) UpdateUserGuarded(_ context.Context, targetID, actorID str
 	}
 	if update.Disabled != nil {
 		target.Disabled = *update.Disabled
+		if *update.Disabled {
+			now := time.Now().UTC()
+			for _, token := range m.tokens {
+				if token.userID == targetID && token.revokedAt == nil {
+					token.revokedAt = &now
+				}
+			}
+		}
 	}
 	if update.DisplayName != nil {
 		target.DisplayName = *update.DisplayName
@@ -189,13 +197,26 @@ func (m *memoryStore) SetMustChangePassword(_ context.Context, username string, 
 	return nil
 }
 
-func (m *memoryStore) RecordFailedLogin(_ context.Context, username string, failedCount int, lockUntil *time.Time) error {
+func (m *memoryStore) RecordFailedLogin(_ context.Context, username string, maxFailures int, lockDuration time.Duration) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	user := m.users[username]
-	user.FailedLoginCount = failedCount
-	user.LockedUntil = lockUntil
-	return nil
+	user, ok := m.users[username]
+	if !ok {
+		return false, identity.ErrNotFound
+	}
+	now := time.Now().UTC()
+	if user.LockedUntil != nil && !user.LockedUntil.After(now) {
+		user.FailedLoginCount = 1
+	} else {
+		user.FailedLoginCount++
+	}
+	if user.FailedLoginCount >= maxFailures {
+		until := now.Add(lockDuration)
+		user.LockedUntil = &until
+		return true, nil
+	}
+	user.LockedUntil = nil
+	return false, nil
 }
 
 func (m *memoryStore) RecordSuccessfulLogin(_ context.Context, username string, at time.Time) error {
@@ -570,5 +591,41 @@ func TestChangePasswordClearsForcedFlag(t *testing.T) {
 	}
 	if _, err := service.Login(ctx, "alice", "a-brand-new-secret", "", "", ""); err != nil {
 		t.Fatalf("login with new password: %v", err)
+	}
+}
+
+func TestExpiredLockoutResetsFailureCounter(t *testing.T) {
+	t.Parallel()
+	store := newMemoryStore()
+	user := store.addUser(t, authz.RoleFull, false)
+	expired := time.Now().UTC().Add(-time.Minute)
+	user.FailedLoginCount = 2
+	user.LockedUntil = &expired
+	service, _ := newTestService(t, store, 2)
+
+	if _, err := service.Login(context.Background(), "alice", "wrong", "", "", ""); !errors.Is(err, identity.ErrInvalidCredentials) {
+		t.Fatalf("err = %v, want ErrInvalidCredentials", err)
+	}
+	if user.FailedLoginCount != 1 || user.LockedUntil != nil {
+		t.Fatalf("expired lockout did not reset counter: count=%d locked=%v", user.FailedLoginCount, user.LockedUntil)
+	}
+}
+
+func TestChangePasswordRevokesExistingRefreshTokens(t *testing.T) {
+	t.Parallel()
+	store := newMemoryStore()
+	user := store.addUser(t, authz.RoleFull, false)
+	service, _ := newTestService(t, store, 10)
+	ctx := context.Background()
+
+	session, err := service.Login(ctx, "alice", testPassword, "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.ChangePassword(ctx, user.ID, testPassword, "a-brand-new-secret", "10.0.0.1", "req-2"); err != nil {
+		t.Fatalf("change password: %v", err)
+	}
+	if _, err := service.Refresh(ctx, session.RefreshToken, "", "", ""); !errors.Is(err, identity.ErrInvalidRefreshToken) {
+		t.Fatalf("refresh token survived password change: %v", err)
 	}
 }

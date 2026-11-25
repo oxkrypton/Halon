@@ -200,11 +200,12 @@ func TestRecordFailedAndSuccessfulLogin(t *testing.T) {
 
 	store, mock := newMockStore(t)
 	lockUntil := time.Date(2026, 11, 23, 10, 15, 0, 0, time.UTC)
-	mock.ExpectBegin()
-	mock.ExpectExec(`UPDATE "auth_users" SET`).
-		WithArgs(3, lockUntil, sqlmock.AnyArg(), "alice").
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectCommit()
+	mock.ExpectQuery(`UPDATE auth_users SET failed_login_count =`).
+		WithArgs(3, sqlmock.AnyArg(), "alice").
+		WillReturnRows(sqlmock.NewRows([]string{"locked_until"}).AddRow(nil))
+	mock.ExpectQuery(`UPDATE auth_users SET failed_login_count =`).
+		WithArgs(3, sqlmock.AnyArg(), "alice").
+		WillReturnRows(sqlmock.NewRows([]string{"locked_until"}).AddRow(lockUntil))
 	mock.ExpectBegin()
 	mock.ExpectExec(`UPDATE "auth_users" SET`).
 		WithArgs(0, sqlmock.AnyArg(), nil, sqlmock.AnyArg(), "alice").
@@ -212,8 +213,13 @@ func TestRecordFailedAndSuccessfulLogin(t *testing.T) {
 	mock.ExpectCommit()
 
 	ctx := context.Background()
-	if err := store.RecordFailedLogin(ctx, "alice", 3, &lockUntil); err != nil {
-		t.Fatalf("record failed login: %v", err)
+	locked, err := store.RecordFailedLogin(ctx, "alice", 3, 5*time.Minute)
+	if err != nil || locked {
+		t.Fatalf("first failed login = %v, %v; want false, nil", locked, err)
+	}
+	locked, err = store.RecordFailedLogin(ctx, "alice", 3, 5*time.Minute)
+	if err != nil || !locked {
+		t.Fatalf("locked failed login = %v, %v; want true, nil", locked, err)
 	}
 	if err := store.RecordSuccessfulLogin(ctx, "alice", time.Now().UTC()); err != nil {
 		t.Fatalf("record successful login: %v", err)
@@ -381,6 +387,34 @@ func TestUpdateUserGuardedRejectsLastAdmin(t *testing.T) {
 		identity.UserUpdate{Disabled: &disabled})
 	if !errors.Is(err, identity.ErrLastAdmin) {
 		t.Fatalf("error = %v, want ErrLastAdmin", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUpdateUserGuardedDisableRevokesTokens(t *testing.T) {
+	t.Parallel()
+	store, mock := newMockStore(t)
+	disabled := true
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT "id" FROM "auth_users" WHERE role = \$1 AND disabled = FALSE FOR UPDATE`).
+		WithArgs("full").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("other-admin"))
+	mock.ExpectQuery(`SELECT \* FROM "auth_users" WHERE id = \$1 LIMIT \$2 FOR UPDATE`).
+		WithArgs("user-uuid", 1).
+		WillReturnRows(userRows())
+	mock.ExpectExec(`UPDATE "auth_users" SET`).
+		WithArgs(true, sqlmock.AnyArg(), "user-uuid").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE auth_refresh_tokens SET revoked_at = NOW\(\) WHERE user_id = \$1 AND revoked_at IS NULL`).
+		WithArgs("user-uuid").
+		WillReturnResult(sqlmock.NewResult(0, 2))
+	mock.ExpectCommit()
+
+	if err := store.UpdateUserGuarded(context.Background(), "user-uuid", "actor-id",
+		identity.UserUpdate{Disabled: &disabled}); err != nil {
+		t.Fatalf("disable user: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)

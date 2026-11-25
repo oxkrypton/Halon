@@ -2,10 +2,12 @@ package identity_test
 
 import (
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/oxkrypton/Halon/internal/authz"
 	"github.com/oxkrypton/Halon/internal/identity"
@@ -193,5 +195,84 @@ func TestUserViewsNeverExposePasswordHash(t *testing.T) {
 		if strings.Contains(body, "password_hash") || strings.Contains(body, sampleHash) {
 			t.Fatalf("password hash leaked in user view: %s", body)
 		}
+	}
+}
+
+func TestDisableUserRevokesRefreshTokensAndAuditsActions(t *testing.T) {
+	t.Parallel()
+	store := newMemoryStore()
+	actor := store.addUser(t, authz.RoleFull, false)
+	target := store.addNamedUser(t, "bob", authz.RoleOperator, false)
+	service, _ := newTestService(t, store, 10)
+	ctx := context.Background()
+
+	login, err := service.Login(ctx, "bob", testPassword, "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	newRole := authz.RoleReadOnly
+	disable := true
+	if _, err := service.UpdateUser(ctx, target.ID, actor.ID, actor.Username, identity.UserUpdate{
+		Role:     &newRole,
+		Disabled: &disable,
+	}, "10.0.0.1", "req-1"); err != nil {
+		t.Fatalf("disable user: %v", err)
+	}
+	if _, err := service.Refresh(ctx, login.RefreshToken, "", "", ""); !errors.Is(err, identity.ErrInvalidRefreshToken) {
+		t.Fatalf("refresh token survived user disable: %v", err)
+	}
+	reasons := store.eventReasons()
+	if len(reasons) < 2 || reasons[len(reasons)-2] != identity.EventRoleChanged || reasons[len(reasons)-1] != identity.EventUserDisabled {
+		t.Fatalf("expected role_changed + user_disabled audit, got %v", reasons)
+	}
+
+	enable := false
+	if _, err := service.UpdateUser(ctx, target.ID, actor.ID, actor.Username, identity.UserUpdate{
+		Disabled: &enable,
+	}, "10.0.0.1", "req-2"); err != nil {
+		t.Fatalf("enable user: %v", err)
+	}
+	if last := store.events[len(store.events)-1].Action; last != identity.EventUserEnabled {
+		t.Fatalf("re-enable audit action = %q, want %q", last, identity.EventUserEnabled)
+	}
+}
+
+func TestGeneratedTempPasswordHonorsConfiguredMinLength(t *testing.T) {
+	t.Parallel()
+	store := newMemoryStore()
+	actor := store.addUser(t, authz.RoleFull, false)
+	_, private, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := authz.NewSigner(private, "k1", authz.DefaultIssuer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := identity.NewService(store, signer, identity.ServiceConfig{
+		AccessTokenTTL:     15 * time.Minute,
+		RefreshTokenTTL:    24 * time.Hour,
+		RefreshMaxLifetime: 72 * time.Hour,
+		PasswordPolicy:     identity.PasswordPolicy{MinLength: 40},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	created, err := service.CreateUser(ctx, identity.CreateUserInput{
+		Username: "bob", Role: authz.RoleReadOnly, ActorUsername: actor.Username,
+	})
+	if err != nil {
+		t.Fatalf("create user with min_length=40: %v", err)
+	}
+	if len(created.GeneratedPassword) != 40 {
+		t.Fatalf("generated password length = %d, want 40", len(created.GeneratedPassword))
+	}
+	reset, err := service.ResetPassword(ctx, created.User.ID, actor.Username, "", "req-reset")
+	if err != nil {
+		t.Fatalf("reset password with min_length=40: %v", err)
+	}
+	if len(reset) != 40 {
+		t.Fatalf("reset password length = %d, want 40", len(reset))
 	}
 }
