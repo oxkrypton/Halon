@@ -43,9 +43,9 @@ func loginRoutesDisabled() []struct{ Method, Path string } {
 func registerAuthRoutes(router *gin.Engine, authenticator *authz.Authenticator, service AuthService, limiter RateLimitBackend, logger *slog.Logger) {
 	auth := router.Group("/auth")
 	auth.POST("/login", loginHandler(service, limiter, logger))
-	auth.POST("/refresh", refreshHandler(service, logger))
+	auth.POST("/refresh", refreshHandler(service, limiter, logger))
 	// Logout is keyed by the refresh token itself and needs no access token.
-	auth.POST("/logout", logoutHandler(service, logger))
+	auth.POST("/logout", logoutHandler(service, limiter, logger))
 	// A token with pcr=true must be able to reach these two endpoints, so
 	// they carry only Middleware and never Require.
 	auth.GET("/me", authz.Middleware(authenticator, abortWithError), meHandler())
@@ -72,9 +72,7 @@ func loginHandler(service AuthService, limiter RateLimitBackend, logger *slog.Lo
 		}
 		// Proxy headers are not trusted, so this is only an auxiliary guard;
 		// per-account failure counters are the real backstop.
-		if limiter != nil && !limiter.Allow(c.ClientIP()) {
-			c.Header("Retry-After", "1")
-			abortWithError(c, http.StatusTooManyRequests, "RATE_LIMITED", "too many login attempts")
+		if !allowAuthAttempt(c, limiter) {
 			return
 		}
 		session, err := service.Login(c.Request.Context(), request.Username, request.Password,
@@ -94,13 +92,16 @@ func loginHandler(service AuthService, limiter RateLimitBackend, logger *slog.Lo
 	}
 }
 
-func refreshHandler(service AuthService, logger *slog.Logger) gin.HandlerFunc {
+func refreshHandler(service AuthService, limiter RateLimitBackend, logger *slog.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var request struct {
 			RefreshToken string `json:"refresh_token" binding:"required"`
 		}
 		if err := bindAuthJSON(c, &request); err != nil {
 			abortWithError(c, http.StatusBadRequest, "INVALID_REQUEST", "refresh_token is required")
+			return
+		}
+		if !allowAuthAttempt(c, limiter) {
 			return
 		}
 		session, err := service.Refresh(c.Request.Context(), request.RefreshToken,
@@ -120,13 +121,16 @@ func refreshHandler(service AuthService, logger *slog.Logger) gin.HandlerFunc {
 	}
 }
 
-func logoutHandler(service AuthService, logger *slog.Logger) gin.HandlerFunc {
+func logoutHandler(service AuthService, limiter RateLimitBackend, logger *slog.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var request struct {
 			RefreshToken string `json:"refresh_token" binding:"required"`
 		}
 		if err := bindAuthJSON(c, &request); err != nil {
 			abortWithError(c, http.StatusBadRequest, "INVALID_REQUEST", "refresh_token is required")
+			return
+		}
+		if !allowAuthAttempt(c, limiter) {
 			return
 		}
 		if err := service.Logout(c.Request.Context(), request.RefreshToken, c.ClientIP(), requestIDFromContext(c)); err != nil {
@@ -137,6 +141,15 @@ func logoutHandler(service AuthService, logger *slog.Logger) gin.HandlerFunc {
 		logAuth(logger, "logout", c, "success")
 		c.Status(http.StatusNoContent)
 	}
+}
+
+func allowAuthAttempt(c *gin.Context, limiter RateLimitBackend) bool {
+	if limiter != nil && !limiter.Allow(c.ClientIP()) {
+		c.Header("Retry-After", "1")
+		abortWithError(c, http.StatusTooManyRequests, "RATE_LIMITED", "too many auth attempts")
+		return false
+	}
+	return true
 }
 
 func meHandler() gin.HandlerFunc {

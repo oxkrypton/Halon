@@ -250,7 +250,7 @@ func auditAdminRequest(logger *slog.Logger, metrics *Metrics) gin.HandlerFunc {
 		}
 		permission := authz.PermissionFromContext(c).String()
 		result := "allow"
-		if c.IsAborted() {
+		if authz.DeniedFromContext(c) {
 			result = "deny"
 		}
 		logger.Info("admin request",

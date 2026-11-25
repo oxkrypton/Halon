@@ -81,6 +81,10 @@ func listUsersHandler(service UserService) gin.HandlerFunc {
 
 func getUserHandler(service UserService) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if err := identity.ValidateUUID(c.Param("id")); err != nil {
+			abortWithError(c, http.StatusBadRequest, "INVALID_REQUEST", "user id must be a valid UUID")
+			return
+		}
 		user, err := service.GetUser(c.Request.Context(), c.Param("id"))
 		if err != nil {
 			if errors.Is(err, identity.ErrNotFound) {
@@ -108,6 +112,10 @@ func createUserHandler(service UserService, logger *slog.Logger) gin.HandlerFunc
 		}
 		if err := identity.ValidateUsername(request.Username); err != nil {
 			abortWithError(c, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
+			return
+		}
+		if len(request.DisplayName) > 128 {
+			abortWithError(c, http.StatusBadRequest, "INVALID_REQUEST", "display_name exceeds 128 bytes")
 			return
 		}
 		role, err := authz.ParseRole(request.Role)
@@ -154,6 +162,10 @@ func createUserHandler(service UserService, logger *slog.Logger) gin.HandlerFunc
 
 func updateUserHandler(service UserService, logger *slog.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if err := identity.ValidateUUID(c.Param("id")); err != nil {
+			abortWithError(c, http.StatusBadRequest, "INVALID_REQUEST", "user id must be a valid UUID")
+			return
+		}
 		var request struct {
 			Role        *string `json:"role"`
 			Disabled    *bool   `json:"disabled"`
@@ -213,17 +225,24 @@ func updateUserHandler(service UserService, logger *slog.Logger) gin.HandlerFunc
 
 func resetPasswordHandler(service UserService, logger *slog.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if err := identity.ValidateUUID(c.Param("id")); err != nil {
+			abortWithError(c, http.StatusBadRequest, "INVALID_REQUEST", "user id must be a valid UUID")
+			return
+		}
 		principal := authz.PrincipalFromContext(c)
 		actorName := actorUsername(principal)
 		password, err := service.ResetPassword(c.Request.Context(), c.Param("id"), actorName,
 			c.ClientIP(), requestIDFromContext(c))
 		if err != nil {
-			if errors.Is(err, identity.ErrNotFound) {
+			switch {
+			case errors.Is(err, identity.ErrNotFound):
 				abortWithError(c, http.StatusNotFound, "USER_NOT_FOUND", "user not found")
-				return
+			case errors.Is(err, identity.ErrWeakPassword):
+				abortWithError(c, http.StatusBadRequest, "WEAK_PASSWORD", err.Error())
+			default:
+				logAuthError(logger, "user_password_reset", c, err)
+				abortWithError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "internal server error")
 			}
-			logAuthError(logger, "user_password_reset", c, err)
-			abortWithError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "internal server error")
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"generated_password": password, "must_change_password": true})

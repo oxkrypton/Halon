@@ -43,9 +43,11 @@ func (s *stubUserService) ResetPassword(context.Context, string, string, string,
 	return s.resetPassword, s.err
 }
 
+const testUserID = "11111111-1111-4111-8111-111111111111"
+
 func sampleUserView() identity.UserView {
 	return identity.UserView{
-		ID: "user-1", Username: "alice", DisplayName: "Alice",
+		ID: testUserID, Username: "alice", DisplayName: "Alice",
 		Role: authz.RoleFull, MustChangePassword: false,
 	}
 }
@@ -81,10 +83,10 @@ func userEndpoints() []struct {
 		Success            int
 	}{
 		{http.MethodGet, "/admin/users", "", http.StatusOK},
-		{http.MethodGet, "/admin/users/user-1", "", http.StatusOK},
+		{http.MethodGet, "/admin/users/" + testUserID, "", http.StatusOK},
 		{http.MethodPost, "/admin/users", `{"username":"bob","role":"readonly"}`, http.StatusCreated},
-		{http.MethodPatch, "/admin/users/user-1", `{"role":"operator"}`, http.StatusOK},
-		{http.MethodPost, "/admin/users/user-1/password", ``, http.StatusOK},
+		{http.MethodPatch, "/admin/users/" + testUserID, `{"role":"operator"}`, http.StatusOK},
+		{http.MethodPost, "/admin/users/" + testUserID + "/password", ``, http.StatusOK},
 	}
 }
 
@@ -165,9 +167,9 @@ func TestUserResponsesNeverIncludePasswordHash(t *testing.T) {
 
 	for _, endpoint := range []struct{ Method, Path, Body string }{
 		{http.MethodGet, "/admin/users", ""},
-		{http.MethodGet, "/admin/users/user-1", ""},
+		{http.MethodGet, "/admin/users/" + testUserID, ""},
 		{http.MethodPost, "/admin/users", `{"username":"bob","role":"readonly","password":"supplied"}`},
-		{http.MethodPatch, "/admin/users/user-1", `{"display_name":"Bob"}`},
+		{http.MethodPatch, "/admin/users/" + testUserID, `{"display_name":"Bob"}`},
 	} {
 		response := adminRequest(router, endpoint.Method, endpoint.Path, token, endpoint.Body)
 		if strings.Contains(strings.ToLower(response.Body.String()), "password_hash") {
@@ -212,9 +214,10 @@ func TestUserManagementErrorMapping(t *testing.T) {
 	}{
 		{"username taken", http.MethodPost, "/admin/users", `{"username":"bob","role":"readonly"}`, identity.ErrUsernameTaken, http.StatusConflict, "USERNAME_TAKEN"},
 		{"weak password", http.MethodPost, "/admin/users", `{"username":"bob","role":"readonly","password":"short"}`, identity.ErrWeakPassword, http.StatusBadRequest, "WEAK_PASSWORD"},
-		{"last admin", http.MethodPatch, "/admin/users/user-1", `{"role":"readonly"}`, identity.ErrLastAdmin, http.StatusConflict, "LAST_ADMIN"},
-		{"self modification", http.MethodPatch, "/admin/users/user-1", `{"role":"readonly"}`, identity.ErrCannotModifySelf, http.StatusForbidden, "FORBIDDEN"},
-		{"not found", http.MethodGet, "/admin/users/user-1", "", identity.ErrNotFound, http.StatusNotFound, "USER_NOT_FOUND"},
+		{"weak reset password", http.MethodPost, "/admin/users/" + testUserID + "/password", ``, identity.ErrWeakPassword, http.StatusBadRequest, "WEAK_PASSWORD"},
+		{"last admin", http.MethodPatch, "/admin/users/" + testUserID, `{"role":"readonly"}`, identity.ErrLastAdmin, http.StatusConflict, "LAST_ADMIN"},
+		{"self modification", http.MethodPatch, "/admin/users/" + testUserID, `{"role":"readonly"}`, identity.ErrCannotModifySelf, http.StatusForbidden, "FORBIDDEN"},
+		{"not found", http.MethodGet, "/admin/users/" + testUserID, "", identity.ErrNotFound, http.StatusNotFound, "USER_NOT_FOUND"},
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
@@ -240,6 +243,27 @@ func TestUserRoutesDisabledByDefault(t *testing.T) {
 		response := adminRequest(router, endpoint.Method, endpoint.Path, "", endpoint.Body)
 		if response.Code != http.StatusNotFound || !strings.Contains(response.Body.String(), `"LOGIN_DISABLED"`) {
 			t.Fatalf("%s %s: status=%d body=%s", endpoint.Method, endpoint.Path, response.Code, response.Body.String())
+		}
+	}
+}
+
+func TestUserInputValidationRejectsBadUUIDAndLongDisplayName(t *testing.T) {
+	t.Parallel()
+	signer, keys := newAdminSigner(t)
+	token := adminTokenFor(t, signer, authz.RoleFull)
+	router := newUserRouter(t, keys, &stubUserService{})
+
+	for _, tc := range []struct {
+		method, path, body string
+	}{
+		{http.MethodGet, "/admin/users/not-a-uuid", ""},
+		{http.MethodPatch, "/admin/users/not-a-uuid", `{"role":"operator"}`},
+		{http.MethodPost, "/admin/users/not-a-uuid/password", ""},
+		{http.MethodPost, "/admin/users", `{"username":"bob","role":"readonly","display_name":"` + strings.Repeat("a", 129) + `"}`},
+	} {
+		resp := adminRequest(router, tc.method, tc.path, token, tc.body)
+		if resp.Code != http.StatusBadRequest || !strings.Contains(resp.Body.String(), `"INVALID_REQUEST"`) {
+			t.Fatalf("%s %s: status=%d body=%s", tc.method, tc.path, resp.Code, resp.Body.String())
 		}
 	}
 }

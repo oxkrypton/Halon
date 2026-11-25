@@ -223,3 +223,25 @@ func TestAdminAuditMetric(t *testing.T) {
 		}
 	}
 }
+
+func TestAdminAuditBusinessErrorIsAllow(t *testing.T) {
+	t.Parallel()
+	signer, keys := newAdminSigner(t)
+	metrics := NewMetrics()
+	router := newAdminRouter(t, authz.ModeJWT, keys, "", metrics)
+	fullToken := adminTokenFor(t, signer, authz.RoleFull)
+
+	response := adminRequest(router, http.MethodPut, "/admin/rules/blacklist/not-an-ip", fullToken, "")
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", response.Code, response.Body.String())
+	}
+	metricsResp := adminRequest(router, http.MethodGet, "/metrics", fullToken, "")
+	body := metricsResp.Body.String()
+	wantMetric := `halon_gateway_admin_requests_total{permission="gateway:blacklist:write",result="allow",role="full"} 1`
+	if !strings.Contains(body, wantMetric) {
+		t.Fatalf("expected %q in metrics, got:\n%s", wantMetric, body)
+	}
+	if strings.Contains(body, `permission="gateway:blacklist:write",result="deny"`) {
+		t.Fatalf("authorized 400 error was mislabeled as deny:\n%s", body)
+	}
+}

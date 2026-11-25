@@ -537,3 +537,63 @@ func TestMiddlewareStatusCodes(t *testing.T) {
 		})
 	}
 }
+
+func TestDeniedFromContext(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	fixture := newJWTFixture(t)
+	allowedToken, err := fixture.signer.Issue(validOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pcrOpts := validOptions()
+	pcrOpts.Role = RoleFull
+	pcrOpts.PasswordChangeRequired = true
+	pcrToken, err := fixture.signer.Issue(pcrOpts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := Config{Mode: ModeJWT, Issuer: DefaultIssuer, PublicKeys: map[string]ed25519.PublicKey{fixture.kid: fixture.key}}
+	authenticator, err := NewAuthenticator(config, AudienceGatewayAdmin, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	abort := func(c *gin.Context, status int, code, message string) {
+		c.AbortWithStatusJSON(status, gin.H{"code": code, "message": message})
+	}
+
+	var lastDenied bool
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Next()
+		lastDenied = DeniedFromContext(c)
+	})
+	group := router.Group("/", Middleware(authenticator, abort))
+	group.GET("/read", Require(PermIncidentRead, abort), func(c *gin.Context) { c.Status(http.StatusOK) })
+	group.PUT("/write", Require(PermGatewayRateLimitWrite, abort), func(c *gin.Context) { c.Status(http.StatusOK) })
+	group.GET("/bad", Require(PermIncidentRead, abort), func(c *gin.Context) {
+		abort(c, http.StatusBadRequest, "BAD", "downstream error")
+	})
+
+	for _, test := range []struct {
+		name       string
+		method     string
+		path       string
+		token      string
+		wantDenied bool
+	}{
+		{"401 missing token", http.MethodGet, "/read", "", true},
+		{"403 insufficient role", http.MethodPut, "/write", allowedToken, true},
+		{"403 pcr", http.MethodGet, "/read", pcrToken, true},
+		{"200 allowed", http.MethodGet, "/read", allowedToken, false},
+		{"400 downstream error", http.MethodGet, "/bad", allowedToken, false},
+	} {
+		request := httptest.NewRequest(test.method, test.path, nil)
+		if test.token != "" {
+			request.Header.Set("Authorization", "Bearer "+test.token)
+		}
+		router.ServeHTTP(httptest.NewRecorder(), request)
+		if lastDenied != test.wantDenied {
+			t.Errorf("%s: DeniedFromContext = %v, want %v", test.name, lastDenied, test.wantDenied)
+		}
+	}
+}

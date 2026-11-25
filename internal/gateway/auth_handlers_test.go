@@ -187,6 +187,34 @@ func TestRefreshAndLogoutEndpoints(t *testing.T) {
 	}
 }
 
+func TestRefreshAndLogoutRateLimited(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		path       string
+		wantStatus int
+	}{
+		{"/auth/refresh", http.StatusOK},
+		{"/auth/logout", http.StatusNoContent},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			service := &stubAuthService{session: sampleSession()}
+			limiter := NewRateLimiter(0.001, 1)
+			router := newAuthRouter(t, nil, service, limiter, testLogger())
+			body := `{"refresh_token":"tok"}`
+
+			if resp := adminRequest(router, http.MethodPost, tc.path, "", body); resp.Code != tc.wantStatus {
+				t.Fatalf("first %s status = %d, want %d", tc.path, resp.Code, tc.wantStatus)
+			}
+			resp := adminRequest(router, http.MethodPost, tc.path, "", body)
+			if resp.Code != http.StatusTooManyRequests ||
+				resp.Header().Get("Retry-After") != "1" ||
+				!strings.Contains(resp.Body.String(), `"RATE_LIMITED"`) {
+				t.Fatalf("second %s: status=%d retry=%q body=%s", tc.path, resp.Code, resp.Header().Get("Retry-After"), resp.Body.String())
+			}
+		})
+	}
+}
+
 func TestMeAndPasswordEndpointsAcceptPCRToken(t *testing.T) {
 	t.Parallel()
 	signer, keys := newAdminSigner(t)
