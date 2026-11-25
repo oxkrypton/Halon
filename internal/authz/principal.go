@@ -18,13 +18,14 @@ const (
 
 // Principal is the authenticated identity carried through one request.
 type Principal struct {
-	Subject  string
-	UserID   string
-	Type     PrincipalType
-	Role     Role
-	Audience Audience
-	Issuer   string
-	JTI      string
+	Subject   string
+	UserID    string
+	Type      PrincipalType
+	Role      Role
+	Audience  Audience
+	Audiences []Audience
+	Issuer    string
+	JTI       string
 	// PasswordChangeRequired is true when the user must set a new password
 	// before using any permission-guarded endpoint. Static credentials and
 	// agent tokens never carry it.

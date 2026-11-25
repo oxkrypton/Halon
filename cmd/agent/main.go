@@ -226,7 +226,7 @@ func checkGatewayCredential(logger *slog.Logger, config authz.Config, gatewayAdm
 	}
 	if !authz.LooksLikeJWT(token) {
 		if config.Mode == authz.ModeJWT {
-			if token == "" && level == agent.LevelReadOnly {
+			if token == "" && (level == agent.LevelReadOnly || gatewayAdminURL == "") {
 				return nil
 			}
 			return errors.New("GATEWAY_ADMIN_TOKEN must be a signed JWT in jwt mode")

@@ -87,7 +87,7 @@ func tokenIssue(args []string, stdout io.Writer) error {
 	subject := flags.String("sub", "", "subject (person or agent identity)")
 	typ := flags.String("type", string(authz.TypeHuman), "human or agent")
 	role := flags.String("role", string(authz.RoleReadOnly), "readonly, operator or full")
-	audience := flags.String("aud", string(authz.AudienceGatewayAdmin), "halon-gateway-admin or halon-agent")
+	audience := flags.String("aud", string(authz.AudienceGatewayAdmin), "comma-separated audiences: halon-gateway-admin, halon-agent")
 	ttl := flags.Duration("ttl", 8*time.Hour, "token lifetime, for example 8h or 2160h")
 	issuer := flags.String("issuer", authz.DefaultIssuer, "JWT issuer")
 	jti := flags.String("jti", "", "optional explicit jti; random when empty")
@@ -137,7 +137,10 @@ func issueToken(request issueRequest) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	audience := authz.Audience(strings.TrimSpace(request.Audience))
+	audiences, err := parseAudiences(request.Audience)
+	if err != nil {
+		return "", err
+	}
 	kid := strings.TrimSpace(request.Kid)
 	if kid == "" {
 		kid = authz.KeyID(private.Public().(ed25519.PublicKey))
@@ -150,7 +153,7 @@ func issueToken(request issueRequest) (string, error) {
 		Subject:   request.Subject,
 		Type:      principalType,
 		Role:      role,
-		Audiences: []authz.Audience{audience},
+		Audiences: audiences,
 		TTL:       request.TTL,
 		Issuer:    request.Issuer,
 		JTI:       request.JTI,
@@ -166,7 +169,7 @@ func tokenInspect(args []string, stdout io.Writer) error {
 	flags := flag.NewFlagSet("token inspect", flag.ContinueOnError)
 	token := flags.String("token", "", "JWT to inspect")
 	publicKeys := flags.String("public-keys", "", "optional kid=base64 public key list; enables signature verification")
-	audience := flags.String("aud", string(authz.AudienceGatewayAdmin), "expected audience when verifying")
+	audience := flags.String("aud", string(authz.AudienceGatewayAdmin), "comma-separated expected audiences when verifying")
 	issuer := flags.String("issuer", authz.DefaultIssuer, "expected issuer when verifying")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -198,21 +201,52 @@ func inspectToken(raw, publicKeys, audience, issuer string) (inspectOutput, erro
 	if err != nil {
 		return inspectOutput{}, err
 	}
-	principal, err := verifier.Verify(raw, authz.Audience(strings.TrimSpace(audience)))
+	audiences, err := parseAudiences(audience)
 	if err != nil {
 		return inspectOutput{}, err
 	}
+	principal, err := verifier.Verify(raw, audiences...)
+	if err != nil {
+		return inspectOutput{}, err
+	}
+	claims := map[string]any{
+		"sub":  principal.Subject,
+		"typ":  string(principal.Type),
+		"role": string(principal.Role),
+		"aud":  string(principal.Audience),
+		"iss":  principal.Issuer,
+		"jti":  principal.JTI,
+	}
+	if principal.UserID != "" {
+		claims["uid"] = principal.UserID
+	}
+	if principal.PasswordChangeRequired {
+		claims["pcr"] = true
+	}
+	if len(principal.Audiences) > 1 {
+		audStrings := make([]string, 0, len(principal.Audiences))
+		for _, aud := range principal.Audiences {
+			audStrings = append(audStrings, string(aud))
+		}
+		claims["audiences"] = audStrings
+	}
 	return inspectOutput{
 		Verified: true,
-		Claims: map[string]any{
-			"sub":  principal.Subject,
-			"typ":  string(principal.Type),
-			"role": string(principal.Role),
-			"aud":  string(principal.Audience),
-			"iss":  principal.Issuer,
-			"jti":  principal.JTI,
-		},
+		Claims:   claims,
 	}, nil
+}
+
+func parseAudiences(raw string) ([]authz.Audience, error) {
+	var audiences []authz.Audience
+	for _, part := range strings.Split(raw, ",") {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			audiences = append(audiences, authz.Audience(trimmed))
+		}
+	}
+	if len(audiences) == 0 {
+		return nil, errors.New("at least one audience is required")
+	}
+	return audiences, nil
 }
 
 func encodeJSON(stdout io.Writer, value any) error {

@@ -130,12 +130,17 @@ func (v *Verifier) Verify(raw string, audiences ...Audience) (*Principal, error)
 	if err != nil {
 		return nil, fmt.Errorf("verify JWT: %w", err)
 	}
+	audiencesClaim := make([]Audience, 0, len(claims.Audience))
+	for _, aud := range claims.Audience {
+		audiencesClaim = append(audiencesClaim, Audience(aud))
+	}
 	return &Principal{
 		Subject:                claims.Subject,
 		UserID:                 claims.UID,
 		Type:                   typ,
 		Role:                   role,
 		Audience:               matched,
+		Audiences:              audiencesClaim,
 		Issuer:                 claims.Issuer,
 		JTI:                    claims.ID,
 		PasswordChangeRequired: claims.PCR,

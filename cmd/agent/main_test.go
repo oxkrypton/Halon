@@ -121,9 +121,9 @@ func TestCheckGatewayCredential(t *testing.T) {
 	}
 }
 
-// With no gateway admin URL the historical behaviour is preserved: a
-// read-only agent may run without a token, and legacy/hybrid operator agents
-// are not forced to supply one. jwt mode still requires a signed JWT.
+// With no gateway admin URL the historical behaviour is preserved across all
+// auth modes: an unconfigured URL allows an empty token, while a non-empty
+// static token in jwt mode is still rejected.
 func TestCheckGatewayCredentialWithoutGatewayURL(t *testing.T) {
 	t.Parallel()
 	fixture := newCredentialFixture(t)
@@ -137,8 +137,9 @@ func TestCheckGatewayCredentialWithoutGatewayURL(t *testing.T) {
 		{"legacy/operator/no-token", authz.ModeLegacy, "", agent.LevelOperator, false},
 		{"hybrid/full/no-token", authz.ModeHybrid, "", agent.LevelFull, false},
 		{"jwt/readonly/no-token", authz.ModeJWT, "", agent.LevelReadOnly, false},
-		{"jwt/operator/no-token", authz.ModeJWT, "", agent.LevelOperator, true},
-		{"jwt/full/no-token", authz.ModeJWT, "", agent.LevelFull, true},
+		{"jwt/operator/no-token", authz.ModeJWT, "", agent.LevelOperator, false},
+		{"jwt/full/no-token", authz.ModeJWT, "", agent.LevelFull, false},
+		{"jwt/operator/static-token", authz.ModeJWT, staticGatewayToken, agent.LevelOperator, true},
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
