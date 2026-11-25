@@ -78,7 +78,7 @@ func TestIntegrationConcurrentRefreshHasSingleWinner(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := store.RotateRefreshToken(ctx, rotation.Token, 15*time.Minute, 24*time.Hour, "", "")
+			_, err := store.RotateRefreshToken(ctx, rotation.Token, 15*time.Minute, 24*time.Hour, "", "", "")
 			if err == nil {
 				winners.Add(1)
 				return

@@ -246,7 +246,7 @@ func (m *memoryStore) IssueRefreshToken(_ context.Context, userID string, ttl, m
 	return m.insertToken(userID, familyID, time.Now().UTC(), ttl, maxLifetime), nil
 }
 
-func (m *memoryStore) RotateRefreshToken(_ context.Context, token string, ttl, maxLifetime time.Duration, _, _ string) (identity.RefreshRotation, error) {
+func (m *memoryStore) RotateRefreshToken(_ context.Context, token string, ttl, maxLifetime time.Duration, _, _, _ string) (identity.RefreshRotation, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	current, ok := m.tokens[token]
@@ -300,13 +300,16 @@ func (m *memoryStore) RevokeTokenFamily(_ context.Context, familyID string) erro
 	return nil
 }
 
-func (m *memoryStore) RevokeRefreshTokenFamilyByToken(_ context.Context, token string) error {
+func (m *memoryStore) RevokeRefreshTokenFamilyByToken(_ context.Context, token string) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if current, ok := m.tokens[token]; ok {
 		m.revokeFamily(current.familyID)
+		if user, found := m.byID[current.userID]; found {
+			return user.Username, nil
+		}
 	}
-	return nil
+	return "", nil
 }
 
 func (m *memoryStore) ageToken(token string, age time.Duration) {
@@ -561,8 +564,13 @@ func TestLogoutRevokesFamily(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := service.Logout(ctx, first.RefreshToken, "req-1"); err != nil {
+	if err := service.Logout(ctx, first.RefreshToken, "10.0.0.5", "req-1"); err != nil {
 		t.Fatal(err)
+	}
+	lastEvent := store.events[len(store.events)-1]
+	if lastEvent.Action != identity.EventLogout || lastEvent.ActorUsername != "alice" ||
+		lastEvent.TargetUsername != "alice" || lastEvent.ClientIP != "10.0.0.5" || lastEvent.RequestID != "req-1" {
+		t.Fatalf("unexpected logout audit event: %+v", lastEvent)
 	}
 	if _, err := service.Refresh(ctx, first.RefreshToken, "", "", ""); !errors.Is(err, identity.ErrInvalidRefreshToken) {
 		t.Fatalf("refresh after logout: %v", err)

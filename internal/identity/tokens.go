@@ -27,6 +27,7 @@ const (
 var (
 	ErrInvalidRefreshToken = errors.New("invalid or expired refresh token")
 	ErrRefreshTokenReuse   = errors.New("refresh token reuse detected")
+	errRefreshNotConsumed  = errors.New("refresh token not consumed")
 )
 
 // RefreshRotation is the outcome of issuing or rotating a refresh token.
@@ -42,6 +43,7 @@ type RefreshRotation struct {
 
 type refreshTokenRow struct {
 	UserID          string
+	Username        string
 	FamilyID        string
 	FamilyStartedAt time.Time
 	ExpiresAt       time.Time
@@ -85,47 +87,62 @@ func (s *Store) IssueRefreshToken(
 	if err != nil {
 		return RefreshRotation{}, err
 	}
-	return s.insertRefreshToken(ctx, userID, familyID, time.Now().UTC(), ttl, maxLifetime, clientIP, userAgent)
+	return s.insertRefreshTokenDB(s.db.WithContext(ctx), userID, familyID, time.Now().UTC(), ttl, maxLifetime, clientIP, userAgent)
 }
 
 // RotateRefreshToken consumes token and issues one replacement in the same
-// family. The UPDATE ... WHERE used_at IS NULL ... RETURNING statement is the
-// atomic decision point: across replicas only one caller can consume a token.
-// ttl and maxLifetime are injected by the caller (config layer).
+// family inside one database transaction. The UPDATE ... WHERE used_at IS NULL
+// ... RETURNING statement is the atomic decision point across replicas, while
+// the transaction ensures the consumed row rolls back if inserting the
+// replacement fails.
 func (s *Store) RotateRefreshToken(
 	ctx context.Context,
 	token string,
 	ttl, maxLifetime time.Duration,
-	clientIP, userAgent string,
+	clientIP, userAgent, requestID string,
 ) (RefreshRotation, error) {
 	hash := HashRefreshToken(token)
-	var consumed refreshTokenRow
-	result := s.db.WithContext(ctx).Raw(`
-		UPDATE auth_refresh_tokens
-		   SET used_at = NOW()
-		 WHERE token_hash = $1
-		   AND used_at IS NULL
-		   AND revoked_at IS NULL
-		   AND expires_at > NOW()
-		RETURNING user_id, family_id, family_started_at, expires_at`, hash).Scan(&consumed)
-	if result.Error == nil && result.RowsAffected > 0 {
-		return s.insertRefreshToken(ctx, consumed.UserID, consumed.FamilyID,
+	var rotation RefreshRotation
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var consumed refreshTokenRow
+		result := tx.Raw(`
+			UPDATE auth_refresh_tokens
+			   SET used_at = NOW()
+			 WHERE token_hash = $1
+			   AND used_at IS NULL
+			   AND revoked_at IS NULL
+			   AND expires_at > NOW()
+			RETURNING user_id, family_id, family_started_at, expires_at`, hash).Scan(&consumed)
+		if result.Error != nil && !errors.Is(result.Error, gorm.ErrRecordNotFound) {
+			return fmt.Errorf("consume refresh token: %w", result.Error)
+		}
+		if result.RowsAffected == 0 {
+			return errRefreshNotConsumed
+		}
+		var insertErr error
+		rotation, insertErr = s.insertRefreshTokenDB(tx, consumed.UserID, consumed.FamilyID,
 			consumed.FamilyStartedAt, ttl, maxLifetime, clientIP, userAgent)
+		return insertErr
+	})
+	if errors.Is(err, errRefreshNotConsumed) {
+		return s.inspectUnusableToken(ctx, hash, clientIP, requestID)
 	}
-	if result.Error != nil && !errors.Is(result.Error, gorm.ErrRecordNotFound) {
-		return RefreshRotation{}, fmt.Errorf("consume refresh token: %w", result.Error)
+	if err != nil {
+		return RefreshRotation{}, err
 	}
-	return s.inspectUnusableToken(ctx, hash)
+	return rotation, nil
 }
 
 // inspectUnusableToken distinguishes a harmless retry from theft when the
 // atomic consume missed.
-func (s *Store) inspectUnusableToken(ctx context.Context, hash []byte) (RefreshRotation, error) {
+func (s *Store) inspectUnusableToken(ctx context.Context, hash []byte, clientIP, requestID string) (RefreshRotation, error) {
 	var row refreshTokenRow
 	result := s.db.WithContext(ctx).Raw(`
-		SELECT user_id, family_id, used_at, revoked_at, expires_at
-		  FROM auth_refresh_tokens
-		 WHERE token_hash = $1`, hash).Scan(&row)
+		SELECT t.user_id, COALESCE(u.username, '') AS username, t.family_id,
+		       t.used_at, t.revoked_at, t.expires_at
+		  FROM auth_refresh_tokens t
+		  LEFT JOIN auth_users u ON u.id = t.user_id
+		 WHERE t.token_hash = $1`, hash).Scan(&row)
 	if errors.Is(result.Error, gorm.ErrRecordNotFound) || result.RowsAffected == 0 {
 		return RefreshRotation{}, ErrInvalidRefreshToken
 	}
@@ -149,9 +166,12 @@ func (s *Store) inspectUnusableToken(ctx context.Context, hash []byte) (RefreshR
 		return RefreshRotation{}, fmt.Errorf("encode reuse detail: %w", err)
 	}
 	if err := s.RecordAuthEvent(ctx, AuthEvent{
-		Action: EventRefreshReuseDetected,
-		Result: EventResultFailure,
-		Detail: JSONB(detail),
+		Action:         EventRefreshReuseDetected,
+		Result:         EventResultFailure,
+		TargetUsername: row.Username,
+		ClientIP:       clientIP,
+		RequestID:      requestID,
+		Detail:         JSONB(detail),
 	}); err != nil {
 		return RefreshRotation{}, err
 	}
@@ -159,19 +179,28 @@ func (s *Store) inspectUnusableToken(ctx context.Context, hash []byte) (RefreshR
 }
 
 // RevokeRefreshTokenFamilyByToken invalidates the whole family that owns the
-// presented token. Unknown tokens are a no-op so logout stays idempotent.
-func (s *Store) RevokeRefreshTokenFamilyByToken(ctx context.Context, token string) error {
-	var familyID string
+// presented token and returns the owning username when known. Unknown tokens
+// are a no-op so logout stays idempotent.
+func (s *Store) RevokeRefreshTokenFamilyByToken(ctx context.Context, token string) (string, error) {
+	var row struct {
+		FamilyID string
+		Username string
+	}
 	result := s.db.WithContext(ctx).Raw(`
-		SELECT family_id FROM auth_refresh_tokens
-		 WHERE token_hash = $1`, HashRefreshToken(token)).Scan(&familyID)
+		SELECT t.family_id, COALESCE(u.username, '') AS username
+		  FROM auth_refresh_tokens t
+		  LEFT JOIN auth_users u ON u.id = t.user_id
+		 WHERE t.token_hash = $1`, HashRefreshToken(token)).Scan(&row)
 	if errors.Is(result.Error, gorm.ErrRecordNotFound) || result.RowsAffected == 0 {
-		return nil
+		return "", nil
 	}
 	if result.Error != nil {
-		return fmt.Errorf("lookup refresh token family: %w", result.Error)
+		return "", fmt.Errorf("lookup refresh token family: %w", result.Error)
 	}
-	return s.RevokeTokenFamily(ctx, familyID)
+	if err := s.RevokeTokenFamily(ctx, row.FamilyID); err != nil {
+		return "", err
+	}
+	return row.Username, nil
 }
 
 // RevokeAllUserRefreshTokens invalidates every active token family of a user.
@@ -201,8 +230,8 @@ func (s *Store) RevokeTokenFamily(ctx context.Context, familyID string) error {
 	return nil
 }
 
-func (s *Store) insertRefreshToken(
-	ctx context.Context,
+func (s *Store) insertRefreshTokenDB(
+	db *gorm.DB,
 	userID, familyID string,
 	familyStartedAt time.Time,
 	ttl, maxLifetime time.Duration,
@@ -220,7 +249,7 @@ func (s *Store) insertRefreshToken(
 	if !expiresAt.After(now) {
 		return RefreshRotation{}, ErrInvalidRefreshToken
 	}
-	result := s.db.WithContext(ctx).Exec(`
+	result := db.Exec(`
 		INSERT INTO auth_refresh_tokens
 		    (user_id, family_id, family_started_at, token_hash, issued_at,
 		     expires_at, client_ip, user_agent)

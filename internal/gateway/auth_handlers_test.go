@@ -34,7 +34,7 @@ func (s *stubAuthService) Refresh(context.Context, string, string, string, strin
 	return s.session, s.refreshErr
 }
 
-func (s *stubAuthService) Logout(context.Context, string, string) error { return s.logoutErr }
+func (s *stubAuthService) Logout(context.Context, string, string, string) error { return s.logoutErr }
 
 func (s *stubAuthService) ChangePassword(context.Context, string, string, string, string, string) error {
 	return s.changeErr

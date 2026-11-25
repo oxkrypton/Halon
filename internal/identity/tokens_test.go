@@ -19,13 +19,15 @@ func rotateRows(familyStartedAt time.Time) *sqlmock.Rows {
 
 func emptyConsume(t *testing.T, mock sqlmock.Sqlmock, hash []byte) {
 	t.Helper()
+	mock.ExpectBegin()
 	mock.ExpectQuery(`UPDATE auth_refresh_tokens SET used_at = NOW\(\) WHERE token_hash = \$1`).
 		WithArgs(hash).
 		WillReturnRows(sqlmock.NewRows([]string{"user_id", "family_id", "family_started_at", "expires_at"}))
+	mock.ExpectRollback()
 }
 
 func expectInspect(mock sqlmock.Sqlmock, hash []byte) *sqlmock.ExpectedQuery {
-	return mock.ExpectQuery(`SELECT user_id, family_id, used_at, revoked_at, expires_at FROM auth_refresh_tokens WHERE token_hash = \$1`).
+	return mock.ExpectQuery(`SELECT t\.user_id, COALESCE\(u\.username, ''\) AS username, t\.family_id, t\.used_at, t\.revoked_at, t\.expires_at FROM auth_refresh_tokens t LEFT JOIN auth_users u ON u\.id = t\.user_id WHERE t\.token_hash = \$1`).
 		WithArgs(hash)
 }
 
@@ -65,6 +67,7 @@ func TestRotateRefreshTokenSuccess(t *testing.T) {
 	hash := identity.HashRefreshToken(rawValue)
 	startedAt := time.Now().UTC().Add(-time.Minute)
 
+	mock.ExpectBegin()
 	mock.ExpectQuery(`UPDATE auth_refresh_tokens SET used_at = NOW\(\) WHERE token_hash = \$1`).
 		WithArgs(hash).
 		WillReturnRows(rotateRows(startedAt))
@@ -72,9 +75,10 @@ func TestRotateRefreshTokenSuccess(t *testing.T) {
 		WithArgs("user-uuid", "family-uuid", startedAt, sqlmock.AnyArg(),
 			sqlmock.AnyArg(), sqlmock.AnyArg(), "10.0.0.4", "test-agent").
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
 
 	rotation, err := store.RotateRefreshToken(context.Background(), rawValue,
-		15*time.Minute, 24*time.Hour, "10.0.0.4", "test-agent")
+		15*time.Minute, 24*time.Hour, "10.0.0.4", "test-agent", "req-rotate")
 	if err != nil {
 		t.Fatalf("rotate token: %v", err)
 	}
@@ -98,6 +102,7 @@ func TestRotateRefreshTokenHonorsFamilyLifetime(t *testing.T) {
 	hash := identity.HashRefreshToken(rawValue)
 	startedAt := time.Now().UTC().Add(-13 * time.Minute)
 
+	mock.ExpectBegin()
 	mock.ExpectQuery(`UPDATE auth_refresh_tokens SET used_at = NOW\(\) WHERE token_hash = \$1`).
 		WithArgs(hash).
 		WillReturnRows(rotateRows(startedAt))
@@ -105,10 +110,11 @@ func TestRotateRefreshTokenHonorsFamilyLifetime(t *testing.T) {
 		WithArgs("user-uuid", "family-uuid", startedAt, sqlmock.AnyArg(),
 			sqlmock.AnyArg(), sqlmock.AnyArg(), "", "").
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
 
 	before := time.Now().UTC()
 	rotation, err := store.RotateRefreshToken(context.Background(), rawValue,
-		15*time.Minute, 20*time.Minute, "", "")
+		15*time.Minute, 20*time.Minute, "", "", "")
 	after := time.Now().UTC().Add(15 * time.Minute)
 	if err != nil {
 		t.Fatalf("rotate token: %v", err)
@@ -134,10 +140,10 @@ func TestRotateRefreshTokenWithinGracePeriod(t *testing.T) {
 
 	emptyConsume(t, mock, hash)
 	expectInspect(mock, hash).WillReturnRows(
-		sqlmock.NewRows([]string{"user_id", "family_id", "used_at", "revoked_at", "expires_at"}).
-			AddRow("user-uuid", "family-uuid", usedAt, nil, time.Now().UTC().Add(time.Hour)))
+		sqlmock.NewRows([]string{"user_id", "username", "family_id", "used_at", "revoked_at", "expires_at"}).
+			AddRow("user-uuid", "alice", "family-uuid", usedAt, nil, time.Now().UTC().Add(time.Hour)))
 
-	_, err := store.RotateRefreshToken(context.Background(), rawValue, 15*time.Minute, 24*time.Hour, "", "")
+	_, err := store.RotateRefreshToken(context.Background(), rawValue, 15*time.Minute, 24*time.Hour, "", "", "")
 	if !errors.Is(err, identity.ErrInvalidRefreshToken) {
 		t.Fatalf("error = %v, want ErrInvalidRefreshToken", err)
 	}
@@ -156,25 +162,72 @@ func TestRotateRefreshTokenDetectsReuseAndRevokesFamily(t *testing.T) {
 
 	emptyConsume(t, mock, hash)
 	expectInspect(mock, hash).WillReturnRows(
-		sqlmock.NewRows([]string{"user_id", "family_id", "used_at", "revoked_at", "expires_at"}).
-			AddRow("user-uuid", "family-uuid", usedAt, nil, time.Now().UTC().Add(time.Hour)))
+		sqlmock.NewRows([]string{"user_id", "username", "family_id", "used_at", "revoked_at", "expires_at"}).
+			AddRow("user-uuid", "alice", "family-uuid", usedAt, nil, time.Now().UTC().Add(time.Hour)))
 	mock.ExpectExec(`UPDATE auth_refresh_tokens SET revoked_at = NOW\(\) WHERE family_id = \$1`).
 		WithArgs("family-uuid").
 		WillReturnResult(sqlmock.NewResult(0, 2))
 	mock.ExpectBegin()
 	mock.ExpectQuery(`INSERT INTO "auth_events"`).
-		WithArgs(identity.EventRefreshReuseDetected, identity.EventResultFailure, "", "", "", "",
+		WithArgs(identity.EventRefreshReuseDetected, identity.EventResultFailure, "", "alice", "10.0.0.8", "req-reuse",
 			`{"family_id":"family-uuid","user_id":"user-uuid"}`).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(1))
 	mock.ExpectCommit()
 
-	_, err := store.RotateRefreshToken(context.Background(), rawValue, 15*time.Minute, 24*time.Hour, "", "")
+	_, err := store.RotateRefreshToken(context.Background(), rawValue, 15*time.Minute, 24*time.Hour, "10.0.0.8", "ua", "req-reuse")
 	if !errors.Is(err, identity.ErrRefreshTokenReuse) {
 		t.Fatalf("error = %v, want ErrRefreshTokenReuse", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestRotateRefreshTokenRollsBackOnInsertFailure(t *testing.T) {
+	t.Parallel()
+
+	t.Run("max_lifetime_exhausted", func(t *testing.T) {
+		store, mock := newMockStore(t)
+		rawValue := "expired-family-token"
+		hash := identity.HashRefreshToken(rawValue)
+		startedAt := time.Now().UTC().Add(-2 * time.Hour)
+
+		mock.ExpectBegin()
+		mock.ExpectQuery(`UPDATE auth_refresh_tokens SET used_at = NOW\(\) WHERE token_hash = \$1`).
+			WithArgs(hash).
+			WillReturnRows(rotateRows(startedAt))
+		mock.ExpectRollback()
+
+		_, err := store.RotateRefreshToken(context.Background(), rawValue, 15*time.Minute, time.Hour, "", "", "")
+		if !errors.Is(err, identity.ErrInvalidRefreshToken) {
+			t.Fatalf("error = %v, want ErrInvalidRefreshToken", err)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("insert_error", func(t *testing.T) {
+		store, mock := newMockStore(t)
+		rawValue := "db-error-token"
+		hash := identity.HashRefreshToken(rawValue)
+		startedAt := time.Now().UTC().Add(-time.Minute)
+
+		mock.ExpectBegin()
+		mock.ExpectQuery(`UPDATE auth_refresh_tokens SET used_at = NOW\(\) WHERE token_hash = \$1`).
+			WithArgs(hash).
+			WillReturnRows(rotateRows(startedAt))
+		mock.ExpectExec(`INSERT INTO auth_refresh_tokens`).
+			WillReturnError(errors.New("insert failed"))
+		mock.ExpectRollback()
+
+		if _, err := store.RotateRefreshToken(context.Background(), rawValue, 15*time.Minute, 24*time.Hour, "", "", ""); err == nil {
+			t.Fatal("expected error when insert fails")
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatal(err)
+		}
+	})
 }
 
 func TestRotateRefreshTokenRejectsUnknownExpiredAndRevoked(t *testing.T) {
@@ -186,8 +239,8 @@ func TestRotateRefreshTokenRejectsUnknownExpiredAndRevoked(t *testing.T) {
 		hash := identity.HashRefreshToken(rawValue)
 		emptyConsume(t, mock, hash)
 		expectInspect(mock, hash).WillReturnRows(
-			sqlmock.NewRows([]string{"user_id", "family_id", "used_at", "revoked_at", "expires_at"}))
-		_, err := store.RotateRefreshToken(context.Background(), rawValue, 15*time.Minute, 24*time.Hour, "", "")
+			sqlmock.NewRows([]string{"user_id", "username", "family_id", "used_at", "revoked_at", "expires_at"}))
+		_, err := store.RotateRefreshToken(context.Background(), rawValue, 15*time.Minute, 24*time.Hour, "", "", "")
 		if !errors.Is(err, identity.ErrInvalidRefreshToken) {
 			t.Fatalf("error = %v, want ErrInvalidRefreshToken", err)
 		}
@@ -202,9 +255,9 @@ func TestRotateRefreshTokenRejectsUnknownExpiredAndRevoked(t *testing.T) {
 		hash := identity.HashRefreshToken(rawValue)
 		emptyConsume(t, mock, hash)
 		expectInspect(mock, hash).WillReturnRows(
-			sqlmock.NewRows([]string{"user_id", "family_id", "used_at", "revoked_at", "expires_at"}).
-				AddRow("user-uuid", "family-uuid", nil, nil, time.Now().UTC().Add(-time.Hour)))
-		_, err := store.RotateRefreshToken(context.Background(), rawValue, 15*time.Minute, 24*time.Hour, "", "")
+			sqlmock.NewRows([]string{"user_id", "username", "family_id", "used_at", "revoked_at", "expires_at"}).
+				AddRow("user-uuid", "alice", "family-uuid", nil, nil, time.Now().UTC().Add(-time.Hour)))
+		_, err := store.RotateRefreshToken(context.Background(), rawValue, 15*time.Minute, 24*time.Hour, "", "", "")
 		if !errors.Is(err, identity.ErrInvalidRefreshToken) {
 			t.Fatalf("error = %v, want ErrInvalidRefreshToken", err)
 		}
@@ -220,9 +273,9 @@ func TestRotateRefreshTokenRejectsUnknownExpiredAndRevoked(t *testing.T) {
 		revokedAt := time.Now().UTC().Add(-time.Minute)
 		emptyConsume(t, mock, hash)
 		expectInspect(mock, hash).WillReturnRows(
-			sqlmock.NewRows([]string{"user_id", "family_id", "used_at", "revoked_at", "expires_at"}).
-				AddRow("user-uuid", "family-uuid", nil, revokedAt, time.Now().UTC().Add(time.Hour)))
-		_, err := store.RotateRefreshToken(context.Background(), rawValue, 15*time.Minute, 24*time.Hour, "", "")
+			sqlmock.NewRows([]string{"user_id", "username", "family_id", "used_at", "revoked_at", "expires_at"}).
+				AddRow("user-uuid", "alice", "family-uuid", nil, revokedAt, time.Now().UTC().Add(time.Hour)))
+		_, err := store.RotateRefreshToken(context.Background(), rawValue, 15*time.Minute, 24*time.Hour, "", "", "")
 		if !errors.Is(err, identity.ErrInvalidRefreshToken) {
 			t.Fatalf("error = %v, want ErrInvalidRefreshToken", err)
 		}

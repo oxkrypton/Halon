@@ -21,7 +21,7 @@ const maxAuthBodyBytes = 8 << 10
 type AuthService interface {
 	Login(ctx context.Context, username, password, clientIP, userAgent, requestID string) (*identity.Session, error)
 	Refresh(ctx context.Context, token, clientIP, userAgent, requestID string) (*identity.Session, error)
-	Logout(ctx context.Context, token, requestID string) error
+	Logout(ctx context.Context, token, clientIP, requestID string) error
 	ChangePassword(ctx context.Context, userID, currentPassword, newPassword, clientIP, requestID string) error
 }
 
@@ -129,7 +129,7 @@ func logoutHandler(service AuthService, logger *slog.Logger) gin.HandlerFunc {
 			abortWithError(c, http.StatusBadRequest, "INVALID_REQUEST", "refresh_token is required")
 			return
 		}
-		if err := service.Logout(c.Request.Context(), request.RefreshToken, requestIDFromContext(c)); err != nil {
+		if err := service.Logout(c.Request.Context(), request.RefreshToken, c.ClientIP(), requestIDFromContext(c)); err != nil {
 			logAuthError(logger, "logout", c, err)
 			abortWithError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "internal server error")
 			return

@@ -45,9 +45,9 @@ type AuthStore interface {
 	RecordSuccessfulLogin(ctx context.Context, username string, at time.Time) error
 	RecordAuthEvent(ctx context.Context, event AuthEvent) error
 	IssueRefreshToken(ctx context.Context, userID string, ttl, maxLifetime time.Duration, clientIP, userAgent string) (RefreshRotation, error)
-	RotateRefreshToken(ctx context.Context, token string, ttl, maxLifetime time.Duration, clientIP, userAgent string) (RefreshRotation, error)
+	RotateRefreshToken(ctx context.Context, token string, ttl, maxLifetime time.Duration, clientIP, userAgent, requestID string) (RefreshRotation, error)
 	RevokeTokenFamily(ctx context.Context, familyID string) error
-	RevokeRefreshTokenFamilyByToken(ctx context.Context, token string) error
+	RevokeRefreshTokenFamilyByToken(ctx context.Context, token string) (string, error)
 }
 
 var _ AuthStore = (*Store)(nil)
@@ -200,7 +200,7 @@ func (s *Service) Refresh(
 	token, clientIP, userAgent, requestID string,
 ) (*Session, error) {
 	rotation, err := s.store.RotateRefreshToken(ctx, token,
-		s.cfg.RefreshTokenTTL, s.cfg.RefreshMaxLifetime, clientIP, userAgent)
+		s.cfg.RefreshTokenTTL, s.cfg.RefreshMaxLifetime, clientIP, userAgent, requestID)
 	if err != nil {
 		if errors.Is(err, ErrInvalidRefreshToken) || errors.Is(err, ErrRefreshTokenReuse) {
 			return nil, ErrInvalidRefreshToken
@@ -229,11 +229,12 @@ func (s *Service) Refresh(
 
 // Logout revokes the entire token family that owns the presented refresh
 // token. Unknown tokens are a no-op, so logout is safe to retry.
-func (s *Service) Logout(ctx context.Context, token, requestID string) error {
-	if err := s.store.RevokeRefreshTokenFamilyByToken(ctx, token); err != nil {
+func (s *Service) Logout(ctx context.Context, token, clientIP, requestID string) error {
+	username, err := s.store.RevokeRefreshTokenFamilyByToken(ctx, token)
+	if err != nil {
 		return fmt.Errorf("logout: %w", err)
 	}
-	s.auditSuccess(ctx, EventLogout, "", "", "", requestID)
+	s.auditSuccess(ctx, EventLogout, username, username, clientIP, requestID)
 	return nil
 }
 
