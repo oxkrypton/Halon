@@ -188,3 +188,56 @@ func TestHealthAndReadiness(t *testing.T) {
 		t.Fatalf("readyz with db down: status = %d, want 503", response.Code)
 	}
 }
+
+func TestIngestSuppressesStormAndRecordsMetrics(t *testing.T) {
+	t.Parallel()
+
+	gin.SetMode(gin.TestMode)
+	store := &stubReportStore{}
+	metrics := NewMetrics()
+	orchestrator := newTestOrchestratorWithOptions(finalMessageModel("ok"), store, OrchestratorOptions{
+		CoalesceCooldown: 5 * time.Minute,
+	})
+	router := NewHTTPHandler(ServerDeps{
+		Orchestrator: orchestrator,
+		Deduper:      incident.NewDeduper(time.Minute),
+		Reports:      &stubReportReader{},
+		IngestToken:  testIngestToken,
+		Logger:       testLogger(),
+		Metrics:      metrics,
+	})
+
+	// 1) First event on route -> 202 accepted.
+	first := postEvent(t, router, testIngestToken, validEventBody())
+	if first.Code != http.StatusAccepted || !strings.Contains(first.Body.String(), `"suppressed":false`) {
+		t.Fatalf("first = %d %s", first.Code, first.Body.String())
+	}
+
+	// 2) Same event_id retried -> 200 duplicate.
+	dup := postEvent(t, router, testIngestToken, validEventBody())
+	if dup.Code != http.StatusOK || !strings.Contains(dup.Body.String(), `"duplicate":true`) {
+		t.Fatalf("dup = %d %s", dup.Code, dup.Body.String())
+	}
+
+	// 3) Different event_id on same route -> 200 suppressed, pointing to evt-100.
+	secondBody := strings.Replace(validEventBody(), "evt-100", "evt-101", 1)
+	sup := postEvent(t, router, testIngestToken, secondBody)
+	if sup.Code != http.StatusOK || !strings.Contains(sup.Body.String(), `"suppressed":true`) || !strings.Contains(sup.Body.String(), `"incident_id":"evt-100"`) {
+		t.Fatalf("suppressed = %d %s", sup.Code, sup.Body.String())
+	}
+
+	// 4) Prometheus /metrics reports all three admission outcomes.
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	body := rec.Body.String()
+	for _, want := range []string{
+		`halon_agent_incident_admissions_total{outcome="accepted"} 1`,
+		`halon_agent_incident_admissions_total{outcome="duplicate"} 1`,
+		`halon_agent_incident_admissions_total{outcome="suppressed"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("metrics missing %q:\n%s", want, body)
+		}
+	}
+}

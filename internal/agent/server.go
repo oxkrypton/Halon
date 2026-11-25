@@ -90,12 +90,17 @@ func ingestTimeout(deps ServerDeps, logger *slog.Logger) gin.HandlerFunc {
 			return
 		}
 		if deps.Deduper != nil && deps.Deduper.Seen(event.EventID) {
-			c.JSON(http.StatusOK, gin.H{"event_id": event.EventID, "accepted": false, "duplicate": true})
+			deps.Metrics.IncIncidentAdmission(AdmissionDuplicate)
+			c.JSON(http.StatusOK, gin.H{"event_id": event.EventID, "accepted": false, "duplicate": true, "suppressed": false})
 			return
 		}
-		duplicate, err := deps.Orchestrator.Submit(c.Request.Context(), event)
+		result, err := deps.Orchestrator.Submit(c.Request.Context(), event)
 		if errors.Is(err, ErrQueueFull) {
 			abortWithAPIError(c, http.StatusServiceUnavailable, "QUEUE_FULL", "too many incidents are waiting for investigation; retry later")
+			return
+		}
+		if errors.Is(err, ErrOrchestratorClosed) {
+			abortWithAPIError(c, http.StatusServiceUnavailable, "AGENT_SHUTTING_DOWN", "agent is shutting down")
 			return
 		}
 		if err != nil {
@@ -103,11 +108,29 @@ func ingestTimeout(deps ServerDeps, logger *slog.Logger) gin.HandlerFunc {
 			abortWithAPIError(c, http.StatusInternalServerError, "SUBMIT_FAILED", "failed to queue the incident")
 			return
 		}
-		if duplicate {
-			c.JSON(http.StatusOK, gin.H{"event_id": event.EventID, "accepted": false, "duplicate": true})
-			return
+		switch result.Outcome {
+		case SubmitDuplicate:
+			deps.Metrics.IncIncidentAdmission(AdmissionDuplicate)
+			c.JSON(http.StatusOK, gin.H{"event_id": event.EventID, "accepted": false, "duplicate": true, "suppressed": false})
+		case SubmitSuppressed:
+			deps.Metrics.IncIncidentAdmission(AdmissionSuppressed)
+			c.JSON(http.StatusOK, gin.H{
+				"event_id":    event.EventID,
+				"incident_id": result.IncidentID,
+				"accepted":    false,
+				"duplicate":   false,
+				"suppressed":  true,
+			})
+		default:
+			deps.Metrics.IncIncidentAdmission(AdmissionAccepted)
+			c.JSON(http.StatusAccepted, gin.H{
+				"event_id":    event.EventID,
+				"incident_id": result.IncidentID,
+				"accepted":    true,
+				"duplicate":   false,
+				"suppressed":  false,
+			})
 		}
-		c.JSON(http.StatusAccepted, gin.H{"event_id": event.EventID, "accepted": true, "duplicate": false})
 	}
 }
 

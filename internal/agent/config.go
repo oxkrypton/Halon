@@ -43,6 +43,12 @@ type Config struct {
 	OpenAITimeout   time.Duration
 	ShutdownTimeout time.Duration
 
+	// Per-route storm suppression and settle delay. CoalesceCooldown == 0
+	// disables route suppression; SettleDelay == 0 enqueues immediately.
+	CoalesceCooldown time.Duration
+	RetryBackoff     time.Duration
+	SettleDelay      time.Duration
+
 	// Shared state (optional). RedisURL empty keeps the single-replica
 	// in-memory mode; non-empty enables the shared multi-replica mode.
 	RedisURL         string
@@ -75,6 +81,9 @@ func LoadConfig() (Config, error) {
 		RecoveryMaxAge:      30 * time.Minute,
 		OpenAITimeout:       60 * time.Second,
 		ShutdownTimeout:     30 * time.Second,
+		CoalesceCooldown:    5 * time.Minute,
+		RetryBackoff:        time.Minute,
+		SettleDelay:         15 * time.Second,
 		RedisURL:            os.Getenv("REDIS_URL"),
 		RedisDialTimeout:    time.Second,
 		RedisOpTimeout:      500 * time.Millisecond,
@@ -117,6 +126,19 @@ func LoadConfig() (Config, error) {
 	if cfg.ShutdownTimeout, err = envDuration("SHUTDOWN_TIMEOUT", cfg.ShutdownTimeout); err != nil {
 		return Config{}, err
 	}
+	if cfg.CoalesceCooldown, err = envDuration("INCIDENT_COALESCE_COOLDOWN", cfg.CoalesceCooldown); err != nil {
+		return Config{}, err
+	}
+	defaultRetryBackoff := cfg.RetryBackoff
+	if cfg.CoalesceCooldown >= 0 && cfg.CoalesceCooldown < defaultRetryBackoff {
+		defaultRetryBackoff = cfg.CoalesceCooldown
+	}
+	if cfg.RetryBackoff, err = envDuration("INCIDENT_RETRY_BACKOFF", defaultRetryBackoff); err != nil {
+		return Config{}, err
+	}
+	if cfg.SettleDelay, err = envDuration("INCIDENT_SETTLE_DELAY", cfg.SettleDelay); err != nil {
+		return Config{}, err
+	}
 	if cfg.RedisDialTimeout, err = envDuration("REDIS_DIAL_TIMEOUT", cfg.RedisDialTimeout); err != nil {
 		return Config{}, err
 	}
@@ -154,6 +176,12 @@ func LoadConfig() (Config, error) {
 	}
 	if cfg.RunTimeout <= 0 || cfg.DedupTTL <= 0 || cfg.OpenAITimeout <= 0 || cfg.ShutdownTimeout <= 0 || cfg.RecoveryMaxAge <= 0 {
 		validationErrors = append(validationErrors, errors.New("timeouts, dedup TTL, and recovery max age must be positive"))
+	}
+	if cfg.CoalesceCooldown < 0 || cfg.RetryBackoff < 0 || cfg.SettleDelay < 0 {
+		validationErrors = append(validationErrors, errors.New("incident suppression cooldown, retry backoff, and settle delay must be non-negative"))
+	}
+	if cfg.CoalesceCooldown > 0 && cfg.RetryBackoff > cfg.CoalesceCooldown {
+		validationErrors = append(validationErrors, errors.New("INCIDENT_RETRY_BACKOFF must not exceed INCIDENT_COALESCE_COOLDOWN"))
 	}
 	if cfg.RedisURL != "" {
 		if _, err := redis.ParseURL(cfg.RedisURL); err != nil {

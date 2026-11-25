@@ -104,13 +104,21 @@ func run(logger *slog.Logger) error {
 
 	model := agent.NewOpenAIClient(cfg.OpenAIBaseURL, cfg.OpenAIAPIKey, cfg.OpenAIModel, cfg.OpenAITimeout)
 	loop := agent.NewLoop(model, registry, cfg.MaxSteps, cfg.MaxToolOutput, cfg.MaxStoredToolOutput, logger)
+	var routeSuppressor agent.RouteSuppressor
+	if cfg.CoalesceCooldown > 0 && redisClient != nil {
+		routeSuppressor = agent.NewRedisRouteSuppressor(redisClient, cfg.RedisOpTimeout, logger, metrics.SetRedisUp)
+	}
 	orchestrator := agent.NewOrchestrator(loop, store, agent.OrchestratorOptions{
-		Level:          cfg.OperationLevel,
-		Workers:        cfg.Workers,
-		QueueSize:      cfg.QueueSize,
-		RunTimeout:     cfg.RunTimeout,
-		RecoveryMaxAge: cfg.RecoveryMaxAge,
-		Logger:         logger,
+		Level:            cfg.OperationLevel,
+		Workers:          cfg.Workers,
+		QueueSize:        cfg.QueueSize,
+		RunTimeout:       cfg.RunTimeout,
+		RecoveryMaxAge:   cfg.RecoveryMaxAge,
+		CoalesceCooldown: cfg.CoalesceCooldown,
+		RetryBackoff:     cfg.RetryBackoff,
+		SettleDelay:      cfg.SettleDelay,
+		Suppressor:       routeSuppressor,
+		Logger:           logger,
 	})
 	orchestratorDone := make(chan struct{})
 	go func() {
