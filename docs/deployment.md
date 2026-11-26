@@ -36,18 +36,17 @@ make deploy-observability   # kubectl apply -f deploy/kubernetes/observability/
 | 组件 | 角色 | 访问方式 |
 | --- | --- | --- |
 | OTel Collector | 接收网关 OTLP traces(4317/4318),转发 Tempo | 集群内服务 |
-| Tempo | 追踪存储(单二进制,本地存储,保留 24h) | 经 Grafana 查询 |
-| Loki | 日志存储(单二进制,保留 72h) | 经 Grafana 查询 |
+| Tempo | 追踪存储(单二进制,本地存储,保留 24h) | Web 控制台 Traces 页面(`TEMPO_URL`)或 HTTP API `:3200` |
+| Loki | 日志存储(单二进制,保留 72h) | HTTP API / `logcli`:`kubectl port-forward -n observability service/loki 3100:3100` |
 | Alloy | 每节点日志采集(Kubernetes API,只采 `app.kubernetes.io/part-of=halon` 的 Pod) | DaemonSet |
 | Prometheus | 抓取 `gateway-admin:9090/metrics`,评估告警规则 | 集群内服务 |
 | Alertmanager | 告警分组路由(默认无 receiver,需自行配置通知渠道) | 集群内服务 |
-| Grafana | 看板与三信号关联查询,预置「Halon Gateway」看板 | `kubectl port-forward -n observability service/grafana 3000:3000`,默认 admin / `halon-admin`(生产必改) |
 
-启用追踪:部署栈后,在 `gateway.yaml` 打开 `OTEL_ENABLED=true`(清单里有注释好的示例)并 `kubectl rollout restart deployment/gateway`。之后:Loki 日志行的 `trace_id` 可一键跳到 Tempo 追踪,Grafana Explore 三信号互通。若在 `gateway.yaml` 同时设置 `TEMPO_URL=http://tempo.observability.svc.cluster.local:3200`,Web 管理控制台的 Traces 页面也会自动读取 Tempo 分布式链路(未设置时自动降级为基于 PostgreSQL 的网关+上游瀑布流)。
+启用追踪:部署栈后,在 `gateway.yaml` 打开 `OTEL_ENABLED=true`(清单里有注释好的示例)并 `kubectl rollout restart deployment/gateway`。之后网关 JSON 日志行携带 `trace_id`,可据此在 Tempo 中定位对应追踪。若在 `gateway.yaml` 同时设置 `TEMPO_URL=http://tempo.observability.svc.cluster.local:3200`,Web 管理控制台的 Traces 页面也会自动读取 Tempo 分布式链路(未设置时自动降级为基于 PostgreSQL 的网关+上游瀑布流)。
 
 ### 可选 Web 管理控制台(`deploy/kubernetes/web/`)
 
-不依赖 Grafana 即可提供 P50/P95/P99 分位数、类 Jaeger 链路追踪、请求日志、AI 故障报告与网关管控界面,`make deploy` **不**包含它:
+提供 P50/P95/P99 分位数、类 Jaeger 链路追踪、请求日志、AI 故障报告与网关管控界面,`make deploy` **不**包含它:
 
 ```bash
 make docker-build-web

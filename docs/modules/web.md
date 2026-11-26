@@ -4,7 +4,7 @@
 
 ## 定位与技术栈
 
-Google Cloud Console / Cloud Trace 风格的轻量级管理控制台，将 P50/P95/P99 分位数观测、类 Jaeger 链路追踪、慢/错请求日志、Agent AI 故障排查报告与网关管控（熔断、黑名单、限流、本地用户）整合在同一套 RBAC 界面中，**无需部署 Grafana Pod**。
+Google Cloud Console / Cloud Trace 风格的轻量级管理控制台，将 P50/P95/P99 分位数观测、类 Jaeger 链路追踪、慢/错请求日志、Agent AI 故障排查报告与网关管控（熔断、黑名单、限流、本地用户）整合在同一套 RBAC 界面中。
 
 - **前端**:React 19 + TypeScript + Vite 6 + React Router 7 + TanStack Query v5 + Tailwind CSS v4 + Radix UI + Apache ECharts + `react-markdown`。
 - **同源反向代理**:

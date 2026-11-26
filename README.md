@@ -32,7 +32,7 @@ Gin Gateway -- bounded channel --> Batch Writer --> PostgreSQL
                                                    |-- incident_reports
 
 Gin Gateway -- /metrics + OTLP traces + JSON logs --> 可选观测栈
-                                                   (Prometheus / Tempo / Loki / Grafana)
+                                                   (Prometheus / Tempo / Loki)
 
 Gateway Admin (:9090) -- Bearer Token --> blacklist / rate-limit / breakers
 
@@ -419,7 +419,7 @@ kubectl rollout restart deployment/agent
 │   ├── postgres.yaml             # PostgreSQL StatefulSet、Service 和 PVC
 │   ├── redis.yaml                # Redis Deployment 和 Service(开发参考清单)
 │   ├── web/                      # 可选 Web 管理控制台 Deployment 和 Service
-│   └── observability/            # 可选观测栈:OTel Collector、Tempo、Loki、Alloy、Prometheus、Alertmanager、Grafana
+│   └── observability/            # 可选观测栈:OTel Collector、Tempo、Loki、Alloy、Prometheus、Alertmanager
 ├── web/                          # Google 风格 React + TypeScript 管理控制台(Vite + ECharts + Nginx)
 ├── docs/
 │   ├── README.md                 # 文档索引与文档维护规则
