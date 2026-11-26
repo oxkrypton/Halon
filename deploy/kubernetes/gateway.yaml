@@ -102,6 +102,9 @@ spec:
             #   value: "true"
             # - name: OTEL_EXPORTER_OTLP_ENDPOINT
             #   value: otel-collector.observability.svc.cluster.local:4317
+            # Optional Tempo HTTP endpoint for the web console's trace waterfall:
+            # - name: TEMPO_URL
+            #   value: http://tempo.observability.svc.cluster.local:3200
             - name: REDIS_URL
               value: redis://redis:6379/0
           startupProbe:
