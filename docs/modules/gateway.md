@@ -27,10 +27,10 @@
 | `errors.go` | 统一错误响应结构 `abortWithError` 与 `upstream_timeout` 标记键 |
 | `accesslog.go` | `AccessLog` 中间件:采集请求/响应体(各自最多 `BODY_CAPTURE_BYTES`),投递日志队列;检测超时标记并投递超时事件队列;日志字段含 `route`、`trace_id`(启用 OTel 时)、`upstream_result`、`retries`;维护在途请求 gauge 与队列丢弃计数 |
 | `notify.go` | `TimeoutNotifier`:消费超时事件队列,POST JSON 到 `AGENT_WEBHOOK_URL`,带 Bearer Token,最多 3 次指数退避重试;最终失败计入 `halon_gateway_webhook_notify_failures_total` |
-| `rules.go` | `BlacklistStore` 接口(Add/Remove/Contains/List)与 `ErrBlacklistUnavailable`;`IPRules`:内存实现(内存模式),IP 规范化(`canonicalIP`);`BlacklistMiddleware` 拦截并计数拒绝 |
-| `rules_redis.go` | `RedisBlacklistStore`:共享实现——Redis 集合 `halon:blacklist` 为事实源,进程内缓存服务读路径;pub/sub 即时失效 + TTL 兜底刷新;写失败返回 `ErrBlacklistUnavailable`(管理接口 503) |
-| `ratelimit.go` | `RateLimitBackend` 接口(Allow/Update/Settings)与 `ErrRateLimitUnavailable`;`RateLimiter`:内存实现(内存模式),每 IP 独立令牌桶(`golang.org/x/time/rate`);`RateLimitMiddleware` 拦截并计数拒绝 |
-| `ratelimit_redis.go` | `RedisRateLimiter`:共享实现——每 IP 一个令牌桶存 Redis,Lua 脚本原子 refill/扣减(时钟取 Redis `TIME`,副本间无漂移),语义与 `x/time/rate` 一致;参数存 `<prefix>config`(默认 `halon:ratelimit:config`,登录限流通过 `WithRateLimitKeyPrefix("halon:ratelimit:login:")` 隔离),进程内缓存 10s;读失败 fail-open 到内存桶,写失败返回 `ErrRateLimitUnavailable`(管理接口 503) |
+| `rules.go` | `BlacklistStore` 接口(Add/Remove/Contains/List)、`ErrBlacklistUnavailable`、IP 规范化(`canonicalIP`)与 `BlacklistMiddleware` 拦截计数 |
+| `rules_redis.go` | `RedisBlacklistStore`:Redis 集合 `halon:blacklist` 为事实源,进程内缓存服务读路径;pub/sub 即时失效 + TTL 兜底刷新;写失败返回 `ErrBlacklistUnavailable`(管理接口 503) |
+| `ratelimit.go` | `RateLimitBackend` 接口(Allow/Update/Settings)、`ErrRateLimitUnavailable` 与 `RateLimitMiddleware` 拦截计数 |
+| `ratelimit_redis.go` | `RedisRateLimiter`:每 IP 一个令牌桶存 Redis,Lua 脚本原子 refill/扣减(时钟取 Redis `TIME`,副本间无漂移),参数存 `<prefix>config`(默认 `halon:ratelimit:config`,登录限流通过 `WithRateLimitKeyPrefix("halon:ratelimit:login:")` 隔离),进程内缓存 10s;Redis 不可达时读路径 fail-open 放行,写失败返回 `ErrRateLimitUnavailable`(管理接口 503) |
 | `metrics.go` | Prometheus 指标与 `/metrics` Handler(独立 Registry,全部方法 nil-safe) |
 | `request.go` | `RequestID` 中间件(校验/生成)、`Recovery`;Bearer 鉴权已迁到 `internal/authz` |
 | `config.go` | `LoadConfig()`:全部环境变量与启动校验(含 `ROUTES` 语法校验、响应头超时 ≤ 总超时的交叉校验) |
@@ -41,7 +41,7 @@
 
 ```text
 请求 → RequestID → AccessLog → Recovery → 无静态路由命中
-  → NoRoute:IPRules.Middleware → RateLimiter.Middleware → ProxyHandler
+  → NoRoute:BlacklistMiddleware → RateLimitMiddleware → ProxyHandler
   → 最长前缀匹配 ROUTES → 请求体上限(MaxBytesReader) → 重试资格判定(幂等方法/Idempotency-Key + 体缓冲)
   → httputil.ReverseProxy → failsafe 策略链:bulkhead(并发上限)→ circuit breaker(熔断)→ retry(可选)
   → observingTransport(上游指标/结果) → http.Transport(拨号/TLS/响应头分阶段超时)
@@ -69,20 +69,19 @@ ProxyHandler 带 UPSTREAM_TIMEOUT 的 context 调上游
 
 `AGENT_WEBHOOK_URL` 为空时整个超时事件链路不启用(队列不创建,事件直接不生成)。
 
-### 共享模式(可选,`REDIS_URL` 非空时启用)
+### Redis 状态后端(黑名单与限流)
 
-黑名单外迁到 Redis,事实源是集合 `halon:blacklist`:
+黑名单存储在 Redis 集合 `halon:blacklist`:
 
 - **读路径零 Redis 往返**:每请求只查进程内缓存;两级失效——pub/sub 频道 `halon:blacklist:invalidate` 即时通知 + `BLACKLIST_CACHE_TTL`(默认 10s)兜底刷新,消息丢失由 TTL 兜住;
 - **生效窗口**:新增/解除封禁最坏 10s 内在全部副本生效;管理接口写响应带 `propagation: "eventually, <=10s"`,不承诺实时。需要即时生效时经 `kubectl port-forward` 逐 Pod 调管理接口(见 `docs/deployment.md`);
-- **降级**:Redis 不可达时读路径退化为最后一份缓存,`halon_gateway_redis_up` 归 0;写操作返回 503 `BLACKLIST_UNAVAILABLE`(安全功能不允许"看似写成功");
-- 滚动升级期间内存/共享副本并存,上述收敛承诺仅在全部副本进入共享模式后成立。
+- **降级**:Redis 不可达时读路径退化为最后一份缓存,`halon_gateway_redis_up` 归 0;写操作返回 503 `BLACKLIST_UNAVAILABLE`(安全功能不允许"看似写成功")。
 
-限流同样外迁,N 副本合计限流量严格等于配置值(不再是配置 ×N):
+限流由 Redis Lua 令牌桶承载,多副本合计限流量严格等于配置值:
 
 - **Lua 令牌桶**:每请求一次脚本往返,refill/扣减在 Redis 内原子完成,时钟取 Redis `TIME`;key 带 TTL(补满空桶时间 + 60s),空闲自动回收;
 - **参数动态调整**:`PUT /admin/rules/rate-limit` 改写 `halon:ratelimit:config`,各副本 10s 配置缓存内生效,无需逐副本进进程;
-- **降级**:Redis 不可达时放行判断 fail-open 到进程内令牌桶(防护弱于拒绝服务,但网关不可用更糟),`halon_gateway_redis_up` 归 0;参数更新返回 503 `RATELIMIT_UNAVAILABLE`。
+- **降级**:Redis 不可达时 `Allow` fail-open 放行并打告警日志,`halon_gateway_redis_up` 归 0;参数更新返回 503 `RATELIMIT_UNAVAILABLE`。
 
 ### 优雅退出顺序(`cmd/gateway/main.go`)
 
@@ -90,7 +89,7 @@ ProxyHandler 带 UPSTREAM_TIMEOUT 的 context 调上游
 
 ## 配置(环境变量)
 
-完整表格见根 `README.md` 的「网关配置」。必填:`DATABASE_DSN`;`ADMIN_TOKEN`(≥12 字符)在 `legacy`/`hybrid` 下必填,`jwt` 模式下可为空。`ROUTES` 为空是合法的(网关只提供探针,业务请求一律 404);设置 `AGENT_WEBHOOK_URL` 时 `AGENT_WEBHOOK_TOKEN` 必填(≥12 字符)。鉴权模式与公钥见 [auth.md](auth.md)。
+完整表格见根 `README.md` 的「网关配置」。必填:`DATABASE_DSN`、`REDIS_URL`;`ADMIN_TOKEN`(≥12 字符)在 `legacy`/`hybrid` 下必填,`jwt` 模式下可为空。`ROUTES` 为空是合法的(网关只提供探针,业务请求一律 404);设置 `AGENT_WEBHOOK_URL` 时 `AGENT_WEBHOOK_TOKEN` 必填(≥12 字符)。鉴权模式与公钥见 [auth.md](auth.md)。
 
 弹性与可观测性配置要点:
 
@@ -103,7 +102,7 @@ ProxyHandler 带 UPSTREAM_TIMEOUT 的 context 调上游
 ## 错误语义
 
 - 上游响应(包括 4xx/5xx)**原样透传**,网关不包装;
-- 网关自身错误统一 `{error:{code,message,request_id}}`:401 `UNAUTHORIZED` / 403 `FORBIDDEN`(管理接口鉴权,见 [auth.md](auth.md))、404 `ROUTE_NOT_FOUND`、403 `IP_BLOCKED`、429 `RATE_LIMITED` / `CONCURRENCY_LIMIT`、413 `REQUEST_TOO_LARGE`、503 `UPSTREAM_UNAVAILABLE`(熔断开启,带 `Retry-After`)、503 `BLACKLIST_UNAVAILABLE` / `RATELIMIT_UNAVAILABLE`(共享模式写时 Redis 不可达)、504 `UPSTREAM_TIMEOUT`(同时触发超时事件)、502 `UPSTREAM_ERROR`。
+- 网关自身错误统一 `{error:{code,message,request_id}}`:401 `UNAUTHORIZED` / 403 `FORBIDDEN`(管理接口鉴权,见 [auth.md](auth.md))、404 `ROUTE_NOT_FOUND`、403 `IP_BLOCKED`、429 `RATE_LIMITED` / `CONCURRENCY_LIMIT`、413 `REQUEST_TOO_LARGE`、503 `UPSTREAM_UNAVAILABLE`(熔断开启,带 `Retry-After`)、503 `BLACKLIST_UNAVAILABLE` / `RATELIMIT_UNAVAILABLE`(Redis 不可达时的写操作)、504 `UPSTREAM_TIMEOUT`(同时触发超时事件)、502 `UPSTREAM_ERROR`。
 
 ## 指标清单(`/metrics`,管理端口)
 
@@ -125,11 +124,11 @@ ProxyHandler 带 UPSTREAM_TIMEOUT 的 context 调上游
 | `halon_gateway_circuit_breaker_trips_total` | Counter | route | 熔断触发次数 |
 | `halon_gateway_trafficlog_dropped_total` / `halon_gateway_timeout_events_dropped_total` | Counter | — | 有界队列丢弃 |
 | `halon_gateway_webhook_notify_failures_total` | Counter | — | 超时事件推送 Agent 最终失败 |
-| `halon_gateway_redis_up` | Gauge | — | 共享模式 Redis 可达性(内存模式恒 1) |
+| `halon_gateway_redis_up` | Gauge | — | Redis 可达性(1=可达,0=降级) |
 
 ## 测试
 
-`auth_test.go`(管理接口角色×端点矩阵、legacy/hybrid/jwt 模式、审计指标)、`auth_handlers_test.go`(登录/刷新/登出/改密/限流/禁用态)、`user_handlers_test.go`(用户管理角色矩阵、UUID 与字段校验、脱敏与错误映射)、`server_test.go`(代理转发/透传/超时/不可达/404、路由表解析、探针、管理接口、限流)、`observability_test.go`(超时事件与指标、webhook 投递)、`resilience_test.go`(重试与体重放、熔断迁移与 503 快速失败、bulkhead 打满 429、请求体上限 413、响应头超时归类 504、`/metrics` 鉴权、`/admin/breakers`;上游传输用桩 RoundTripper 保证确定性)、`tracing_test.go`(OTel 禁用透传、server/client span 同 trace、`traceparent` 透传,用 in-memory span recorder)、`rules_redis_test.go`(共享黑名单增删、外部写入刷新、双副本 pub/sub 传播、TTL 兜底、降级读缓存/写 503;`alicebob/miniredis` 进程内仿真)、`ratelimit_redis_test.go`(Lua 令牌桶 refill/突发边界、双副本合计限额、参数跨副本传播、降级 fail-open/写 503)、`config_test.go`(配置校验)。真实上游一律用 `httptest.NewServer`。
+`auth_test.go`(管理接口角色×端点矩阵、legacy/hybrid/jwt 模式、审计指标)、`auth_handlers_test.go`(登录/刷新/登出/改密/限流/禁用态)、`user_handlers_test.go`(用户管理角色矩阵、UUID 与字段校验、脱敏与错误映射)、`server_test.go`(代理转发/透传/超时/不可达/404、路由表解析、探针、管理接口、限流)、`observability_test.go`(超时事件与指标、webhook 投递)、`resilience_test.go`(重试与体重放、熔断迁移与 503 快速失败、bulkhead 打满 429、请求体上限 413、响应头超时归类 504、`/metrics` 鉴权、`/admin/breakers`;上游传输用桩 RoundTripper 保证确定性)、`tracing_test.go`(OTel 禁用透传、server/client span 同 trace、`traceparent` 透传,用 in-memory span recorder)、`rules_redis_test.go`(黑名单增删、IPv6 规范化、外部写入刷新、双副本 pub/sub 传播、TTL 兜底、降级读缓存/写 503;`alicebob/miniredis` 进程内仿真)、`ratelimit_redis_test.go`(Lua 令牌桶 refill/突发边界、双副本合计限额、参数跨副本传播、降级 fail-open/写 503)、`config_test.go`(配置校验)。真实上游一律用 `httptest.NewServer`。
 
 ## 修改本模块时必须同步检查
 
@@ -142,7 +141,7 @@ ProxyHandler 带 UPSTREAM_TIMEOUT 的 context 调上游
 
 ## 已知边界
 
-- 黑名单与限流在共享模式下已外迁 Redis;熔断器与并发舱壁是有意的 per-replica 语义(保护本副本到上游的连接与请求配额,见 `docs/proposals/shared-state-multireplica.md` §3.3),不外迁;共享模式下网关可多副本;
+- 黑名单与限流由 Redis 承载,支持网关多副本;熔断器与并发舱壁是有意的 per-replica 语义(保护本副本到上游的连接与请求配额,见 `docs/proposals/shared-state-multireplica.md` §3.3),不外迁;
 - 日志与超时事件队列均为有界、满则丢弃,保证不拖垮业务请求;
 - 与上游之间是明文 HTTP,跨集群或不可信网络应启用 TLS;
 - 熔断/限流等弹性策略基于 `failsafe-go`(v0.x,API 可能随版本变动),全部封装在 `resilience.go`,升级依赖时只改这一处;

@@ -69,7 +69,7 @@ make deploy          # kubectl apply -f deploy/kubernetes/(适用于任意 K8s)
 
 ## 当前已知边界(改动前先读)
 
-- 共享状态分两模式:`REDIS_URL` 为空为内存模式(网关与 Agent 均固定 1 副本);非空为共享模式——黑名单/限流外迁 Redis(`internal/gateway/rules_redis.go`、`ratelimit_redis.go`),Agent 操作冷却(`internal/agent/tools/cooldown.go`,fail-closed)与按路由超时风暴抑制(`internal/agent/suppress.go`,fail-open 退回本地内存)均经 Redis `SET NX PX` 裁决,两端均可 `replicas: 2+`。熔断器/并发舱壁是**有意的 per-replica 语义**(保护本副本到上游的连接与请求配额),不外迁;事件去重由数据库唯一约束表决,任意副本数安全。**两端 `REDIS_URL` 必须同时配置或同时留空**,"半共享态"是配置错误。Agent 启动恢复(`Orchestrator.RecoverUnfinished`,回收崩溃进程悬挂的排查)只在内存模式执行——单副本下启动时的 queued/processing 行必然是孤儿;共享模式下这些行可能属于存活副本,需租约机制才能安全回收。方案详见 `docs/proposals/shared-state-multireplica.md`、`docs/proposals/timeout-storm-coalescing.md`。
+- 网关黑名单与限流(`internal/gateway/rules_redis.go`、`ratelimit_redis.go`)、Agent 资源级操作冷却(`internal/agent/tools/cooldown.go`,fail-closed)与按路由超时风暴抑制(`internal/agent/suppress.go`,fail-open)统一由 Redis 承载(`REDIS_URL` 为两端必填项),网关与 Agent 均支持单副本或 `replicas: 2+`。熔断器/并发舱壁是**有意的 per-replica 语义**(保护本副本到上游的连接与请求配额),不外迁;事件去重由数据库唯一约束表决,任意副本数安全。崩溃进程悬挂的排查任务需要租约机制才能在多副本下安全回收。方案参考 `docs/proposals/shared-state-multireplica.md`、`docs/proposals/timeout-storm-coalescing.md`。
 - Agent、网关与本地认证共用同一个 PostgreSQL 数据库,但使用**独立的迁移版本表**(流量日志 `schema_migrations`、事件报告 `incident_schema_migrations`、本地认证 `auth_schema_migrations`),不要合并。
 - 网关与上游之间、Agent 与网关管理接口之间均为集群内明文 HTTP;跨集群或不可信网络应启用 TLS。
 - `OPENAI_API_KEY` 等密钥只走 `halon-secrets`,禁止入库或写入代码。

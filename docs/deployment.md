@@ -20,8 +20,9 @@
 | 文件 | 内容 |
 | --- | --- |
 | `postgres.yaml` | StatefulSet + Service + PVC,数据在 Pod 重建后保留 |
-| `gateway.yaml` | 1 副本 Deployment + 两个 Service(`gateway` / `gateway-admin`),`ROUTES` 声明上游路由,推送超时事件到 `http://agent:8081/api/v1/incidents/timeout` |
-| `agent.yaml` | ServiceAccount + 命名空间级 Role/RoleBinding(最小权限)+ 1 副本 Deployment + Service |
+| `redis.yaml` | 单副本 Redis 7 + Service(开启 AOF),供开发与演练使用;生产建议托管或 HA Redis |
+| `gateway.yaml` | Deployment(支持多副本)+ 两个 Service(`gateway` / `gateway-admin`),`ROUTES` 声明上游路由,推送超时事件到 `http://agent:8081/api/v1/incidents/timeout` |
+| `agent.yaml` | ServiceAccount + 命名空间级 Role/RoleBinding(最小权限)+ Deployment(支持多副本)+ Service |
 
 演示清单在 `examples/user-service/deploy.yaml` 与 `examples/order-service/deploy.yaml`,需单独 `kubectl apply`。
 
@@ -47,28 +48,17 @@ make deploy-observability   # kubectl apply -f deploy/kubernetes/observability/
 
 Loki 基数约定:`trace_id`、`route`、`status` 可做 label 或查询条件;`path`、`client_ip` 只作为日志字段检索,严禁进 label(Loki 高基数会显著拖慢)。
 
-### 可选共享状态 Redis(`deploy/kubernetes/redis/`)
+### Redis(`deploy/kubernetes/redis.yaml`)
 
-多副本前置组件,`make deploy` **不**包含它:
+Redis 是网关黑名单、限流以及 Agent 资源冷却、风暴抑制的必备后端,已包含在 `make deploy` 主路径中。
 
-```bash
-make deploy-redis   # kubectl apply -f deploy/kubernetes/redis/
-```
+参考清单为单副本 Redis 7 + Service,开启 `appendonly yes` / `appendfsync everysec`:Redis 是黑名单的事实源,重启不得静默清空;AOF 最坏丢失约 1s 的写入,恢复后经网关管理接口(`PUT /admin/rules/blacklist/:ip`)重放补齐即可。该清单面向开发与演练;生产请改用云厂商托管 Redis 或 Helm 的 HA(Sentinel/Cluster)部署,并把网关与 Agent 的 `REDIS_URL` 指向生产地址。多套部署不要共用同一个 Redis logical DB(用 `REDIS_URL` 的 db 编号区分)。
 
-参考清单为单副本 Redis 7 + Service,开启 `appendonly yes` / `appendfsync everysec`:共享模式下 Redis 是黑名单的事实源,重启不得静默清空;AOF 最坏丢失约 1s 的写入,恢复后经网关管理接口(`PUT /admin/rules/blacklist/:ip`)重放补齐即可。该清单面向开发与演练;生产请改用云厂商托管 Redis 或 Helm 的 HA(Sentinel/Cluster)部署。
+Redis 健康不进 `/readyz`(降级策略允许网关在 Redis 不可达时继续服务,摘除 Pod 反而中断全部流量),用指标表达:网关 `halon_gateway_redis_up`、Agent `halon_agent_redis_up`,告警规则可并入观测栈。
 
-启用共享模式:给网关与 Agent 同时设置 `REDIS_URL`(参考清单对应 `redis://redis:6379/0`,清单里有注释好的示例)并滚动重启。**两端必须同时配置或同时留空**——一端共享、一端内存的"半共享态"属于配置错误;两端启动日志都会打 `shared_state_mode=redis|memory` 供核查。多套部署不要共用同一个 Redis logical DB(用 `REDIS_URL` 的 db 编号区分)。
+多副本扩缩:网关与 Agent 的黑名单、限流、操作冷却与路由风暴抑制均由 Redis 裁决,将 `gateway.yaml` / `agent.yaml` 中的 `replicas` 调整为 `2+` 即可直接水平扩容。
 
-Redis 健康不进 `/readyz`(降级策略允许网关在 Redis 不可达时继续服务,摘除 Pod 反而中断全部流量),用指标表达:网关 `halon_gateway_redis_up`、Agent `halon_agent_redis_up`(新增 `/metrics` 端点),告警规则可并入观测栈。
-
-切换到多副本的步骤:
-
-1. `make deploy-redis`(或指向托管/HA Redis);
-2. 网关与 Agent 清单同时打开 `REDIS_URL`,先把两端滚动到共享模式——滚动期间内存/共享副本并存,黑名单"≤10s 全副本收敛"的承诺只在全部副本进入共享模式后成立,升级窗口内按单副本语义理解;
-3. 确认两端启动日志均为 `shared_state_mode=redis` 且 `halon_*_redis_up` 为 1;
-4. 再把 `replicas` 提到 2+。回滚:两端同时去掉 `REDIS_URL` 并把 `replicas` 降回 1 即可,任意阶段都安全。
-
-共享模式下黑名单新增/解除最坏 10s 收敛全部副本。需要即时生效时逐 Pod 调管理接口:
+黑名单新增/解除通过 Redis pub/sub 即时广播并以 `BLACKLIST_CACHE_TTL`(默认 10s)兜底,最坏 10s 内收敛到全部副本。需要即时生效时逐 Pod 调管理接口:
 
 ```bash
 for pod in $(kubectl get pods -l app.kubernetes.io/name=gateway -o name); do
@@ -89,7 +79,7 @@ done
 
 ### Agent 的 RBAC 权限(agent.yaml)
 
-`pods: get/list/delete`、`pods/log: get`、`events: get/list`、`deployments: get/list/update/patch`。新增需要其他资源的工具时先扩 Role,并在 [modules/agent-tools.md](modules/agent-tools.md) 记录。
+`pods: get/list/delete`、`pods/log: get`、`events: get/list`、`deployments: get/list/update/patch`、`replicasets: get`。新增需要其他资源的工具时先扩 Role,并在 [modules/agent-tools.md](modules/agent-tools.md) 记录。
 
 ### Secret(halon-secrets,手动创建)
 
@@ -119,10 +109,10 @@ done
 
 ## 本地运行(无 K8s)
 
-1. Docker 启动 PostgreSQL 17(命令见 README);
+1. Docker 启动 PostgreSQL 17 与 Redis 7(命令见 README);
 2. `make run-demo`(演示后端,:8090);
-3. 带 `DATABASE_DSN`/`ADMIN_TOKEN`/`ROUTES` 等环境变量 `make run-gateway`;
-4. 可选:带 `INGEST_TOKEN`/`OPENAI_API_KEY`/`OPENAI_MODEL` 等 `make run-agent`。Agent 会回退使用 `~/.kube/config` 访问集群;本地无集群时 K8s 工具会报连接错误,其余功能不受影响(可将操作级别保持 readonly 并忽略 K8s 工具错误)。
+3. 带 `DATABASE_DSN`/`REDIS_URL`/`ADMIN_TOKEN`/`ROUTES` 等环境变量 `make run-gateway`;
+4. 可选:带 `DATABASE_DSN`/`REDIS_URL`/`INGEST_TOKEN`/`OPENAI_API_KEY`/`OPENAI_MODEL` 等 `make run-agent`。Agent 会回退使用 `~/.kube/config` 访问集群;本地无集群时 K8s 工具会报连接错误,其余功能不受影响(可将操作级别保持 readonly 并忽略 K8s 工具错误)。
 
 ## 端到端故障演练(任意集群)
 

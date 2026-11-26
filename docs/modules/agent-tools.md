@@ -7,7 +7,7 @@
 - 工具通过 `Tool.Permission`(`authz.Permission`)声明权限,与网关管理接口共用同一套权限字符串:`tool:observe` / `tool:k8s:restart_pod` / `tool:k8s:scale` / `tool:k8s:update_image` / `gateway:blacklist:write`。角色映射见 [auth.md](auth.md),由 `AGENT_OPERATION_LEVEL`(默认 `readonly`)总开关控制:注册时过滤、执行时再校验一次;低于角色的工具对模型不可见也不可执行;
 - 所有工具参数经 `decodeArguments` 严格解码(`DisallowUnknownFields`,且只允许一个 JSON 对象);
 - 所有 SQL 参数化;K8s 操作受命名空间白名单(`K8S_NAMESPACES`,`*` 表示全部)约束;
-- 变更类操作(重启/扩容/改镜像/封禁)共用 `KubernetesToolset.allowAction` 冷却窗口(`K8S_ACTION_COOLDOWN`,默认 2 分钟),同一对象冷却期内拒绝重复操作。冷却由 `CooldownStore` 裁决:内存模式为进程内 map(单副本);共享模式(`REDIS_URL` 非空)为 `RedisCooldownStore`,`SET halon:cooldown:<key> NX PX` 原子抢占,N 个副本同一窗口内只有一个能执行,未抢到的拿到 `PTTL` 剩余时间;Redis 不可达时**拒绝变更**(`ErrCooldownUnavailable`,安全功能不侥幸放行),只读工具不受影响;
+- 变更类操作(重启/扩容/改镜像/封禁)共用 `KubernetesToolset.allowAction` 冷却窗口(`K8S_ACTION_COOLDOWN`,默认 2 分钟),在**资源粒度**上互斥:Deployment 的扩容(`k8s_scale_deployment`)、改镜像(`k8s_update_deployment_image`)以及归属于该 Deployment(经 `ReplicaSet` 溯源)的 Pod 重启(`k8s_restart_pod`)共用锁键 `deployment/<namespace>/<name>`,防止多 Agent 同时对同一工作负载执行冲突变更;StatefulSet/DaemonSet Pod 共用 `statefulset/<ns>/<name>` / `daemonset/<ns>/<name>`;独立 Pod 使用 `pod/<ns>/<pod>`;网关 IP 操作使用规范化后的 `gateway/ip/<ip>`。冷却由 `RedisCooldownStore`(`SET halon:cooldown:<key> NX PX`)原子裁决,所有副本同一窗口内只有一个能执行,未抢到的拿到 `PTTL` 剩余时间;Redis 不可达(或 `Cooldowns` 未配置)时**拒绝变更**(`ErrCooldownUnavailable`,安全功能不侥幸放行),只读工具不受影响;
 - 单次只读查询有 15s 超时(`queryTimeout`)。
 
 ## 工具清单
@@ -29,7 +29,7 @@
 
 | 工具 | 权限 | 说明 | 保护 |
 | --- | --- | --- | --- |
-| `k8s_restart_pod` | `tool:k8s:restart_pod` | 删除一个故障 Pod 让控制器重建 | 必须提供 reason;冷却;先 Get 确认存在 |
+| `k8s_restart_pod` | `tool:k8s:restart_pod` | 删除一个故障 Pod 让控制器重建 | 必须提供 reason;先 Get 确认存在并解析所属控制器生成资源锁;冷却 |
 | `k8s_scale_deployment` | `tool:k8s:scale` | 调整 Deployment 副本数 | 上限 `K8S_MAX_REPLICAS`;冷却;写入 `halon.dev/last-agent-action` 注解审计 |
 | `gateway_block_ip` | `gateway:blacklist:write` | 调网关管理接口把 IP 加入黑名单 | IP 必须 `net.ParseIP` 通过;reason 必填;冷却;网关返回非 2xx 视为失败 |
 
@@ -47,7 +47,7 @@
 | --- | --- |
 | `observability.go` | 4 个只读工具(3 个 SQL + PromQL);行类型 `ErrorLogRow`/`TrafficStatRow`/`TopIPRow` |
 | `kubernetes.go` | `KubernetesToolset`(白名单、副本上限、冷却)与 6 个 K8s 工具 |
-| `cooldown.go` | `CooldownStore` 接口(Claim)与 `ErrCooldownUnavailable`;`memoryCooldownStore`(内存模式)与 `RedisCooldownStore`(共享模式,SET NX PX 裁决 + 后台 Ping 保活指标) |
+| `cooldown.go` | `CooldownStore` 接口(Claim)、`ErrCooldownUnavailable` 与 `RedisCooldownStore`(SET NX PX 裁决 + 后台 Ping 保活指标) |
 | `gateway.go` | `NewGatewayActionTool`:封禁 IP,经网关管理接口,复用 K8s 冷却器 |
 | `schema.go` | `objectSchema`/`decodeArguments`/`queryContext` 等工具构造函数 |
 

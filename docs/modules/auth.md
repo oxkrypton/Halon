@@ -7,7 +7,7 @@
 - **一套角色**:`readonly` < `operator` < `full`,沿用 `AGENT_OPERATION_LEVEL` 和报告 `level` 字符串,不迁移历史数据。人类管理员与 Agent 共用同一套角色。
 - **权限字符串**:`资源:动作`,由网关路由和 Agent 工具共同引用;映射表写在代码里(`internal/authz/role.go`),不支持自定义角色或环境变量改映射。
 - **凭据并存**:`AUTH_MODE=legacy`(默认,与升级前行为完全一致)/ `hybrid`(JWT 与静态令牌并存)/ `jwt`(管理面只认 JWT,webhook ingest 例外)。
-- **签名算法**:仅 Ed25519(EdDSA)。拒绝 `none`、HS 系列和未知 `kid`;`exp` 必填,校验 `iss`/`aud`/`sub`/`jti`,支持 `kid` 轮换与 `AUTH_REVOKED_JTIS` 单点撤销。验签无状态,内存/共享模式都不需要 Redis。
+- **签名算法**:仅 Ed25519(EdDSA)。拒绝 `none`、HS 系列和未知 `kid`;`exp` 必填,校验 `iss`/`aud`/`sub`/`jti`,支持 `kid` 轮换与 `AUTH_REVOKED_JTIS` 单点撤销。验签无状态,不需要 Redis。
 - **两种运行形态**:默认保持无状态离线密钥模式(`AUTH_LOGIN_ENABLED=false`,不读写用户库,私钥离线由 `halonctl` 保管);如需浏览器/本地账号登录与用户管理,可按需开启 `AUTH_LOGIN_ENABLED=true`。
 
 ## 权限矩阵
@@ -94,7 +94,7 @@
 | `AUTH_REFRESH_TOKEN_TTL` | `168h` | 单次 Refresh Token 滚动有效期 |
 | `AUTH_REFRESH_MAX_LIFETIME` | `720h` | 同一次登录 family 的最长寿命(需 `>= AUTH_REFRESH_TOKEN_TTL`) |
 | `AUTH_PASSWORD_MIN_LENGTH` | `12` | 创建/重置/改密最小长度(`8..128`) |
-| `AUTH_LOGIN_RATE_LIMIT_RPS` | `0.2` | 登录/刷新/登出接口单 IP 速率上限(共享模式用 `halon:ratelimit:login:` 前缀) |
+| `AUTH_LOGIN_RATE_LIMIT_RPS` | `0.2` | 登录/刷新/登出接口单 IP 速率上限(Redis 键前缀 `halon:ratelimit:login:`) |
 | `AUTH_LOGIN_RATE_LIMIT_BURST` | `5` | 登录/刷新/登出接口单 IP 突发容量 |
 | `AUTH_LOGIN_MAX_FAILURES` | `10` | 连续失败锁定阈值 |
 | `AUTH_LOGIN_LOCK_DURATION` | `5m` | 账号锁定时长 |

@@ -52,7 +52,7 @@ Gin Gateway -- 504 webhook --> Agent Service (:8081)
 - 上游弹性策略(基于 [failsafe-go](https://github.com/failsafe-go/failsafe-go)):拨号/TLS/响应头分阶段超时、幂等请求的有预算重试(默认关)、每路由熔断(503 + `Retry-After` 快速失败)、每路由并发上限(429 快速失败)、请求体大小上限。
 - 上游响应原样透传;上游超时返回 504 `UPSTREAM_TIMEOUT` 并触发故障事件;连接失败返回 502 `UPSTREAM_ERROR`;熔断开启返回 503 `UPSTREAM_UNAVAILABLE`。
 - 统一 JSON 错误响应和 `X-Request-ID` 请求追踪(自动透传到上游)。
-- 内存 IP 黑名单及按客户端 IP 的令牌桶限流。
+- 基于 Redis 的 IP 黑名单(进程内缓存 + pub/sub 失效与 TTL 兜底)及按客户端 IP 的 Redis Lua 令牌桶限流。
 - 独立管理端口 `:9090`,支持动态更新黑名单和限流参数、查询各路由熔断状态,暴露 Prometheus 指标(全指标清单见 [docs/modules/gateway.md](docs/modules/gateway.md))。
 - 可选 OpenTelemetry 追踪(`OTEL_ENABLED`):自动注入/透传 W3C `traceparent`,上游零改动;`trace_id` 写入结构化日志实现日志↔追踪互跳。配套开源观测栈(OTel Collector + Tempo + Loki + Prometheus + Grafana)见 `deploy/kubernetes/observability/`。
 - `/healthz` 存活检查和 `/readyz` 数据库就绪检查。
@@ -70,12 +70,11 @@ Gin Gateway -- 504 webhook --> Agent Service (:8081)
 ### Agent 故障排查服务
 
 - `POST /api/v1/incidents/timeout` 接收网关 504 webhook,Bearer 鉴权 + 事件体严格校验。
-- 事件去重与风暴抑制:内存 TTL 去重器 + `ON CONFLICT DO NOTHING` 保证事件幂等;按路由抑制窗口(`INCIDENT_COALESCE_COOLDOWN`,内存/Redis 双模式)防止同一路由超时风暴重复触发排查,配合 `INCIDENT_SETTLE_DELAY`(默认 `15s`)等待日志与 Prometheus 指标落齐后再启动 LLM。
+- 事件去重与风暴抑制:内存 TTL 去重器 + `ON CONFLICT DO NOTHING` 保证事件幂等;按路由抑制窗口(`INCIDENT_COALESCE_COOLDOWN`,基于 Redis)防止同一路由超时风暴重复触发排查,配合 `INCIDENT_SETTLE_DELAY`(默认 `15s`)等待日志与 Prometheus 指标落齐后再启动 LLM。
 - 有界队列 + 可配置 worker 数的编排器,每次排查有独立超时,支持 readonly/operator/full 三级操作权限。
-- 启动恢复:重启后回收上一进程悬挂的排查——`AGENT_RECOVERY_MAX_AGE` 内的事件重新入队续跑,超龄的标记 failed;仅内存(单副本)模式执行。
 - 只读工具:PostgreSQL 错误日志、流量统计、Top IP,Prometheus PromQL 即时查询,Pod/日志/事件/Deployment 状态。
 - 操作工具(operator):Pod 重启、Deployment 扩容(上限保护)、网关 IP 封禁;full 级别额外支持更新容器镜像。
-- 命名空间白名单与操作冷却时间,SQL 全部参数化,工具参数严格校验。
+- 命名空间白名单与资源级操作冷却(基于 Redis `SET NX PX` 互斥),SQL 全部参数化,工具参数严格校验。
 - 排查结果(中文 Markdown 报告、工具调用轨迹、Token 用量)持久化到 `incident_reports` 表,可随时通过 API 查询。
 
 ## 环境要求
@@ -92,7 +91,7 @@ make test
 
 ## 本地运行(不依赖 K8s)
 
-启动 PostgreSQL:
+启动 PostgreSQL 与 Redis:
 
 ```bash
 docker run --rm --name halon-postgres \
@@ -102,18 +101,21 @@ docker run --rm --name halon-postgres \
   -p 5432:5432 \
   -v halon-pgdata:/var/lib/postgresql/data \
   postgres:17-alpine
+
+docker run --rm --name halon-redis -p 6379:6379 redis:7-alpine
 ```
 
-启动演示后端(第二个终端):
+启动演示后端(第三个终端):
 
 ```bash
 make run-demo    # 用户服务 :8090;订单演示:go run ./examples/order-service(:8092)
 ```
 
-启动网关(第三个终端):
+启动网关(第四个终端):
 
 ```bash
 DATABASE_DSN='postgres://halon:halon-local-password@localhost:5432/halon?sslmode=disable' \
+REDIS_URL='redis://localhost:6379/0' \
 ADMIN_TOKEN='halon-local-admin-token' \
 ROUTES='/api/v1/users/=http://localhost:8090,/api/v1/orders/=http://localhost:8092' \
 make run-gateway
@@ -131,6 +133,7 @@ curl -i http://localhost:8080/readyz
 
 ```bash
 DATABASE_DSN='postgres://halon:halon-local-password@localhost:5432/halon?sslmode=disable' \
+REDIS_URL='redis://localhost:6379/0' \
 INGEST_TOKEN='halon-local-ingest-token' \
 OPENAI_API_KEY='<你的 OpenAI 兼容 API Key>' \
 OPENAI_MODEL='gpt-4o-mini' \
@@ -231,13 +234,13 @@ docker tag halon/gateway:dev <registry>/halon/gateway:v1 && docker push <registr
 docker tag halon/agent:dev   <registry>/halon/agent:v1   && docker push <registry>/halon/agent:v1
 ```
 
-先启动数据库,再部署产品组件:
+先启动数据库,再部署产品组件(`make deploy` 会同时部署 Redis、网关与 Agent):
 
 ```bash
 kubectl apply -f deploy/kubernetes/postgres.yaml
 kubectl rollout status statefulset/postgres --timeout=180s
 make deploy
-kubectl rollout status deployment/gateway deployment/agent --timeout=180s
+kubectl rollout status deployment/redis deployment/gateway deployment/agent --timeout=180s
 make status
 ```
 
@@ -339,8 +342,8 @@ kubectl rollout restart deployment/agent
 | `OTEL_TRACES_SAMPLER_RATIO` | `1.0` | 采样比例(0–1,父 span 优先) |
 | `AGENT_WEBHOOK_URL` | 空 | Agent 超时事件接收地址,为空则不推送 |
 | `AGENT_WEBHOOK_TOKEN` | 空 | Agent 接收接口 Bearer Token,配置 URL 后必填 |
-| `REDIS_URL` | 空 | 共享状态 Redis 地址(如 `redis://redis:6379/0`);为空为内存模式(单副本),非空为共享模式(可多副本) |
-| `BLACKLIST_CACHE_TTL` | `10s` | 共享模式下黑名单进程内缓存的兜底刷新间隔 |
+| `REDIS_URL` | 必填 | Redis 连接串(如 `redis://redis:6379/0`),承载黑名单与限流状态 |
+| `BLACKLIST_CACHE_TTL` | `10s` | 黑名单进程内缓存的兜底刷新间隔 |
 | `REDIS_DIAL_TIMEOUT` | `1s` | Redis 拨号超时 |
 | `REDIS_OP_TIMEOUT` | `500ms` | Redis 单次操作超时(同时作为读写 socket 超时) |
 | `SHUTDOWN_TIMEOUT` | `10s` | 平滑退出超时 |
@@ -368,17 +371,16 @@ kubectl rollout restart deployment/agent
 | `INCIDENT_COALESCE_COOLDOWN` | `5m` | 同一路由排查成功后的抑制静默期;设为 `0` 关闭按路由抑制 |
 | `INCIDENT_RETRY_BACKOFF` | `1m` | 同一路由排查失败或队列满后的短退避(默认上限为 cooldown,不可超过 cooldown) |
 | `INCIDENT_SETTLE_DELAY` | `15s` | 新受理事件入队前的聚集延迟(等待日志与 Prometheus 就绪);设为 `0` 立即入队 |
-| `AGENT_RECOVERY_MAX_AGE` | `30m` | 启动恢复重新入队的事件最大龄期,超龄的未完成报告标记 failed;仅内存模式生效 |
 | `GATEWAY_ADMIN_URL` / `GATEWAY_ADMIN_TOKEN` | 空 | 网关管理接口地址与凭据;权限不足时封禁工具不可用。`readonly` 可不配;非 `readonly` 在 `jwt` 模式下必须配 `typ=agent` 且角色与操作级别一致的 JWT(启动自检) |
 | `PROMETHEUS_URL` | 空 | Prometheus 查询地址,为空时 PromQL 工具不可用 |
-| `REDIS_URL` | 空 | 共享状态 Redis 地址;语义与网关一致,两端必须同时配置或同时留空 |
+| `REDIS_URL` | 必填 | Redis 连接串(如 `redis://redis:6379/0`),承载操作冷却与按路由抑制窗口 |
 | `REDIS_DIAL_TIMEOUT` | `1s` | Redis 拨号超时 |
 | `REDIS_OP_TIMEOUT` | `500ms` | Redis 单次操作超时(同时作为读写 socket 超时) |
 | `SHUTDOWN_TIMEOUT` | `30s` | 平滑退出超时 |
 
 ## 当前边界
 
-- 共享状态分两模式:`REDIS_URL` 为空为内存模式,网关与 Agent 均固定 1 副本;非空为共享模式,黑名单/限流/操作冷却/按路由风暴抑制外迁 Redis(风暴抑制在 Redis 不可达时 fail-open 退回本地内存),两端均可 2+ 副本(需两端同时配置;熔断器与并发舱壁是有意的 per-replica 语义,不外迁;事件去重由数据库唯一约束表决,任意副本数安全)。Agent 启动恢复(回收悬挂排查)只在内存模式执行,共享模式下崩溃副本的未完成报告暂不重跑(需租约机制)。参考清单 `make deploy-redis`,详见 `docs/deployment.md`。
+- 网关黑名单/限流与 Agent 资源级操作冷却/按路由风暴抑制统一基于 Redis(`REDIS_URL` 必填;风暴抑制在 Redis 不可达时 fail-open,限流 fail-open,操作冷却 fail-closed,黑名单写返回 503),网关与 Agent 均支持单副本或 2+ 副本(熔断器与并发舱壁是有意的 per-replica 语义,不外迁;事件去重由数据库唯一约束表决,任意副本数安全)。崩溃副本的悬挂排查暂不自动回收(需租约机制)。Redis 部署说明见 `docs/deployment.md`。
 - 异步日志采用有界、尽力投递队列,数据库长期不可用或队列饱和时会丢弃日志,避免拖垮业务请求。
 - 网关与上游之间、Agent 与网关管理接口之间使用集群内明文 HTTP;跨集群或不可信网络应启用 TLS。
 - 弹性策略依赖 failsafe-go(v0.x,API 可能变动),全部封装在 `internal/gateway/resilience.go`;追踪依赖 OpenTelemetry Go SDK,默认关闭。
@@ -409,6 +411,7 @@ kubectl rollout restart deployment/agent
 │   ├── agent.yaml                # Agent Deployment、Service 和 RBAC
 │   ├── gateway.yaml              # 网关 Deployment 和 Service
 │   ├── postgres.yaml             # PostgreSQL StatefulSet、Service 和 PVC
+│   ├── redis.yaml                # Redis Deployment 和 Service(开发参考清单)
 │   └── observability/            # 可选观测栈:OTel Collector、Tempo、Loki、Alloy、Prometheus、Alertmanager、Grafana
 ├── docs/
 │   ├── README.md                 # 文档索引与文档维护规则

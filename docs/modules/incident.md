@@ -25,9 +25,9 @@
 
 状态:`queued → processing → completed / failed`。
 
-`Report` 完整记录一次排查:事件字段 + `Status` + `FinalMessage`(中文 Markdown 报告)+ `Steps` + `Executions`(JSONB,工具调用轨迹)+ Token 用量 + `Error` + 起止时间。`JSONB` 类型入库前校验 JSON 合法性。`Report.Event()` 从行字段重建原始 `TimeoutEvent`,供启动恢复重新入队。
+`Report` 完整记录一次排查:事件字段 + `Status` + `FinalMessage`(中文 Markdown 报告)+ `Steps` + `Executions`(JSONB,工具调用轨迹)+ Token 用量 + `Error` + 起止时间。`JSONB` 类型入库前校验 JSON 合法性。`Report.Event()` 从行字段重建原始 `TimeoutEvent`。
 
-进程在 queued/processing 之间崩溃会让行永远悬挂(唯一约束同时阻止了重投递再认领);Agent 启动恢复(见 [agent.md](agent.md) 编排器行为细节)负责回收:内存模式下重新入队或按龄期标记 `failed`,共享模式下暂不执行(需租约机制)。
+进程在 queued/processing 之间崩溃会让行保持未完成状态(唯一约束同时阻止了重投递再认领),多副本下需租约机制才能安全接管回收。
 
 ### Store(`store.go`)
 
@@ -37,7 +37,7 @@
 | `Migrate()` | iofs 嵌入式迁移,**版本表 `incident_schema_migrations`**(与 trafficlog 隔离,允许同库共存) |
 | `Claim(ctx, event)` | 插入 queued 行,`ON CONFLICT DO NOTHING`;返回 false 表示该事件已被认领——这是幂等投递的表决层:多副本下同一事件只有一个 `INSERT` 成功,编排器队列归属由此唯一确定 |
 | `MarkProcessing(ctx, eventID, at)` | 仅从 queued 转为 processing(条件更新,不覆盖其他字段) |
-| `LoadUnfinished(ctx)` | 返回全部 queued/processing 行(按发生时间升序);供启动恢复使用,仅单副本(内存)模式安全 |
+| `LoadUnfinished(ctx)` | 返回全部 queued/processing 行(按发生时间升序),供后续租约恢复使用 |
 | `MarkFailed(ctx, eventID, cause, at)` | 条件更新把未完成行收尾为 `failed`(不影响已完成行,0 行命中不算错误);供启动恢复标记超龄事件 |
 | `SaveResult(ctx, report)` | 覆盖写入排查结果;事件不存在返回 `ErrNotFound` |
 | `Get` / `List` | 单查 / 按发生时间倒序列表(limit 钳制到 1..200,默认 50) |
