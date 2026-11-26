@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/oxkrypton/Halon/internal/agent"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -37,9 +39,13 @@ func TestKubernetesListPodsAndNamespaceGuard(t *testing.T) {
 }
 
 func TestKubernetesScaleDeploymentAndCooldown(t *testing.T) {
+	mr := miniredis.RunT(t)
 	replicas := int32(1)
 	client := fake.NewClientset(&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "user-service", Namespace: "default"}, Spec: appsv1.DeploymentSpec{Replicas: &replicas}})
-	_, tools := NewKubernetesTools(client, KubernetesOptions{AllowedNamespaces: []string{"default"}, MaxReplicas: 5, ActionCooldown: time.Minute})
+	_, tools := NewKubernetesTools(client, KubernetesOptions{
+		AllowedNamespaces: []string{"default"}, MaxReplicas: 5, ActionCooldown: time.Minute,
+		Cooldowns: newTestRedisCooldownStore(t, mr, nil),
+	})
 	handler := findTool(tools, "k8s_scale_deployment").Handler
 	arguments := json.RawMessage(`{"namespace":"default","name":"user-service","replicas":3,"reason":"high p95 and CPU saturation"}`)
 	if _, err := handler(context.Background(), arguments); err != nil {
@@ -58,8 +64,12 @@ func TestKubernetesScaleDeploymentAndCooldown(t *testing.T) {
 }
 
 func TestKubernetesRestartPod(t *testing.T) {
+	mr := miniredis.RunT(t)
 	client := fake.NewClientset(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "broken-pod", Namespace: "default"}})
-	_, tools := NewKubernetesTools(client, KubernetesOptions{AllowedNamespaces: []string{"default"}})
+	_, tools := NewKubernetesTools(client, KubernetesOptions{
+		AllowedNamespaces: []string{"default"},
+		Cooldowns:         newTestRedisCooldownStore(t, mr, nil),
+	})
 	_, err := findTool(tools, "k8s_restart_pod").Handler(context.Background(), json.RawMessage(`{"pod":"broken-pod","reason":"CrashLoopBackOff with repeated panics"}`))
 	if err != nil {
 		t.Fatal(err)
@@ -71,11 +81,15 @@ func TestKubernetesRestartPod(t *testing.T) {
 }
 
 func TestKubernetesFullAccessImageUpdate(t *testing.T) {
+	mr := miniredis.RunT(t)
 	client := fake.NewClientset(&appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{Name: "user-service", Namespace: "default"},
 		Spec:       appsv1.DeploymentSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "user-service", Image: "old:v1"}}}}},
 	})
-	_, tools := NewKubernetesTools(client, KubernetesOptions{AllowedNamespaces: []string{"default"}})
+	_, tools := NewKubernetesTools(client, KubernetesOptions{
+		AllowedNamespaces: []string{"default"},
+		Cooldowns:         newTestRedisCooldownStore(t, mr, nil),
+	})
 	_, err := findTool(tools, "k8s_update_deployment_image").Handler(context.Background(), json.RawMessage(`{"name":"user-service","container":"user-service","image":"registry.local/user:v2","reason":"known bad image"}`))
 	if err != nil {
 		t.Fatal(err)
@@ -87,6 +101,7 @@ func TestKubernetesFullAccessImageUpdate(t *testing.T) {
 }
 
 func TestGatewayBlockIP(t *testing.T) {
+	mr := miniredis.RunT(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/admin/rules/blacklist/192.0.2.10" || r.Header.Get("Authorization") != "Bearer test-admin-token" {
 			t.Errorf("unexpected request: %s %q", r.URL.Path, r.Header.Get("Authorization"))
@@ -94,7 +109,9 @@ func TestGatewayBlockIP(t *testing.T) {
 		w.WriteHeader(http.StatusCreated)
 	}))
 	defer server.Close()
-	toolset, _ := NewKubernetesTools(fake.NewClientset(), KubernetesOptions{})
+	toolset, _ := NewKubernetesTools(fake.NewClientset(), KubernetesOptions{
+		Cooldowns: newTestRedisCooldownStore(t, mr, nil),
+	})
 	tool := NewGatewayActionTool(toolset, server.URL, "test-admin-token", server.Client())
 	result, err := tool.Handler(context.Background(), json.RawMessage(`{"ip":"192.0.2.10","reason":"500 requests with 90% errors"}`))
 	if err != nil {
@@ -102,6 +119,153 @@ func TestGatewayBlockIP(t *testing.T) {
 	}
 	if result.(map[string]any)["status"] != "blocked" {
 		t.Fatalf("result = %+v", result)
+	}
+}
+
+func newResourceLockFixture(t *testing.T) (*miniredis.Miniredis, *fake.Clientset) {
+	t.Helper()
+	mr := miniredis.RunT(t)
+	replicas := int32(1)
+	isController := true
+	client := fake.NewClientset(
+		&appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{Name: "user-service", Namespace: "default"},
+			Spec: appsv1.DeploymentSpec{
+				Replicas: &replicas,
+				Template: corev1.PodTemplateSpec{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "user-service", Image: "old:v1"}},
+					},
+				},
+			},
+		},
+		&appsv1.ReplicaSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "user-service-rs",
+				Namespace: "default",
+				OwnerReferences: []metav1.OwnerReference{
+					{APIVersion: "apps/v1", Kind: "Deployment", Name: "user-service", Controller: &isController},
+				},
+			},
+		},
+		&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "user-service-rs-abc",
+				Namespace: "default",
+				OwnerReferences: []metav1.OwnerReference{
+					{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "user-service-rs", Controller: &isController},
+				},
+			},
+		},
+		&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "standalone-pod", Namespace: "default"},
+		},
+	)
+	return mr, client
+}
+
+func TestKubernetesDeploymentResourceLevelMutualExclusion(t *testing.T) {
+	t.Parallel()
+
+	t.Run("scale blocks image update and owned pod restart across replicas", func(t *testing.T) {
+		t.Parallel()
+		mr, client := newResourceLockFixture(t)
+		_, toolsA := NewKubernetesTools(client, KubernetesOptions{
+			AllowedNamespaces: []string{"default"}, MaxReplicas: 5, ActionCooldown: time.Minute,
+			Cooldowns: newTestRedisCooldownStore(t, mr, nil),
+		})
+		_, toolsB := NewKubernetesTools(client, KubernetesOptions{
+			AllowedNamespaces: []string{"default"}, MaxReplicas: 5, ActionCooldown: time.Minute,
+			Cooldowns: newTestRedisCooldownStore(t, mr, nil),
+		})
+
+		if _, err := findTool(toolsA, "k8s_scale_deployment").Handler(context.Background(),
+			json.RawMessage(`{"name":"user-service","replicas":2,"reason":"latency spike"}`)); err != nil {
+			t.Fatalf("replica A scale: %v", err)
+		}
+		if _, err := findTool(toolsB, "k8s_update_deployment_image").Handler(context.Background(),
+			json.RawMessage(`{"name":"user-service","container":"user-service","image":"new:v2","reason":"rollback"}`)); err == nil || !strings.Contains(err.Error(), "cooling down") {
+			t.Fatalf("replica B image update = %v, want cooling down", err)
+		}
+		if _, err := findTool(toolsB, "k8s_restart_pod").Handler(context.Background(),
+			json.RawMessage(`{"pod":"user-service-rs-abc","reason":"unhealthy pod"}`)); err == nil || !strings.Contains(err.Error(), "cooling down") {
+			t.Fatalf("replica B owned pod restart = %v, want cooling down", err)
+		}
+	})
+
+	t.Run("owned pod restart blocks scale and image update across replicas", func(t *testing.T) {
+		t.Parallel()
+		mr, client := newResourceLockFixture(t)
+		_, toolsA := NewKubernetesTools(client, KubernetesOptions{
+			AllowedNamespaces: []string{"default"}, MaxReplicas: 5, ActionCooldown: time.Minute,
+			Cooldowns: newTestRedisCooldownStore(t, mr, nil),
+		})
+		_, toolsB := NewKubernetesTools(client, KubernetesOptions{
+			AllowedNamespaces: []string{"default"}, MaxReplicas: 5, ActionCooldown: time.Minute,
+			Cooldowns: newTestRedisCooldownStore(t, mr, nil),
+		})
+
+		if _, err := findTool(toolsA, "k8s_restart_pod").Handler(context.Background(),
+			json.RawMessage(`{"pod":"user-service-rs-abc","reason":"crash loop"}`)); err != nil {
+			t.Fatalf("replica A restart: %v", err)
+		}
+		if _, err := findTool(toolsB, "k8s_scale_deployment").Handler(context.Background(),
+			json.RawMessage(`{"name":"user-service","replicas":3,"reason":"scale up"}`)); err == nil || !strings.Contains(err.Error(), "cooling down") {
+			t.Fatalf("replica B scale = %v, want cooling down", err)
+		}
+		if _, err := findTool(toolsB, "k8s_update_deployment_image").Handler(context.Background(),
+			json.RawMessage(`{"name":"user-service","container":"user-service","image":"new:v2","reason":"rollback"}`)); err == nil || !strings.Contains(err.Error(), "cooling down") {
+			t.Fatalf("replica B image update = %v, want cooling down", err)
+		}
+	})
+
+	t.Run("standalone pod restart does not block deployment", func(t *testing.T) {
+		t.Parallel()
+		mr, client := newResourceLockFixture(t)
+		_, toolsA := NewKubernetesTools(client, KubernetesOptions{
+			AllowedNamespaces: []string{"default"}, MaxReplicas: 5, ActionCooldown: time.Minute,
+			Cooldowns: newTestRedisCooldownStore(t, mr, nil),
+		})
+		_, toolsB := NewKubernetesTools(client, KubernetesOptions{
+			AllowedNamespaces: []string{"default"}, MaxReplicas: 5, ActionCooldown: time.Minute,
+			Cooldowns: newTestRedisCooldownStore(t, mr, nil),
+		})
+
+		if _, err := findTool(toolsA, "k8s_restart_pod").Handler(context.Background(),
+			json.RawMessage(`{"pod":"standalone-pod","reason":"stuck"}`)); err != nil {
+			t.Fatalf("standalone pod restart: %v", err)
+		}
+		if _, err := findTool(toolsB, "k8s_scale_deployment").Handler(context.Background(),
+			json.RawMessage(`{"name":"user-service","replicas":2,"reason":"scale up"}`)); err != nil {
+			t.Fatalf("deployment scale after standalone pod restart: %v", err)
+		}
+	})
+}
+
+func TestGatewayBlockIPMultiReplicaResourceCooldown(t *testing.T) {
+	t.Parallel()
+	mr := miniredis.RunT(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer server.Close()
+
+	toolsetA, _ := NewKubernetesTools(fake.NewClientset(), KubernetesOptions{
+		ActionCooldown: time.Minute,
+		Cooldowns:      newTestRedisCooldownStore(t, mr, nil),
+	})
+	toolsetB, _ := NewKubernetesTools(fake.NewClientset(), KubernetesOptions{
+		ActionCooldown: time.Minute,
+		Cooldowns:      newTestRedisCooldownStore(t, mr, nil),
+	})
+	toolA := NewGatewayActionTool(toolsetA, server.URL, "test-admin-token", server.Client())
+	toolB := NewGatewayActionTool(toolsetB, server.URL, "test-admin-token", server.Client())
+
+	if _, err := toolA.Handler(context.Background(), json.RawMessage(`{"ip":"2001:0db8::1","reason":"flood"}`)); err != nil {
+		t.Fatalf("replica A block IPv6: %v", err)
+	}
+	if _, err := toolB.Handler(context.Background(), json.RawMessage(`{"ip":"2001:db8::1","reason":"flood"}`)); err == nil || !strings.Contains(err.Error(), "cooling down") {
+		t.Fatalf("replica B canonical IPv6 block = %v, want cooling down", err)
 	}
 }
 

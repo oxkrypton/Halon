@@ -56,43 +56,37 @@ func run(logger *slog.Logger) error {
 
 	metrics := agent.NewMetrics()
 
-	// Optional shared-state mode: with REDIS_URL set, action cooldowns are
-	// arbitrated in Redis so multiple replicas can run. Ping failure does
-	// not abort startup; mutation tools reject actions while degraded.
-	sharedStateMode := "memory"
-	var redisClient *redis.Client
-	if cfg.RedisURL != "" {
-		options, err := redis.ParseURL(cfg.RedisURL)
-		if err != nil {
-			return fmt.Errorf("parse REDIS_URL: %w", err)
-		}
-		options.DialTimeout = cfg.RedisDialTimeout
-		options.ReadTimeout = cfg.RedisOpTimeout
-		options.WriteTimeout = cfg.RedisOpTimeout
-		redisClient = redis.NewClient(options)
-		defer func() { _ = redisClient.Close() }()
-		pingContext, cancelPing := context.WithTimeout(context.Background(), cfg.RedisDialTimeout)
-		pingErr := redisClient.Ping(pingContext).Err()
-		cancelPing()
-		metrics.SetRedisUp(pingErr == nil)
-		if pingErr != nil {
-			logger.Warn("redis unreachable at startup; running with degraded shared state", "error", pingErr)
-		}
-		sharedStateMode = "redis"
+	// Redis arbitrates action cooldowns and route storm suppression across
+	// agent replicas. Startup ping failure does not abort startup; mutation
+	// tools fail closed while route suppression fails open.
+	options, err := redis.ParseURL(cfg.RedisURL)
+	if err != nil {
+		return fmt.Errorf("parse REDIS_URL: %w", err)
 	}
-	logger.Info("shared state mode", "shared_state_mode", sharedStateMode)
+	options.DialTimeout = cfg.RedisDialTimeout
+	options.ReadTimeout = cfg.RedisOpTimeout
+	options.WriteTimeout = cfg.RedisOpTimeout
+	redisClient := redis.NewClient(options)
+	defer func() { _ = redisClient.Close() }()
+	pingContext, cancelPing := context.WithTimeout(context.Background(), cfg.RedisDialTimeout)
+	pingErr := redisClient.Ping(pingContext).Err()
+	cancelPing()
+	metrics.SetRedisUp(pingErr == nil)
+	if pingErr != nil {
+		logger.Warn("redis unreachable at startup; running in degraded mode", "error", pingErr)
+	}
 
 	clientset, err := kubernetesClientset()
 	if err != nil {
 		return fmt.Errorf("create kubernetes client: %w", err)
 	}
+	cooldownStore := tools.NewRedisCooldownStore(redisClient, cfg.RedisOpTimeout, logger, metrics.SetRedisUp)
+	defer cooldownStore.Close()
 	kubernetesOptions := tools.KubernetesOptions{
 		AllowedNamespaces: cfg.K8sNamespaces,
 		MaxReplicas:       cfg.K8sMaxReplicas,
 		ActionCooldown:    cfg.K8sActionCooldown,
-	}
-	if redisClient != nil {
-		kubernetesOptions.Cooldowns = tools.NewRedisCooldownStore(redisClient, cfg.RedisOpTimeout, logger, metrics.SetRedisUp)
+		Cooldowns:         cooldownStore,
 	}
 	kubernetesToolset, kubernetesTools := tools.NewKubernetesTools(clientset, kubernetesOptions)
 	sqlDB, err := store.SQLDB()
@@ -109,7 +103,7 @@ func run(logger *slog.Logger) error {
 	model := agent.NewOpenAIClient(cfg.OpenAIBaseURL, cfg.OpenAIAPIKey, cfg.OpenAIModel, cfg.OpenAITimeout)
 	loop := agent.NewLoop(model, registry, cfg.MaxSteps, cfg.MaxToolOutput, cfg.MaxStoredToolOutput, logger)
 	var routeSuppressor agent.RouteSuppressor
-	if cfg.CoalesceCooldown > 0 && redisClient != nil {
+	if cfg.CoalesceCooldown > 0 {
 		routeSuppressor = agent.NewRedisRouteSuppressor(redisClient, cfg.RedisOpTimeout, logger, metrics.SetRedisUp)
 	}
 	orchestrator := agent.NewOrchestrator(loop, store, agent.OrchestratorOptions{
@@ -117,7 +111,6 @@ func run(logger *slog.Logger) error {
 		Workers:          cfg.Workers,
 		QueueSize:        cfg.QueueSize,
 		RunTimeout:       cfg.RunTimeout,
-		RecoveryMaxAge:   cfg.RecoveryMaxAge,
 		CoalesceCooldown: cfg.CoalesceCooldown,
 		RetryBackoff:     cfg.RetryBackoff,
 		SettleDelay:      cfg.SettleDelay,
@@ -129,24 +122,6 @@ func run(logger *slog.Logger) error {
 		orchestrator.Run()
 		close(orchestratorDone)
 	}()
-
-	// Startup recovery (memory mode only): rows still queued/processing were
-	// claimed by a previous process whose in-memory queue died with it. A
-	// single replica makes them unambiguous orphans, so re-queueing is safe.
-	// In shared mode a live replica may own those rows, so recovery is
-	// skipped until lease-based claiming exists.
-	if cfg.RedisURL == "" {
-		requeued, expired, err := orchestrator.RecoverUnfinished(context.Background())
-		switch {
-		case err != nil:
-			logger.Error("incident recovery incomplete; remaining orphans retry on next restart",
-				"requeued", requeued, "expired", expired, "error", err)
-		case requeued > 0 || expired > 0:
-			logger.Info("incident recovery finished", "requeued", requeued, "expired", expired)
-		}
-	} else {
-		logger.Info("startup incident recovery skipped in shared mode")
-	}
 
 	// In jwt mode INGEST_TOKEN is only a webhook credential; it must not
 	// grant report reads through the static-token fallback.

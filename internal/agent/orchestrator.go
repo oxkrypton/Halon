@@ -40,7 +40,6 @@ type ReportStore interface {
 	Claim(context.Context, incident.TimeoutEvent) (bool, error)
 	MarkProcessing(ctx context.Context, eventID string, startedAt time.Time) error
 	SaveResult(context.Context, incident.Report) error
-	LoadUnfinished(ctx context.Context) ([]incident.Report, error)
 	MarkFailed(ctx context.Context, eventID, cause string, finishedAt time.Time) error
 }
 
@@ -49,9 +48,6 @@ type OrchestratorOptions struct {
 	Workers    int
 	QueueSize  int
 	RunTimeout time.Duration
-	// RecoveryMaxAge bounds how old an unfinished incident may be for
-	// startup recovery to re-queue it; older ones are marked failed.
-	RecoveryMaxAge time.Duration
 	// CoalesceCooldown suppresses subsequent timeouts on the same route after
 	// a completed investigation. Non-positive disables route suppression.
 	CoalesceCooldown time.Duration
@@ -63,7 +59,7 @@ type OrchestratorOptions struct {
 	// enqueues immediately.
 	SettleDelay time.Duration
 	// Suppressor arbitrates per-route windows when CoalesceCooldown > 0.
-	// Nil selects the single-replica MemoryRouteSuppressor.
+	// When nil, per-route suppression is skipped.
 	Suppressor RouteSuppressor
 	Logger     *slog.Logger
 }
@@ -81,7 +77,6 @@ type Orchestrator struct {
 	store            ReportStore
 	level            OperationLevel
 	runTimeout       time.Duration
-	recoveryMaxAge   time.Duration
 	coalesceCooldown time.Duration
 	retryBackoff     time.Duration
 	settleDelay      time.Duration
@@ -108,9 +103,6 @@ func NewOrchestrator(loop *Loop, store ReportStore, options OrchestratorOptions)
 	if options.RunTimeout <= 0 {
 		options.RunTimeout = 5 * time.Minute
 	}
-	if options.RecoveryMaxAge <= 0 {
-		options.RecoveryMaxAge = 30 * time.Minute
-	}
 	if options.CoalesceCooldown < 0 {
 		options.CoalesceCooldown = 0
 	}
@@ -129,16 +121,12 @@ func NewOrchestrator(loop *Loop, store ReportStore, options OrchestratorOptions)
 	var suppressor RouteSuppressor
 	if options.CoalesceCooldown > 0 {
 		suppressor = options.Suppressor
-		if suppressor == nil {
-			suppressor = NewMemoryRouteSuppressor()
-		}
 	}
 	return &Orchestrator{
 		loop:             loop,
 		store:            store,
 		level:            options.Level,
 		runTimeout:       options.RunTimeout,
-		recoveryMaxAge:   options.RecoveryMaxAge,
 		coalesceCooldown: options.CoalesceCooldown,
 		retryBackoff:     options.RetryBackoff,
 		settleDelay:      options.SettleDelay,
@@ -274,51 +262,6 @@ func (o *Orchestrator) failUnqueued(ctx context.Context, event incident.TimeoutE
 	finished := time.Now().UTC()
 	report.FinishedAt = &finished
 	return o.store.SaveResult(ctx, report)
-}
-
-// RecoverUnfinished re-queues incidents that a previous process claimed but
-// never finished: at startup the in-memory queue is empty, so every row
-// still in queued/processing status is an orphan no worker will pick up.
-// Rows younger than RecoveryMaxAge are re-queued for investigation; older
-// ones are marked failed so they do not look perpetually in-flight.
-//
-// Single-replica (memory) mode only: in shared mode a live replica may
-// legitimately own some of these rows, so callers must skip recovery until
-// lease-based claiming exists.
-//
-// Workers must be running (Run) before calling this, because re-queueing
-// blocks when the queue is full. Partial progress is reported on error; the
-// next startup retries the rest.
-func (o *Orchestrator) RecoverUnfinished(ctx context.Context) (requeued, expired int, err error) {
-	reports, err := o.store.LoadUnfinished(ctx)
-	if err != nil {
-		return 0, 0, fmt.Errorf("load unfinished incidents: %w", err)
-	}
-	cutoff := time.Now().Add(-o.recoveryMaxAge)
-	for _, report := range reports {
-		if report.OccurredAt.Before(cutoff) {
-			finished := time.Now().UTC()
-			if failErr := o.store.MarkFailed(ctx, report.EventID, "incident expired while the agent was down", finished); failErr != nil {
-				return requeued, expired, fmt.Errorf("expire incident %s: %w", report.EventID, failErr)
-			}
-			expired++
-			continue
-		}
-		event := report.Event()
-		if o.suppressor != nil {
-			// Best-effort: reserve the route window so new timeouts arriving
-			// right after startup do not kick off a parallel investigation.
-			_, _, _ = o.suppressor.TryAcquire(ctx, event.Route, event.EventID, o.initialWindowTTL())
-		}
-		select {
-		case o.queue <- event:
-			requeued++
-			o.logger.Info("re-queued unfinished incident", "event_id", report.EventID, "status", report.Status)
-		case <-ctx.Done():
-			return requeued, expired, ctx.Err()
-		}
-	}
-	return requeued, expired, nil
 }
 
 // Run starts the worker pool and blocks until Close is called and all

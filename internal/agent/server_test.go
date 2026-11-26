@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
 
 	"github.com/oxkrypton/Halon/internal/incident"
@@ -193,10 +194,12 @@ func TestIngestSuppressesStormAndRecordsMetrics(t *testing.T) {
 	t.Parallel()
 
 	gin.SetMode(gin.TestMode)
+	mr := miniredis.RunT(t)
 	store := &stubReportStore{}
 	metrics := NewMetrics()
 	orchestrator := newTestOrchestratorWithOptions(finalMessageModel("ok"), store, OrchestratorOptions{
 		CoalesceCooldown: 5 * time.Minute,
+		Suppressor:       newTestRedisRouteSuppressor(t, mr, nil),
 	})
 	router := NewHTTPHandler(ServerDeps{
 		Orchestrator: orchestrator,

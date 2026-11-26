@@ -12,60 +12,6 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-func TestMemoryRouteSuppressorLifecycle(t *testing.T) {
-	t.Parallel()
-
-	now := time.Date(2026, 11, 25, 0, 0, 0, 0, time.UTC)
-	store := NewMemoryRouteSuppressor()
-	store.clock = func() time.Time { return now }
-
-	acquired, owner, err := store.TryAcquire(context.Background(), "/api/v1/orders/", "evt-1", 5*time.Minute)
-	if err != nil || !acquired || owner != "evt-1" {
-		t.Fatalf("first TryAcquire = (%v, %q, %v), want (true, evt-1, nil)", acquired, owner, err)
-	}
-
-	// Second event on same route is suppressed and learns the current owner.
-	acquired, owner, err = store.TryAcquire(context.Background(), "/api/v1/orders/", "evt-2", 5*time.Minute)
-	if err != nil || acquired || owner != "evt-1" {
-		t.Fatalf("second TryAcquire = (%v, %q, %v), want (false, evt-1, nil)", acquired, owner, err)
-	}
-
-	// Different route is independent.
-	acquired, owner, err = store.TryAcquire(context.Background(), "/api/v1/users/", "evt-u1", 5*time.Minute)
-	if err != nil || !acquired || owner != "evt-u1" {
-		t.Fatalf("other route TryAcquire = (%v, %q, %v), want (true, evt-u1, nil)", acquired, owner, err)
-	}
-
-	// Non-owner cannot shorten or release the window.
-	_ = store.SetTTL(context.Background(), "/api/v1/orders/", "evt-2", time.Second)
-	_ = store.Release(context.Background(), "/api/v1/orders/", "evt-2")
-	now = now.Add(2 * time.Minute)
-	if acquired, _, _ := store.TryAcquire(context.Background(), "/api/v1/orders/", "evt-3", 5*time.Minute); acquired {
-		t.Fatal("non-owner mutated active window")
-	}
-
-	// Owner shortens TTL to 30s; once elapsed a new event opens a fresh window.
-	_ = store.SetTTL(context.Background(), "/api/v1/orders/", "evt-1", 30*time.Second)
-	now = now.Add(31 * time.Second)
-	acquired, owner, err = store.TryAcquire(context.Background(), "/api/v1/orders/", "evt-4", 5*time.Minute)
-	if err != nil || !acquired || owner != "evt-4" {
-		t.Fatalf("TryAcquire after shortened TTL = (%v, %q, %v), want (true, evt-4, nil)", acquired, owner, err)
-	}
-
-	// Release by owner frees the route immediately.
-	_ = store.Release(context.Background(), "/api/v1/orders/", "evt-4")
-	acquired, owner, err = store.TryAcquire(context.Background(), "/api/v1/orders/", "evt-5", 5*time.Minute)
-	if err != nil || !acquired || owner != "evt-5" {
-		t.Fatalf("TryAcquire after Release = (%v, %q, %v), want (true, evt-5, nil)", acquired, owner, err)
-	}
-
-	// Non-positive SetTTL acts as immediate release.
-	_ = store.SetTTL(context.Background(), "/api/v1/orders/", "evt-5", 0)
-	if acquired, _, _ := store.TryAcquire(context.Background(), "/api/v1/orders/", "evt-6", 5*time.Minute); !acquired {
-		t.Fatal("SetTTL(0) did not release window")
-	}
-}
-
 func newTestRedisRouteSuppressor(t *testing.T, mr *miniredis.Miniredis, onHealth func(bool)) *RedisRouteSuppressor {
 	t.Helper()
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
@@ -158,7 +104,7 @@ func TestRedisRouteSuppressorMultiReplicaConcurrency(t *testing.T) {
 	}
 }
 
-func TestRedisRouteSuppressorFailsOpenToMemory(t *testing.T) {
+func TestRedisRouteSuppressorFailsOpen(t *testing.T) {
 	t.Parallel()
 	mr := miniredis.RunT(t)
 	var up atomic.Bool
@@ -173,16 +119,15 @@ func TestRedisRouteSuppressorFailsOpenToMemory(t *testing.T) {
 	if up.Load() {
 		t.Fatal("health hook was not notified of redis outage")
 	}
-	// Memory fallback still suppresses duplicate timeouts locally.
+	// When Redis is unreachable, subsequent events fail open too rather than suppressing.
 	acquired, owner, err = store.TryAcquire(context.Background(), "/api/v1/orders/", "evt-2", 5*time.Minute)
-	if err != nil || acquired || owner != "evt-1" {
-		t.Fatalf("second degraded TryAcquire = (%v, %q, %v), want local suppression", acquired, owner, err)
+	if err != nil || !acquired || owner != "evt-2" {
+		t.Fatalf("second degraded TryAcquire = (%v, %q, %v), want fail-open acquire", acquired, owner, err)
 	}
-	// Release still clears local fallback without returning an error.
+	if err := store.SetTTL(context.Background(), "/api/v1/orders/", "evt-1", time.Minute); err != nil {
+		t.Fatalf("degraded SetTTL: %v", err)
+	}
 	if err := store.Release(context.Background(), "/api/v1/orders/", "evt-1"); err != nil {
 		t.Fatalf("degraded Release: %v", err)
-	}
-	if acquired, _, err := store.TryAcquire(context.Background(), "/api/v1/orders/", "evt-3", 5*time.Minute); err != nil || !acquired {
-		t.Fatalf("TryAcquire after degraded Release = (%v, %v), want acquired", acquired, err)
 	}
 }

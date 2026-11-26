@@ -21,8 +21,8 @@ type KubernetesOptions struct {
 	AllowedNamespaces []string
 	MaxReplicas       int
 	ActionCooldown    time.Duration
-	// Cooldowns arbitrates mutating actions. Nil selects the single-replica
-	// memory store; shared mode injects a RedisCooldownStore.
+	// Cooldowns arbitrates mutating actions across replicas. When nil, mutating
+	// actions fail closed with ErrCooldownUnavailable.
 	Cooldowns CooldownStore
 }
 
@@ -43,9 +43,6 @@ func NewKubernetesTools(client kubernetes.Interface, options KubernetesOptions) 
 	}
 	if options.ActionCooldown <= 0 {
 		options.ActionCooldown = 2 * time.Minute
-	}
-	if options.Cooldowns == nil {
-		options.Cooldowns = newMemoryCooldownStore()
 	}
 	toolset := &KubernetesToolset{
 		client: client, namespaces: make(map[string]struct{}), maxReplicas: options.MaxReplicas,
@@ -231,10 +228,11 @@ func (k *KubernetesToolset) tools() []agent.Tool {
 				if err := k.checkNamespace(&input.Namespace); err != nil {
 					return nil, err
 				}
-				if err := k.allowAction(ctx, "restart/"+input.Namespace+"/"+input.Pod); err != nil {
+				pod, err := k.client.CoreV1().Pods(input.Namespace).Get(ctx, input.Pod, metav1.GetOptions{})
+				if err != nil {
 					return nil, err
 				}
-				if _, err := k.client.CoreV1().Pods(input.Namespace).Get(ctx, input.Pod, metav1.GetOptions{}); err != nil {
+				if err := k.allowAction(ctx, k.podCooldownKey(ctx, pod)); err != nil {
 					return nil, err
 				}
 				if err := k.client.CoreV1().Pods(input.Namespace).Delete(ctx, input.Pod, metav1.DeleteOptions{}); err != nil {
@@ -266,7 +264,7 @@ func (k *KubernetesToolset) tools() []agent.Tool {
 				if err := k.checkNamespace(&input.Namespace); err != nil {
 					return nil, err
 				}
-				if err := k.allowAction(ctx, "scale/"+input.Namespace+"/"+input.Name); err != nil {
+				if err := k.allowAction(ctx, deploymentCooldownKey(input.Namespace, input.Name)); err != nil {
 					return nil, err
 				}
 				// #nosec G115 -- input.Replicas is validated to 0..k.maxReplicas above.
@@ -314,7 +312,7 @@ func (k *KubernetesToolset) tools() []agent.Tool {
 				if err := k.checkNamespace(&input.Namespace); err != nil {
 					return nil, err
 				}
-				if err := k.allowAction(ctx, "image/"+input.Namespace+"/"+input.Name+"/"+input.Container); err != nil {
+				if err := k.allowAction(ctx, deploymentCooldownKey(input.Namespace, input.Name)); err != nil {
 					return nil, err
 				}
 				err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -409,10 +407,65 @@ func (k *KubernetesToolset) checkNamespace(namespace *string) error {
 	return nil
 }
 
-// allowAction claims the cooldown slot for key. In shared mode the claim is
-// an atomic Redis command, so only one replica executes the action per
-// window; a store outage rejects the mutation instead of risking a repeat.
+func deploymentCooldownKey(namespace, name string) string {
+	return "deployment/" + namespace + "/" + name
+}
+
+func gatewayIPCooldownKey(ip string) string {
+	return "gateway/ip/" + ip
+}
+
+func (k *KubernetesToolset) podCooldownKey(ctx context.Context, pod *corev1.Pod) string {
+	owner, ok := findOwner(pod.OwnerReferences, "ReplicaSet", "Deployment", "StatefulSet", "DaemonSet")
+	if ok {
+		switch owner.Kind {
+		case "ReplicaSet":
+			if k.client != nil {
+				rs, err := k.client.AppsV1().ReplicaSets(pod.Namespace).Get(ctx, owner.Name, metav1.GetOptions{})
+				if err == nil {
+					if deployOwner, ok := findOwner(rs.OwnerReferences, "Deployment"); ok {
+						return deploymentCooldownKey(pod.Namespace, deployOwner.Name)
+					}
+				}
+			}
+		case "Deployment":
+			return deploymentCooldownKey(pod.Namespace, owner.Name)
+		case "StatefulSet", "DaemonSet":
+			return strings.ToLower(owner.Kind) + "/" + pod.Namespace + "/" + owner.Name
+		}
+	}
+	return "pod/" + pod.Namespace + "/" + pod.Name
+}
+
+func findOwner(refs []metav1.OwnerReference, kinds ...string) (metav1.OwnerReference, bool) {
+	matches := func(kind string) bool {
+		for _, candidate := range kinds {
+			if kind == candidate {
+				return true
+			}
+		}
+		return false
+	}
+	for _, ref := range refs {
+		if ref.Controller != nil && *ref.Controller && matches(ref.Kind) {
+			return ref, true
+		}
+	}
+	for _, ref := range refs {
+		if matches(ref.Kind) {
+			return ref, true
+		}
+	}
+	return metav1.OwnerReference{}, false
+}
+
+// allowAction claims the resource-level cooldown slot for key via an atomic
+// Redis command, so only one replica mutates a resource per window; a store
+// outage rejects the mutation instead of risking a conflict.
 func (k *KubernetesToolset) allowAction(ctx context.Context, key string) error {
+	if k.cooldowns == nil {
+		return fmt.Errorf("action %s is unavailable: %w", key, ErrCooldownUnavailable)
+	}
 	remaining, claimed, err := k.cooldowns.Claim(ctx, key, k.cooldown)
 	if err != nil {
 		return fmt.Errorf("action %s is unavailable: %w", key, err)

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -28,79 +27,6 @@ type RouteSuppressor interface {
 	SetTTL(ctx context.Context, route, owner string, ttl time.Duration) error
 	// Release deletes the window for route if still owned by owner.
 	Release(ctx context.Context, route, owner string) error
-}
-
-type memoryWindow struct {
-	owner     string
-	expiresAt time.Time
-}
-
-// MemoryRouteSuppressor is the single-replica RouteSuppressor backed by an
-// in-memory map. It is safe for concurrent use.
-type MemoryRouteSuppressor struct {
-	mu      sync.Mutex
-	clock   func() time.Time
-	windows map[string]memoryWindow
-}
-
-var _ RouteSuppressor = (*MemoryRouteSuppressor)(nil)
-
-func NewMemoryRouteSuppressor() *MemoryRouteSuppressor {
-	return &MemoryRouteSuppressor{
-		clock:   time.Now,
-		windows: make(map[string]memoryWindow),
-	}
-}
-
-func (m *MemoryRouteSuppressor) TryAcquire(_ context.Context, route, owner string, ttl time.Duration) (bool, string, error) {
-	if ttl <= 0 {
-		return true, owner, nil
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	now := m.clock()
-	if w, ok := m.windows[route]; ok && now.Before(w.expiresAt) {
-		return false, w.owner, nil
-	}
-	m.windows[route] = memoryWindow{owner: owner, expiresAt: now.Add(ttl)}
-	m.evictLocked(now)
-	return true, owner, nil
-}
-
-func (m *MemoryRouteSuppressor) SetTTL(_ context.Context, route, owner string, ttl time.Duration) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	w, ok := m.windows[route]
-	if !ok || w.owner != owner {
-		return nil
-	}
-	if ttl <= 0 {
-		delete(m.windows, route)
-		return nil
-	}
-	w.expiresAt = m.clock().Add(ttl)
-	m.windows[route] = w
-	return nil
-}
-
-func (m *MemoryRouteSuppressor) Release(_ context.Context, route, owner string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if w, ok := m.windows[route]; ok && w.owner == owner {
-		delete(m.windows, route)
-	}
-	return nil
-}
-
-func (m *MemoryRouteSuppressor) evictLocked(now time.Time) {
-	if len(m.windows) < 1024 && len(m.windows)&(len(m.windows)-1) != 0 {
-		return
-	}
-	for route, w := range m.windows {
-		if !now.Before(w.expiresAt) {
-			delete(m.windows, route)
-		}
-	}
 }
 
 // acquireWindowScript atomically acquires a route suppression window when no
@@ -130,20 +56,18 @@ end
 return 0
 `)
 
-// RedisRouteSuppressor is the shared-mode RouteSuppressor. Windows live in
-// Redis under halon:incident:route:<route> so N replicas together trigger at
-// most one investigation per route window.
+// RedisRouteSuppressor backs RouteSuppressor in Redis under
+// halon:incident:route:<route> so all agent replicas together trigger at most
+// one investigation per route window.
 //
-// Degradation: unlike mutating K8s cooldowns (which fail closed for safety),
-// storm suppression is a noise/cost optimization. When Redis is unreachable it
-// fails open to an embedded MemoryRouteSuppressor so incidents are still
-// investigated (at worst one per replica per window).
+// Degradation: unlike mutating cooldowns (which fail closed for safety), storm
+// suppression is a noise/cost optimization. When Redis is unreachable it fails
+// open so incidents are still investigated.
 type RedisRouteSuppressor struct {
 	client    *redis.Client
 	opTimeout time.Duration
 	logger    *slog.Logger
 	onHealth  func(bool)
-	fallback  *MemoryRouteSuppressor
 }
 
 var _ RouteSuppressor = (*RedisRouteSuppressor)(nil)
@@ -160,7 +84,6 @@ func NewRedisRouteSuppressor(client *redis.Client, opTimeout time.Duration, logg
 		opTimeout: opTimeout,
 		logger:    logger,
 		onHealth:  onHealth,
-		fallback:  NewMemoryRouteSuppressor(),
 	}
 }
 
@@ -173,20 +96,19 @@ func (s *RedisRouteSuppressor) TryAcquire(ctx context.Context, route, owner stri
 	raw, err := acquireWindowScript.Run(opCtx, s.client, []string{routeSuppressKeyPrefix + route}, owner, ttlMillis(ttl)).Slice()
 	if err != nil {
 		s.reportHealth(false)
-		s.logger.Warn("redis route suppression acquire failed; failing open to memory", "route", route, "error", err)
-		return s.fallback.TryAcquire(ctx, route, owner, ttl)
+		s.logger.Warn("redis route suppression acquire failed; failing open", "route", route, "error", err)
+		return true, owner, nil
 	}
 	s.reportHealth(true)
 	acquired, currentOwner, parseErr := parseAcquireResult(raw)
 	if parseErr != nil {
-		s.logger.Warn("unexpected redis route suppression response; failing open to memory", "route", route, "error", parseErr)
-		return s.fallback.TryAcquire(ctx, route, owner, ttl)
+		s.logger.Warn("unexpected redis route suppression response; failing open", "route", route, "error", parseErr)
+		return true, owner, nil
 	}
 	return acquired, currentOwner, nil
 }
 
 func (s *RedisRouteSuppressor) SetTTL(ctx context.Context, route, owner string, ttl time.Duration) error {
-	_ = s.fallback.SetTTL(ctx, route, owner, ttl)
 	if ttl <= 0 {
 		return s.Release(ctx, route, owner)
 	}
@@ -202,7 +124,6 @@ func (s *RedisRouteSuppressor) SetTTL(ctx context.Context, route, owner string, 
 }
 
 func (s *RedisRouteSuppressor) Release(ctx context.Context, route, owner string) error {
-	_ = s.fallback.Release(ctx, route, owner)
 	opCtx, cancel := context.WithTimeout(ctx, s.opTimeout)
 	defer cancel()
 	if err := releaseIfOwnerScript.Run(opCtx, s.client, []string{routeSuppressKeyPrefix + route}, owner).Err(); err != nil {

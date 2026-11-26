@@ -20,11 +20,9 @@ type stubReportStore struct {
 	claims      int
 	saved       []incident.Report
 	processing  []string
-	unfinished  []incident.Report
 	failed      map[string]string
 	claimExists bool
 	claimErr    error
-	loadErr     error
 }
 
 func (s *stubReportStore) Claim(_ context.Context, event incident.TimeoutEvent) (bool, error) {
@@ -55,15 +53,6 @@ func (s *stubReportStore) SaveResult(_ context.Context, report incident.Report) 
 	defer s.mu.Unlock()
 	s.saved = append(s.saved, report)
 	return nil
-}
-
-func (s *stubReportStore) LoadUnfinished(context.Context) ([]incident.Report, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.loadErr != nil {
-		return nil, s.loadErr
-	}
-	return append([]incident.Report(nil), s.unfinished...), nil
 }
 
 func (s *stubReportStore) MarkFailed(_ context.Context, eventID, cause string, _ time.Time) error {
@@ -194,59 +183,6 @@ func TestOrchestratorRejectsInvalidEvents(t *testing.T) {
 	}
 }
 
-func TestOrchestratorRecoversUnfinishedIncidents(t *testing.T) {
-	fresh := incident.NewReport(testEvent())
-	fresh.OccurredAt = time.Now().Add(-5 * time.Minute)
-	stale := incident.NewReport(testEvent())
-	stale.EventID = "evt-stale"
-	stale.OccurredAt = time.Now().Add(-2 * time.Hour)
-	store := &stubReportStore{unfinished: []incident.Report{fresh, stale}}
-
-	orchestrator := newTestOrchestrator(finalMessageModel("## 事件摘要\n已恢复"), store, 4)
-	go orchestrator.Run()
-	defer orchestrator.Close()
-
-	requeued, expired, err := orchestrator.RecoverUnfinished(context.Background())
-	if err != nil {
-		t.Fatalf("recover: %v", err)
-	}
-	if requeued != 1 || expired != 1 {
-		t.Fatalf("recover = requeued %d, expired %d, want 1/1", requeued, expired)
-	}
-	if cause := store.failedReports()["evt-stale"]; cause == "" {
-		t.Fatalf("stale incident must be marked failed, got %v", store.failedReports())
-	}
-
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		reports := store.savedReports()
-		if len(reports) == 1 {
-			report := reports[0]
-			if report.EventID != fresh.EventID || report.Status != incident.StatusCompleted {
-				t.Fatalf("recovered investigation report: %+v", report)
-			}
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("recovered incident was not investigated in time")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-}
-
-func TestOrchestratorRecoveryPropagatesStoreError(t *testing.T) {
-	store := &stubReportStore{loadErr: errors.New("database unreachable")}
-	orchestrator := newTestOrchestrator(finalMessageModel("ok"), store, 4)
-
-	requeued, expired, err := orchestrator.RecoverUnfinished(context.Background())
-	if err == nil {
-		t.Fatal("load failure must surface")
-	}
-	if requeued != 0 || expired != 0 {
-		t.Fatalf("recover = requeued %d, expired %d, want 0/0", requeued, expired)
-	}
-}
-
 func TestOrchestratorReportsFullQueue(t *testing.T) {
 	store := &stubReportStore{}
 	orchestrator := newTestOrchestrator(finalMessageModel("ok"), store, 1)
@@ -292,10 +228,12 @@ func newTestOrchestratorWithOptions(model Model, store ReportStore, opts Orchest
 }
 
 func TestOrchestratorSuppressesRouteStorm(t *testing.T) {
+	mr := miniredis.RunT(t)
 	store := &stubReportStore{}
 	orchestrator := newTestOrchestratorWithOptions(finalMessageModel("ok"), store, OrchestratorOptions{
 		CoalesceCooldown: 5 * time.Minute,
 		RetryBackoff:     time.Minute,
+		Suppressor:       newTestRedisRouteSuppressor(t, mr, nil),
 	})
 	go orchestrator.Run()
 	defer orchestrator.Close()
@@ -349,20 +287,8 @@ func TestOrchestratorSuppressesRouteStorm(t *testing.T) {
 }
 
 func TestOrchestratorCooldownAndRetryBackoff(t *testing.T) {
-	var nowMu sync.Mutex
-	now := time.Date(2026, 11, 25, 0, 0, 0, 0, time.UTC)
-	advance := func(d time.Duration) {
-		nowMu.Lock()
-		now = now.Add(d)
-		nowMu.Unlock()
-	}
-
-	suppressor := NewMemoryRouteSuppressor()
-	suppressor.clock = func() time.Time {
-		nowMu.Lock()
-		defer nowMu.Unlock()
-		return now
-	}
+	mr := miniredis.RunT(t)
+	suppressor := newTestRedisRouteSuppressor(t, mr, nil)
 
 	var failNext atomic.Bool
 	failNext.Store(true)
@@ -389,9 +315,10 @@ func TestOrchestratorCooldownAndRetryBackoff(t *testing.T) {
 		t.Fatalf("evt1 = (%+v, %v)", res, err)
 	}
 	waitReports(t, store, 1)
+	waitRouteTTL(t, mr, evt1.Route, func(ttl time.Duration) bool { return ttl > 0 && ttl <= time.Minute })
 
 	// Within 1m backoff, another event is suppressed.
-	advance(30 * time.Second)
+	mr.FastForward(30 * time.Second)
 	evtBlocked := testEvent()
 	evtBlocked.EventID = "evt-blocked-backoff"
 	if res, err := orchestrator.Submit(context.Background(), evtBlocked); err != nil || res.Outcome != SubmitSuppressed {
@@ -400,16 +327,17 @@ func TestOrchestratorCooldownAndRetryBackoff(t *testing.T) {
 
 	// Past 1m backoff (still < 5m cooldown), next event is accepted and succeeds.
 	failNext.Store(false)
-	advance(40 * time.Second)
+	mr.FastForward(40 * time.Second)
 	evt2 := testEvent()
 	evt2.EventID = "evt-ok"
 	if res, err := orchestrator.Submit(context.Background(), evt2); err != nil || res.Outcome != SubmitAccepted {
 		t.Fatalf("after backoff: (%+v, %v), want accepted", res, err)
 	}
 	waitReports(t, store, 2)
+	waitRouteTTL(t, mr, evt2.Route, func(ttl time.Duration) bool { return ttl > time.Minute && ttl <= 5*time.Minute })
 
 	// After success, window stays closed for full 5m cooldown.
-	advance(2 * time.Minute)
+	mr.FastForward(2 * time.Minute)
 	evtBlockedCooldown := testEvent()
 	evtBlockedCooldown.EventID = "evt-blocked-cooldown"
 	if res, err := orchestrator.Submit(context.Background(), evtBlockedCooldown); err != nil || res.Outcome != SubmitSuppressed {
@@ -417,7 +345,7 @@ func TestOrchestratorCooldownAndRetryBackoff(t *testing.T) {
 	}
 
 	// Past 5m cooldown, a fresh investigation opens.
-	advance(4 * time.Minute)
+	mr.FastForward(4 * time.Minute)
 	evt3 := testEvent()
 	evt3.EventID = "evt-reopen"
 	if res, err := orchestrator.Submit(context.Background(), evt3); err != nil || res.Outcome != SubmitAccepted {
@@ -427,9 +355,11 @@ func TestOrchestratorCooldownAndRetryBackoff(t *testing.T) {
 }
 
 func TestOrchestratorReleasesWindowOnClaimFailureOrDuplicate(t *testing.T) {
+	mr := miniredis.RunT(t)
 	store := &stubReportStore{claimErr: errors.New("db hiccup")}
 	orchestrator := newTestOrchestratorWithOptions(finalMessageModel("ok"), store, OrchestratorOptions{
 		CoalesceCooldown: 5 * time.Minute,
+		Suppressor:       newTestRedisRouteSuppressor(t, mr, nil),
 	})
 
 	evt1 := testEvent()
@@ -461,10 +391,12 @@ func TestOrchestratorReleasesWindowOnClaimFailureOrDuplicate(t *testing.T) {
 }
 
 func TestOrchestratorSettleDelay(t *testing.T) {
+	mr := miniredis.RunT(t)
 	store := &stubReportStore{}
 	orchestrator := newTestOrchestratorWithOptions(finalMessageModel("ok"), store, OrchestratorOptions{
 		CoalesceCooldown: 5 * time.Minute,
 		SettleDelay:      60 * time.Millisecond,
+		Suppressor:       newTestRedisRouteSuppressor(t, mr, nil),
 	})
 	go orchestrator.Run()
 	defer orchestrator.Close()
@@ -488,8 +420,9 @@ func TestOrchestratorSettleDelay(t *testing.T) {
 }
 
 func TestOrchestratorCloseCancelsPendingSettleAndReleasesWindow(t *testing.T) {
+	mr := miniredis.RunT(t)
 	store := &stubReportStore{}
-	suppressor := NewMemoryRouteSuppressor()
+	suppressor := newTestRedisRouteSuppressor(t, mr, nil)
 	orchestrator := newTestOrchestratorWithOptions(finalMessageModel("ok"), store, OrchestratorOptions{
 		CoalesceCooldown: 5 * time.Minute,
 		SettleDelay:      10 * time.Second,
@@ -587,6 +520,22 @@ func waitReports(t *testing.T, store *stubReportStore, want int) {
 	for len(store.savedReports()) < want {
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out waiting for %d saved reports (got %d)", want, len(store.savedReports()))
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func waitRouteTTL(t *testing.T, mr *miniredis.Miniredis, route string, check func(time.Duration) bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	key := routeSuppressKeyPrefix + route
+	for {
+		ttl := mr.TTL(key)
+		if check(ttl) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for route TTL on %s (last=%v)", key, ttl)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}

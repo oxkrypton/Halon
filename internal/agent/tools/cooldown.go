@@ -12,10 +12,7 @@ import (
 
 // CooldownStore arbitrates which replica may execute a mutating action.
 // Claim reserves key for ttl; when the key is already held it reports the
-// remaining wait instead. The single-replica memory mode uses
-// memoryCooldownStore; the shared multi-replica mode uses
-// RedisCooldownStore, where SET NX PX plays the same arbitration role as
-// incident.Store.Claim's ON CONFLICT DO NOTHING.
+// remaining wait instead.
 type CooldownStore interface {
 	Claim(ctx context.Context, key string, ttl time.Duration) (remaining time.Duration, claimed bool, err error)
 }
@@ -25,30 +22,8 @@ type CooldownStore interface {
 // a safety feature must never fail open.
 var ErrCooldownUnavailable = fmt.Errorf("cooldown store unavailable")
 
-// memoryCooldownStore is the single-replica CooldownStore (the pre-shared
-// mode behavior): a map guarded by a mutex.
-type memoryCooldownStore struct {
-	mu   sync.Mutex
-	last map[string]time.Time
-}
-
-func newMemoryCooldownStore() *memoryCooldownStore {
-	return &memoryCooldownStore{last: make(map[string]time.Time)}
-}
-
-func (m *memoryCooldownStore) Claim(_ context.Context, key string, ttl time.Duration) (time.Duration, bool, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	now := time.Now()
-	if last, ok := m.last[key]; ok && now.Sub(last) < ttl {
-		return ttl - now.Sub(last), false, nil
-	}
-	m.last[key] = now
-	return 0, true, nil
-}
-
-// RedisCooldownStore is the shared-mode CooldownStore. Claims are atomic
-// SET NX PX commands, so N replicas together execute a mutating action at
+// RedisCooldownStore backs CooldownStore with atomic Redis SET NX PX commands,
+// so all agent replicas together execute a mutating action on a resource at
 // most once per cooldown window. A background pinger keeps the health hook
 // current because mutations can be hours apart.
 type RedisCooldownStore struct {

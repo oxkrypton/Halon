@@ -28,7 +28,7 @@ func NewMetrics() *Metrics {
 		registry: prometheus.NewRegistry(),
 		redisUp: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "halon_agent_redis_up",
-			Help: "Whether the shared-state Redis is reachable (1) or degraded (0). Always 1 in memory mode.",
+			Help: "Whether Redis is reachable (1) or degraded (0).",
 		}),
 		incidentAdmissions: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "halon_agent_incident_admissions_total",
@@ -48,8 +48,7 @@ func (m *Metrics) IncIncidentAdmission(outcome string) {
 	m.incidentAdmissions.WithLabelValues(outcome).Inc()
 }
 
-// SetRedisUp records shared-state Redis reachability. In memory mode it is
-// simply never called and the gauge stays at its initial 1.
+// SetRedisUp records Redis reachability.
 func (m *Metrics) SetRedisUp(up bool) {
 	if m == nil {
 		return
