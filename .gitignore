@@ -16,3 +16,8 @@
 
 # Runtime files
 *.log
+
+# Web frontend
+web/node_modules/
+web/dist/
+

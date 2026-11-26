@@ -1,0 +1,28 @@
+:root {
+  --gc-bg-canvas: #f8f9fa;
+  --gc-bg-surface: #ffffff;
+  --gc-bg-subtle: #f1f3f4;
+  --gc-bg-hover: #f5f7f9;
+  --gc-border: #dadce0;
+  --gc-border-light: #e8eaed;
+
+  --gc-text-primary: #202124;
+  --gc-text-secondary: #5f6368;
+  --gc-text-muted: #80868b;
+
+  --gc-blue: #1a73e8;
+  --gc-blue-hover: #1765cc;
+  --gc-blue-soft: #e8f0fe;
+  --gc-blue-text: #1967d2;
+
+  --gc-green: #1e8e3e;
+  --gc-green-soft: #e6f4ea;
+  --gc-yellow: #f9ab00;
+  --gc-yellow-text: #b06000;
+  --gc-yellow-soft: #fef7e0;
+  --gc-red: #d93025;
+  --gc-red-soft: #fce8e6;
+
+  --gc-font-sans: "Inter", "Roboto", "Noto Sans SC", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --gc-font-mono: "Roboto Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}

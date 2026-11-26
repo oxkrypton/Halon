@@ -1,0 +1,115 @@
+@import "tailwindcss";
+@import "./theme/tokens.css";
+
+@layer base {
+  body {
+    font-family: var(--gc-font-sans);
+    background-color: var(--gc-bg-canvas);
+    color: var(--gc-text-primary);
+    font-size: 13px;
+    line-height: 1.5;
+  }
+
+  code,
+  pre,
+  .font-mono {
+    font-family: var(--gc-font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+.gc-card {
+  background: var(--gc-bg-surface);
+  border: 1px solid var(--gc-border);
+  border-radius: 8px;
+}
+
+.gc-card-subtle {
+  background: var(--gc-bg-surface);
+  border: 1px solid var(--gc-border-light);
+  border-radius: 8px;
+}
+
+.gc-markdown h1,
+.gc-markdown h2,
+.gc-markdown h3 {
+  font-weight: 600;
+  color: var(--gc-text-primary);
+  margin-top: 1.15em;
+  margin-bottom: 0.45em;
+}
+
+.gc-markdown h2 {
+  font-size: 15px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--gc-border-light);
+}
+
+.gc-markdown h3 {
+  font-size: 13.5px;
+}
+
+.gc-markdown p,
+.gc-markdown ul,
+.gc-markdown ol {
+  margin-bottom: 0.65em;
+  color: #3c4043;
+}
+
+.gc-markdown ul,
+.gc-markdown ol {
+  padding-left: 1.25rem;
+}
+
+.gc-markdown ul {
+  list-style: disc;
+}
+
+.gc-markdown ol {
+  list-style: decimal;
+}
+
+.gc-markdown pre {
+  background: #f1f3f4;
+  border: 1px solid var(--gc-border-light);
+  border-radius: 6px;
+  padding: 10px 12px;
+  overflow-x: auto;
+  font-size: 12px;
+  margin: 0.6em 0;
+}
+
+.gc-markdown code {
+  background: #f1f3f4;
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 12px;
+}
+
+.gc-markdown pre code {
+  background: transparent;
+  padding: 0;
+}
+
+.gc-markdown table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.75em 0;
+  font-size: 12px;
+}
+
+.gc-markdown th,
+.gc-markdown td {
+  border: 1px solid var(--gc-border);
+  padding: 6px 10px;
+  text-align: left;
+}
+
+.gc-markdown th {
+  background: var(--gc-bg-canvas);
+  font-weight: 600;
+}
