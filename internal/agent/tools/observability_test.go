@@ -80,7 +80,7 @@ func TestQueryTrafficStatsReturnsEmptySet(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func(database *sql.DB) { _ = database.Close() }(database)
-	rows := sqlmock.NewRows([]string{"path", "status_code", "count", "avg", "max", "p95", "server_errors"})
+	rows := sqlmock.NewRows([]string{"path", "status_code", "count", "avg", "max", "p95", "p99", "server_errors"})
 	mock.ExpectQuery("SELECT path, status_code").WithArgs(30, "/api/v1/users/1").WillReturnRows(rows)
 	results, err := queryTrafficStats(context.Background(), database, "/api/v1/users/1", 30)
 	if err != nil || len(results) != 0 {

@@ -38,6 +38,7 @@ type TrafficStatRow struct {
 	AverageMS    float64 `json:"average_ms"`
 	MaximumMS    float64 `json:"maximum_ms"`
 	P95MS        float64 `json:"p95_ms"`
+	P99MS        float64 `json:"p99_ms"`
 	ServerErrors int64   `json:"server_errors"`
 }
 
@@ -208,7 +209,7 @@ func queryTrafficStats(ctx context.Context, database *sql.DB, path string, minut
 		arguments = append(arguments, path)
 		filter = " AND path = $2"
 	}
-	query := `SELECT path, status_code, COUNT(*), AVG(latency_ms), MAX(latency_ms), percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms), COUNT(*) FILTER (WHERE status_code >= 500)
+	query := `SELECT path, status_code, COUNT(*), AVG(latency_ms), MAX(latency_ms), percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms), percentile_cont(0.99) WITHIN GROUP (ORDER BY latency_ms), COUNT(*) FILTER (WHERE status_code >= 500)
 FROM base_logs WHERE created_at >= NOW() - make_interval(mins => $1)` + filter + ` GROUP BY path, status_code ORDER BY COUNT(*) DESC LIMIT 50`
 	ctx, cancel := queryContext(ctx)
 	defer cancel()
@@ -220,7 +221,7 @@ FROM base_logs WHERE created_at >= NOW() - make_interval(mins => $1)` + filter +
 	results := make([]TrafficStatRow, 0)
 	for rows.Next() {
 		var row TrafficStatRow
-		if err := rows.Scan(&row.Path, &row.StatusCode, &row.Requests, &row.AverageMS, &row.MaximumMS, &row.P95MS, &row.ServerErrors); err != nil {
+		if err := rows.Scan(&row.Path, &row.StatusCode, &row.Requests, &row.AverageMS, &row.MaximumMS, &row.P95MS, &row.P99MS, &row.ServerErrors); err != nil {
 			return nil, err
 		}
 		results = append(results, row)
