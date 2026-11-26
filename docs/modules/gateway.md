@@ -19,13 +19,16 @@
 | 文件 | 内容 |
 | --- | --- |
 | `proxy.go` | `RouteTable`:`ParseRoutes` 解析 `前缀=上游` 配置(最长前缀优先、启动时校验);`ProxyHandler` 反向代理(保留完整路径、注入 `X-Forwarded-For`、按请求限时、请求体上限与重试体缓冲);`newUpstreamTransport` 分阶段超时(拨号/TLS/响应头)与连接池;`upstreamErrorHandler` 错误分类(超时 504、熔断 503、并发满 429、体过大 413、其余 502);`routeLabel` 统一指标/事件的路由标签 |
-| `resilience.go` | 弹性策略组合(`failsafe-go`):每路由 bulkhead(并发上限)→ circuit breaker(熔断)→ retry(仅传输层错误、仅幂等);`observingTransport` 记录上游调用指标与单次请求结果;`ResilienceSet.BreakerStatuses` 供管理接口查询 |
+| `resilience.go` | 弹性策略组合(`failsafe-go`):每路由 bulkhead(并发上限)→ circuit breaker(熔断)→ retry(仅传输层错误、仅幂等);`observingTransport` 记录上游调用指标、耗时与单次请求结果;`ResilienceSet.BreakerStatuses` 供管理接口查询 |
 | `tracing.go` | OpenTelemetry 接入:`OTEL_ENABLED=true` 时初始化 OTLP gRPC exporter 与 TracerProvider;`WrapHandler` 给业务端口打 server span,`WrapTransport` 给上游调用打 client span 并注入 `traceparent`;禁用时全部透传零开销 |
-| `server.go` | `NewHTTPHandler`:探针路由 + 把代理链(黑名单 → 限流 → 路由表)挂载到 `NoRoute`(任意前缀无需注册路由);`NewAdminHandler`(`/admin/rules/*` + `/admin/breakers` + `/metrics` + 可选 `/auth/*` 与 `/admin/users/*`,`authz.Middleware` 认证 + 按路由 `authz.Require` 授权,写/读请求统一审计日志与指标);`readinessHandler`(只查数据库) |
+| `tempo.go` | 只读 Tempo HTTP 客户端(`/api/search` 与 `/api/traces/:id`),归一化 OTLP JSON Span 树;未配置 `TEMPO_URL` 时通过 `synthesizeTraceFromLogs` 从 PG 日志构造「网关+上游」两级瀑布流 |
+| `observability_handlers.go` | 管理面观测聚合与系统信息接口:`/admin/system`、`/admin/observability/{overview,timeseries,routes,logs,logs/:id,top-ips}` |
+| `trace_handlers.go` | 管理面链路追踪接口:`/admin/traces` 与 `/admin/traces/:trace_id`(支持 Tempo 优先 + PG 降级与关联报文) |
+| `server.go` | `NewHTTPHandler`:探针路由 + 把代理链(黑名单 → 限流 → 路由表)挂载到 `NoRoute`(任意前缀无需注册路由);`NewAdminHandler`(`/admin/rules/*` + `/admin/breakers` + `/admin/system` + `/admin/observability/*` + `/admin/traces/*` + `/metrics` + 可选 `/auth/*` 与 `/admin/users/*`,`authz.Middleware` 认证 + 按路由 `authz.Require` 授权,写/读请求统一审计日志与指标);`readinessHandler`(只查数据库) |
 | `auth_handlers.go` | 本地登录/刷新/登出/自助改密(`/auth/login`、`/auth/refresh`、`/auth/logout`、`/auth/me`、`/auth/password`,均受体大小上限与 `/auth/{login,refresh,logout}` 限流保护);未开启 `AUTH_LOGIN_ENABLED` 时返回 `404 LOGIN_DISABLED` |
 | `user_handlers.go` | 管理员用户管理接口(`/admin/users`、`POST /admin/users`、`/admin/users/:id`、`PATCH /admin/users/:id`、`POST /admin/users/:id/password`),校验 UUID 与字段长度,保护自身与最后管理员 |
 | `errors.go` | 统一错误响应结构 `abortWithError` 与 `upstream_timeout` 标记键 |
-| `accesslog.go` | `AccessLog` 中间件:采集请求/响应体(各自最多 `BODY_CAPTURE_BYTES`),投递日志队列;检测超时标记并投递超时事件队列;日志字段含 `route`、`trace_id`(启用 OTel 时)、`upstream_result`、`retries`;维护在途请求 gauge 与队列丢弃计数 |
+| `accesslog.go` | `AccessLog` 中间件:采集请求/响应体(各自最多 `BODY_CAPTURE_BYTES`),连同 `trace_id`、`route`、`upstream_latency_ms`、`upstream_result`、`retries` 投递日志队列;检测超时标记并投递超时事件队列;维护在途请求 gauge 与队列丢弃计数 |
 | `notify.go` | `TimeoutNotifier`:消费超时事件队列,POST JSON 到 `AGENT_WEBHOOK_URL`,带 Bearer Token,最多 3 次指数退避重试;最终失败计入 `halon_gateway_webhook_notify_failures_total` |
 | `rules.go` | `BlacklistStore` 接口(Add/Remove/Contains/List)、`ErrBlacklistUnavailable`、IP 规范化(`canonicalIP`)与 `BlacklistMiddleware` 拦截计数 |
 | `rules_redis.go` | `RedisBlacklistStore`:Redis 集合 `halon:blacklist` 为事实源,进程内缓存服务读路径;pub/sub 即时失效 + TTL 兜底刷新;写失败返回 `ErrBlacklistUnavailable`(管理接口 503) |
@@ -98,6 +101,7 @@ ProxyHandler 带 UPSTREAM_TIMEOUT 的 context 调上游
 - `BREAKER_ENABLED` 默认 true;`CONCURRENCY_PER_ROUTE` 默认 256,`0` 表示不限;
 - `MAX_REQUEST_BODY_BYTES` 默认 10 MiB,`0` 表示不限;
 - `OTEL_ENABLED` 默认 false,开启需配套 `OTEL_EXPORTER_OTLP_ENDPOINT`(host:port,不带 scheme)。
+- `TEMPO_URL` 默认空(可选),配置为 Tempo HTTP 地址(如 `http://tempo.observability.svc.cluster.local:3200`)后 `/admin/traces*` 将查询 Tempo 分布式链路;`TEMPO_TIMEOUT` 默认 `5s`。
 
 ## 错误语义
 
@@ -128,7 +132,7 @@ ProxyHandler 带 UPSTREAM_TIMEOUT 的 context 调上游
 
 ## 测试
 
-`auth_test.go`(管理接口角色×端点矩阵、legacy/hybrid/jwt 模式、审计指标)、`auth_handlers_test.go`(登录/刷新/登出/改密/限流/禁用态)、`user_handlers_test.go`(用户管理角色矩阵、UUID 与字段校验、脱敏与错误映射)、`server_test.go`(代理转发/透传/超时/不可达/404、路由表解析、探针、管理接口、限流)、`observability_test.go`(超时事件与指标、webhook 投递)、`resilience_test.go`(重试与体重放、熔断迁移与 503 快速失败、bulkhead 打满 429、请求体上限 413、响应头超时归类 504、`/metrics` 鉴权、`/admin/breakers`;上游传输用桩 RoundTripper 保证确定性)、`tracing_test.go`(OTel 禁用透传、server/client span 同 trace、`traceparent` 透传,用 in-memory span recorder)、`rules_redis_test.go`(黑名单增删、IPv6 规范化、外部写入刷新、双副本 pub/sub 传播、TTL 兜底、降级读缓存/写 503;`alicebob/miniredis` 进程内仿真)、`ratelimit_redis_test.go`(Lua 令牌桶 refill/突发边界、双副本合计限额、参数跨副本传播、降级 fail-open/写 503)、`config_test.go`(配置校验)。真实上游一律用 `httptest.NewServer`。
+`auth_test.go`(管理接口角色×端点矩阵、legacy/hybrid/jwt 模式、审计指标)、`auth_handlers_test.go`(登录/刷新/登出/改密/限流/禁用态)、`user_handlers_test.go`(用户管理角色矩阵、UUID 与字段校验、脱敏与错误映射)、`server_test.go`(代理转发/透传/超时/不可达/404、路由表解析、探针、管理接口、限流)、`observability_test.go`(超时事件与指标、webhook 投递)、`observability_handlers_test.go`(`/admin/system`、`/admin/observability/*`、`/admin/traces/*` 与参数/权限校验)、`tempo_test.go`(Tempo 搜索与 OTLP JSON 解码 + PG 降级瀑布流合成)、`resilience_test.go`(重试与体重放、熔断迁移与 503 快速失败、bulkhead 打满 429、请求体上限 413、响应头超时归类 504、`/metrics` 鉴权、`/admin/breakers`;上游传输用桩 RoundTripper 保证确定性)、`tracing_test.go`(OTel 禁用透传、server/client span 同 trace、`traceparent` 透传,用 in-memory span recorder)、`rules_redis_test.go`(黑名单增删、IPv6 规范化、外部写入刷新、双副本 pub/sub 传播、TTL 兜底、降级读缓存/写 503;`alicebob/miniredis` 进程内仿真)、`ratelimit_redis_test.go`(Lua 令牌桶 refill/突发边界、双副本合计限额、参数跨副本传播、降级 fail-open/写 503)、`config_test.go`(配置校验)。真实上游一律用 `httptest.NewServer`。
 
 ## 修改本模块时必须同步检查
 

@@ -17,7 +17,7 @@
 | 工具 | 说明 | 关键参数约束 |
 | --- | --- | --- |
 | `query_error_logs` | 查 PostgreSQL 错误/慢请求报文,优先按 incident 的 request_id | minutes 1..1440,limit 1..100 |
-| `query_traffic_stats` | 按路径+状态码聚合请求量、均值、P95、5xx 数 | 同上 |
+| `query_traffic_stats` | 按路径+状态码聚合请求量、均值、P95、P99、5xx 数 | 同上 |
 | `query_top_ips` | 按客户端 IP 聚合请求量与错误数 | 同上 |
 | `query_prometheus` | 只读 PromQL 即时查询(`PROMETHEUS_URL` 为空时报配置错误) | query 必填 |
 | `k8s_list_pods` | 列 Pod(状态、重启次数、容器状态) | namespace 白名单,limit 1..100 |

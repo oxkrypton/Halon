@@ -16,7 +16,8 @@
 | `make test` | `go test -race ./...` + `go vet ./...`,**每次提交前必跑** |
 | `make lint` | `golangci-lint run ./...`(配置见 `.golangci.yml`),**每次提交前必跑** |
 | `make build` / `make build-demo` | 构建产品二进制 `bin/gateway`、`bin/agent`、`bin/halonctl` 与演示二进制 `bin/user-service-demo` |
-| `make run-gateway` / `make run-agent` / `make run-demo` | 本地运行(环境变量见各模块文档) |
+| `make run-gateway` / `make run-agent` / `make run-demo` / `make run-web` | 本地运行(环境变量见各模块文档;`run-web` 启动 Vite 前端) |
+| `make build-web` / `make docker-build-web` / `make deploy-web` | 前端类型检查/构建、构建 `halon/web:dev` 镜像与部署可选控制台清单 |
 | `make docker-build` / `make docker-build-demo` | 构建产品镜像与演示镜像 |
 | `make deploy` | `kubectl apply -f deploy/kubernetes/`(适用于任意 K8s 集群) |
 

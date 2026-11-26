@@ -36,6 +36,7 @@ Agent 服务:事件去重 → 编排器队列 → LLM 排查循环(工具调用)
 | Agent 核心(循环/编排/API/配置) | [docs/modules/agent.md](docs/modules/agent.md) | `internal/agent`、`cmd/agent` |
 | Agent 工具层 | [docs/modules/agent-tools.md](docs/modules/agent-tools.md) | `internal/agent/tools` |
 | RBAC 与 JWT 鉴权 | [docs/modules/auth.md](docs/modules/auth.md) | `internal/authz`、`internal/identity`、`cmd/halonctl` |
+| Web 管理控制台 | [docs/modules/web.md](docs/modules/web.md) | `web/`、`deploy/kubernetes/web` |
 | 超时事件与故障报告 | [docs/modules/incident.md](docs/modules/incident.md) | `internal/incident` |
 | 流量日志存储 | [docs/modules/trafficlog.md](docs/modules/trafficlog.md) | `internal/trafficlog` |
 | 演示后端(示例,非产品) | [examples/user-service/README.md](examples/user-service/README.md)、[examples/order-service/README.md](examples/order-service/README.md) | `examples/` |
@@ -50,7 +51,8 @@ make test            # go test -race ./... && go vet ./...(每次提交前必跑
 make lint            # golangci-lint(每次提交前必跑;CI 在 push/PR 上强制同样检查)
 make build           # 构建 gateway / agent / halonctl 三个二进制
 make build-demo      # 构建演示后端二进制
-make run-gateway / run-agent / run-demo   # 本地运行(环境变量见各模块文档)
+make run-gateway / run-agent / run-demo / run-web   # 本地运行(环境变量见各模块文档)
+make build-web / docker-build-web / deploy-web     # Web 控制台构建与部署
 make docker-build    # 构建网关与 Agent 镜像;make docker-build-demo 构建演示镜像
 make deploy          # kubectl apply -f deploy/kubernetes/(适用于任意 K8s)
 ```

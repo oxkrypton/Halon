@@ -17,6 +17,7 @@
 | `incident:read` | ✓ | ✓ | ✓ |
 | `gateway:rules:read` / `gateway:breaker:read` | ✓ | ✓ | ✓ |
 | `gateway:metrics:read`(`/metrics` 抓取) | ✓ | ✓ | ✓ |
+| `gateway:observability:read`(`/admin/system`、`/admin/observability/*`、`/admin/traces/*`) | ✓ | ✓ | ✓ |
 | `tool:observe`(`query_*`、`k8s_*` 只读工具) | ✓ | ✓ | ✓ |
 | `gateway:blacklist:write`(`gateway_block_ip` 所需) | | ✓ | ✓ |
 | `tool:k8s:restart_pod` / `tool:k8s:scale` | | ✓ | ✓ |

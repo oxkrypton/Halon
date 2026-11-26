@@ -54,13 +54,14 @@ Gin Gateway -- 504 webhook --> Agent Service (:8081)
 - 统一 JSON 错误响应和 `X-Request-ID` 请求追踪(自动透传到上游)。
 - 基于 Redis 的 IP 黑名单(进程内缓存 + pub/sub 失效与 TTL 兜底)及按客户端 IP 的 Redis Lua 令牌桶限流。
 - 独立管理端口 `:9090`,支持动态更新黑名单和限流参数、查询各路由熔断状态,暴露 Prometheus 指标(全指标清单见 [docs/modules/gateway.md](docs/modules/gateway.md))。
-- 可选 OpenTelemetry 追踪(`OTEL_ENABLED`):自动注入/透传 W3C `traceparent`,上游零改动;`trace_id` 写入结构化日志实现日志↔追踪互跳。配套开源观测栈(OTel Collector + Tempo + Loki + Prometheus + Grafana)见 `deploy/kubernetes/observability/`。
+- 可选 OpenTelemetry 追踪(`OTEL_ENABLED`):自动注入/透传 W3C `traceparent`,上游零改动;`trace_id`、`route`、`upstream_latency_ms` 写入 PostgreSQL `base_logs` 并打印到结构化日志。配套可选观测栈见 `deploy/kubernetes/observability/`。
+- 可选 Web 管理控制台(`web/`):Google Cloud Console 风格 React 前端,内置 P50/P95/P99 分位数趋势、类 Jaeger 链路追踪瀑布流(支持 Tempo 或 PG 降级)、请求/错误日志、Agent AI 故障报告与熔断/黑名单/限流/用户管控,详见 [docs/modules/web.md](docs/modules/web.md)。
 - `/healthz` 存活检查和 `/readyz` 数据库就绪检查。
 - HTTP 超时、Panic 恢复、平滑退出及非 root 容器运行。
 
 ### PostgreSQL 日志存储
 
-- `base_logs`:记录全部 HTTP 请求的 IP、路径、状态码和耗时。
+- `base_logs`:记录全部 HTTP 请求的 IP、路径、路由、状态码、总耗时、上游耗时、上游结果、重试次数与可选 `trace_id`。
 - `error_body`:仅记录状态码不低于 400 或耗时达到阈值的请求报文,默认最多各截取 64 KiB。
 - 有界队列异步写入,默认每 500 条或每 1 秒批量提交。
 - 基础日志和详情日志在同一事务中写入,失败批次最多重试 3 次。
@@ -162,6 +163,9 @@ curl -s http://localhost:8081/api/v1/incidents -H 'Authorization: Bearer halon-l
 | `GET /admin/rules/rate-limit` | `gateway:rules:read` | 查询限流参数 |
 | `PUT /admin/rules/rate-limit` | `gateway:ratelimit:write` | 更新限流参数 |
 | `GET /admin/breakers` | `gateway:breaker:read` | 查询各路由熔断器状态 |
+| `GET /admin/system` | `gateway:observability:read` | 查询当前登录主体、路由表、能力开关与 Redis 状态 |
+| `GET /admin/observability/{overview,timeseries,routes,logs,logs/:id,top-ips}` | `gateway:observability:read` | 查询 PostgreSQL 精确 P50/P95/P99、时序、路由排行、请求报文与 Top IP |
+| `GET /admin/traces` / `GET /admin/traces/:trace_id` | `gateway:observability:read` | 查询分布式链路列表与 Span 瀑布流(支持 Tempo 优先与 PostgreSQL 降级) |
 | `POST /auth/login` / `refresh` / `logout` | — | 本地登录、Refresh Token 轮转与登出(仅 `AUTH_LOGIN_ENABLED=true`,否则 `404 LOGIN_DISABLED`) |
 | `GET /auth/me` / `POST /auth/password` | Bearer JWT | 查看当前主体与自助改密(允许 `pcr=true` 令牌;仅 `AUTH_LOGIN_ENABLED=true`) |
 | `GET /admin/users` / `GET /admin/users/:id` | `auth:user:read` | 查询本地用户列表或单个用户(仅 `AUTH_LOGIN_ENABLED=true`) |
@@ -340,6 +344,8 @@ kubectl rollout restart deployment/agent
 | `OTEL_ENABLED` | `false` | OpenTelemetry 追踪开关 |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `otel-collector.observability.svc.cluster.local:4317` | OTLP gRPC 端点(host:port,不带 scheme) |
 | `OTEL_TRACES_SAMPLER_RATIO` | `1.0` | 采样比例(0–1,父 span 优先) |
+| `TEMPO_URL` | 空 | 可选 Tempo HTTP 查询地址(如 `http://tempo.observability.svc.cluster.local:3200`) |
+| `TEMPO_TIMEOUT` | `5s` | Tempo 查询 HTTP 超时 |
 | `AGENT_WEBHOOK_URL` | 空 | Agent 超时事件接收地址,为空则不推送 |
 | `AGENT_WEBHOOK_TOKEN` | 空 | Agent 接收接口 Bearer Token,配置 URL 后必填 |
 | `REDIS_URL` | 必填 | Redis 连接串(如 `redis://redis:6379/0`),承载黑名单与限流状态 |
@@ -412,7 +418,9 @@ kubectl rollout restart deployment/agent
 │   ├── gateway.yaml              # 网关 Deployment 和 Service
 │   ├── postgres.yaml             # PostgreSQL StatefulSet、Service 和 PVC
 │   ├── redis.yaml                # Redis Deployment 和 Service(开发参考清单)
+│   ├── web/                      # 可选 Web 管理控制台 Deployment 和 Service
 │   └── observability/            # 可选观测栈:OTel Collector、Tempo、Loki、Alloy、Prometheus、Alertmanager、Grafana
+├── web/                          # Google 风格 React + TypeScript 管理控制台(Vite + ECharts + Nginx)
 ├── docs/
 │   ├── README.md                 # 文档索引与文档维护规则
 │   ├── development.md            # 开发流程与约定

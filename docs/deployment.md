@@ -8,6 +8,7 @@
 | --- | --- | --- | --- | --- |
 | gateway | `halon/gateway:dev` | `bin/gateway` | 8080 (业务) / 9090 (管理) | **产品**:通用网关 |
 | agent | `halon/agent:dev` | `bin/agent` | 8081 (事件 + 报告 API) | **产品**:故障排查 Agent |
+| web | `halon/web:dev` | `web/dist` (Nginx) | 8080 (静态 UI + API 反代) | **可选控制台**:观测与网关管理 UI |
 | user-service | `halon/user-service-demo:dev` | `bin/user-service-demo` | 8090 | **演示**,非产品 |
 | order-service | `halon/order-service-demo:dev` | `bin/order-service-demo` | 8092 | **演示**,非产品 |
 
@@ -42,7 +43,19 @@ make deploy-observability   # kubectl apply -f deploy/kubernetes/observability/
 | Alertmanager | 告警分组路由(默认无 receiver,需自行配置通知渠道) | 集群内服务 |
 | Grafana | 看板与三信号关联查询,预置「Halon Gateway」看板 | `kubectl port-forward -n observability service/grafana 3000:3000`,默认 admin / `halon-admin`(生产必改) |
 
-启用追踪:部署栈后,在 `gateway.yaml` 打开 `OTEL_ENABLED=true`(清单里有注释好的示例)并 `kubectl rollout restart deployment/gateway`。之后:Loki 日志行的 `trace_id` 可一键跳到 Tempo 追踪,Grafana Explore 三信号互通。
+启用追踪:部署栈后,在 `gateway.yaml` 打开 `OTEL_ENABLED=true`(清单里有注释好的示例)并 `kubectl rollout restart deployment/gateway`。之后:Loki 日志行的 `trace_id` 可一键跳到 Tempo 追踪,Grafana Explore 三信号互通。若在 `gateway.yaml` 同时设置 `TEMPO_URL=http://tempo.observability.svc.cluster.local:3200`,Web 管理控制台的 Traces 页面也会自动读取 Tempo 分布式链路(未设置时自动降级为基于 PostgreSQL 的网关+上游瀑布流)。
+
+### 可选 Web 管理控制台(`deploy/kubernetes/web/`)
+
+不依赖 Grafana 即可提供 P50/P95/P99 分位数、类 Jaeger 链路追踪、请求日志、AI 故障报告与网关管控界面,`make deploy` **不**包含它:
+
+```bash
+make docker-build-web
+make deploy-web             # kubectl apply -f deploy/kubernetes/web/
+kubectl port-forward service/halon-web 18090:8080
+```
+
+容器基于 `nginxinc/nginx-unprivileged`（非 root UID 101、只读根文件系统）,把 `/api/gateway/*` 反代至 `gateway-admin:9090`,把 `/api/agent/*` 反代至 `agent:8081`。
 
 对接已有 Prometheus:集群已有 kube-prometheus-stack 时跳过 `14-prometheus.yaml`/`15-alertmanager.yaml`,把 `14-prometheus.yaml` 里的 `halon-gateway` scrape job 与告警规则组(`prometheus-rules` ConfigMap 内容)并入现有安装即可。
 

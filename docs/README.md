@@ -28,6 +28,7 @@
 | Agent 核心 | [modules/agent.md](modules/agent.md) | LLM 循环、工具注册、编排器、事件 API、服务配置 |
 | Agent 工具层 | [modules/agent-tools.md](modules/agent-tools.md) | 日志/PromQL/K8s/封禁工具的清单、权限与安全约束 |
 | RBAC 与 JWT 鉴权 | [modules/auth.md](modules/auth.md) | 角色×权限矩阵、Ed25519 JWT、`AUTH_MODE`、可选本地登录/用户管理(`internal/identity`)与 `halonctl` |
+| Web 管理控制台 | [modules/web.md](modules/web.md) | Google 风格 React 前端、P99/日志观测、类 Jaeger 链路瀑布流与网关管控界面 |
 | 演示后端(非产品) | [../examples/user-service/README.md](../examples/user-service/README.md)、[../examples/order-service/README.md](../examples/order-service/README.md) | 演练用 HTTP 服务与故障注入 |
 
 ### 历史设计稿
