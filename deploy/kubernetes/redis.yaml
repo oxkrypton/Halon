@@ -1,11 +1,9 @@
-# Optional shared-state Redis reference manifest (single replica + AOF).
-# NOT part of `make deploy`; apply with `make deploy-redis`.
+# Development Redis manifest (single replica + AOF), deployed with `make deploy`.
 #
-# This is a development reference that runs on any Kubernetes cluster, in the
-# same spirit as deploy/kubernetes/observability/. The blacklist fact source
-# lives here, so AOF is on: a restart loses at most ~1s of writes, and
-# docs/deployment.md describes how to replay entries through the admin API.
-# For production use a managed Redis or an HA (Sentinel/Cluster) deployment.
+# The blacklist fact source lives here, so AOF is on: a restart loses at most
+# ~1s of writes, and docs/deployment.md describes how to replay entries through
+# the admin API. For production use a managed Redis or an HA (Sentinel/Cluster)
+# deployment.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -14,7 +12,6 @@ metadata:
     app.kubernetes.io/name: redis
     app.kubernetes.io/part-of: halon
 spec:
-  # Single replica: shared-state semantics only require one logical Redis.
   replicas: 1
   # AOF lives on an emptyDir; recreate instead of rolling so the new pod
   # never runs alongside the old one against the same data dir.

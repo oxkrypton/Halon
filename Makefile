@@ -7,7 +7,7 @@ DEMO_ORDER_IMAGE := halon/order-service-demo:dev
 GO_BIN := $(shell go env GOPATH)/bin
 export PATH := $(GO_BIN):$(PATH)
 
-.PHONY: test lint run-gateway run-agent run-demo build build-demo docker-build docker-build-demo minikube-start minikube-image deploy deploy-observability deploy-redis status clean
+.PHONY: test lint run-gateway run-agent run-demo build build-demo docker-build docker-build-demo minikube-start minikube-image deploy deploy-observability status clean
 
 test:
 	go test -race ./...
@@ -57,11 +57,6 @@ deploy:
 # OTel Collector). Not part of `make deploy`; see docs/deployment.md.
 deploy-observability:
 	kubectl apply -f deploy/kubernetes/observability/
-
-# Optional shared-state Redis reference manifest. Not part of `make deploy`;
-# see docs/deployment.md for managed/HA production guidance.
-deploy-redis:
-	kubectl apply -f deploy/kubernetes/redis/
 
 status:
 	kubectl get pods,services,statefulsets -l app.kubernetes.io/part-of=halon

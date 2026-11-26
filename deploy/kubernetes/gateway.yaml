@@ -6,9 +6,7 @@ metadata:
     app.kubernetes.io/name: gateway
     app.kubernetes.io/part-of: halon
 spec:
-  # Memory mode (default): keep one replica while blacklist and rate-limit
-  # state is memory-local. With REDIS_URL set on BOTH gateway and agent
-  # (shared mode), 2+ replicas are safe — that state lives in Redis.
+  # Blacklist and rate-limit state live in Redis, so 2+ replicas are safe.
   replicas: 1
   selector:
     matchLabels:
@@ -104,11 +102,8 @@ spec:
             #   value: "true"
             # - name: OTEL_EXPORTER_OTLP_ENDPOINT
             #   value: otel-collector.observability.svc.cluster.local:4317
-            # Shared-state mode is off by default. After deploying Redis
-            # (make deploy-redis) uncomment on BOTH gateway and agent,
-            # then replicas may be raised above 1:
-            # - name: REDIS_URL
-            #   value: redis://redis:6379/0
+            - name: REDIS_URL
+              value: redis://redis:6379/0
           startupProbe:
             httpGet:
               path: /healthz
