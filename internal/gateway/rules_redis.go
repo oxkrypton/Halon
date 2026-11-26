@@ -16,10 +16,10 @@ const (
 	blacklistInvalidateChan = "halon:blacklist:invalidate"
 )
 
-// RedisBlacklistStore is the shared-mode BlacklistStore. Redis is the fact
-// source; the in-process map is only a read cache so the per-request hot
-// path never pays a Redis round trip. Writes go straight to Redis and then
-// fan out a pub/sub invalidation; a TTL refresh covers lost messages.
+// RedisBlacklistStore backs BlacklistStore with Redis as the fact source.
+// The in-process map is a read cache so the per-request hot path never pays a
+// Redis round trip. Writes go straight to Redis and fan out a pub/sub
+// invalidation; a TTL refresh covers lost messages.
 //
 // Degradation: when Redis is unreachable, reads fall back to the last known
 // cache and writes fail with ErrBlacklistUnavailable (mapped to 503) — a

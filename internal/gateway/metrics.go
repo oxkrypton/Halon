@@ -132,7 +132,7 @@ func NewMetrics() *Metrics {
 		}),
 		redisUp: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "halon_gateway_redis_up",
-			Help: "Whether the shared-state Redis is reachable (1) or degraded (0). Always 1 in memory mode.",
+			Help: "Whether Redis is reachable (1) or degraded (0).",
 		}),
 	}
 	m.redisUp.Set(1)
@@ -244,8 +244,7 @@ func (m *Metrics) IncWebhookNotifyFailures() {
 	}
 }
 
-// SetRedisUp records shared-state Redis reachability. In memory mode it is
-// simply never called and the gauge stays at its initial 1.
+// SetRedisUp records Redis reachability.
 func (m *Metrics) SetRedisUp(up bool) {
 	if m == nil {
 		return

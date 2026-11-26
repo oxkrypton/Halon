@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/oxkrypton/Halon/internal/authz"
 	"github.com/oxkrypton/Halon/internal/identity"
@@ -65,11 +66,8 @@ func newAuthRouter(t *testing.T, keys map[string]ed25519.PublicKey, service Auth
 	if err != nil {
 		t.Fatal(err)
 	}
-	rules, err := NewIPRules(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return NewAdminHandler("", rules, NewRateLimiter(100, 100), logger, nil, AdminOptions{
+	rules, adminLimiter := newTestRedisStores(t, 100, 100)
+	return NewAdminHandler("", rules, adminLimiter, logger, nil, AdminOptions{
 		Auth: authenticator, LoginEnabled: true, AuthService: service, LoginLimiter: limiter,
 	})
 }
@@ -77,11 +75,8 @@ func newAuthRouter(t *testing.T, keys map[string]ed25519.PublicKey, service Auth
 func TestAuthRoutesDisabledByDefault(t *testing.T) {
 	t.Parallel()
 	gin.SetMode(gin.TestMode)
-	rules, err := NewIPRules(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	router := NewAdminHandler("", rules, NewRateLimiter(100, 100), testLogger(), nil, AdminOptions{})
+	rules, limiter := newTestRedisStores(t, 100, 100)
+	router := NewAdminHandler("", rules, limiter, testLogger(), nil, AdminOptions{})
 	for _, test := range []struct{ method, path string }{
 		{http.MethodPost, "/auth/login"},
 		{http.MethodPost, "/auth/refresh"},
@@ -146,7 +141,7 @@ func TestLoginEndpointSuccessAndUniformFailures(t *testing.T) {
 func TestLoginEndpointRateLimited(t *testing.T) {
 	t.Parallel()
 	service := &stubAuthService{session: sampleSession()}
-	limiter := NewRateLimiter(0.001, 1)
+	limiter := newTestRedisRateLimiter(t, miniredis.RunT(t), 0.001, 1, nil)
 	router := newAuthRouter(t, nil, service, limiter, testLogger())
 	body := `{"username":"alice","password":"correct-horse-battery-staple"}`
 
@@ -198,7 +193,7 @@ func TestRefreshAndLogoutRateLimited(t *testing.T) {
 	} {
 		t.Run(tc.path, func(t *testing.T) {
 			service := &stubAuthService{session: sampleSession()}
-			limiter := NewRateLimiter(0.001, 1)
+			limiter := newTestRedisRateLimiter(t, miniredis.RunT(t), 0.001, 1, nil)
 			router := newAuthRouter(t, nil, service, limiter, testLogger())
 			body := `{"refresh_token":"tok"}`
 

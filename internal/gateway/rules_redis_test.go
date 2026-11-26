@@ -80,6 +80,17 @@ func TestRedisBlacklistStoreAddContainsRemove(t *testing.T) {
 	if _, err := store.Add("not-an-ip"); err == nil {
 		t.Fatal("Add() accepted invalid IP")
 	}
+	created, err = store.Add("2001:0db8::1")
+	if err != nil || !created {
+		t.Fatalf("Add(IPv6) = %v, %v", created, err)
+	}
+	if !store.Contains("2001:db8::1") {
+		t.Fatal("canonical IPv6 address was not matched")
+	}
+	created, err = store.Add("2001:db8::1")
+	if err != nil || created {
+		t.Fatalf("duplicate IPv6 Add() = %v, %v", created, err)
+	}
 }
 
 func TestRedisBlacklistStoreRefreshPicksUpExternalWrites(t *testing.T) {
@@ -143,7 +154,7 @@ func TestAdminBlacklistSharedModeResponses(t *testing.T) {
 	t.Parallel()
 	mr := miniredis.RunT(t)
 	store := newTestRedisBlacklistStore(t, mr, 10*time.Second)
-	admin := NewAdminHandler(testAdminToken, store, NewRateLimiter(1, 1), testLogger(), nil, AdminOptions{})
+	admin := NewAdminHandler(testAdminToken, store, newTestRedisRateLimiter(t, mr, 1, 1, nil), testLogger(), nil, AdminOptions{})
 
 	request := httptest.NewRequest(http.MethodPut, "/admin/rules/blacklist/192.0.2.30", nil)
 	request.Header.Set("Authorization", "Bearer "+testAdminToken)

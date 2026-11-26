@@ -13,8 +13,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/oxkrypton/Halon/internal/trafficlog"
+	"github.com/redis/go-redis/v9"
 )
 
 const testAdminToken = "test-admin-token"
@@ -27,10 +29,21 @@ func (s pingerStub) Ping(context.Context) error { return s.err }
 
 type fixture struct {
 	router   *gin.Engine
-	rules    *IPRules
-	limiter  *RateLimiter
+	rules    *RedisBlacklistStore
+	limiter  *RedisRateLimiter
 	queue    chan trafficlog.Entry
 	upstream *httptest.Server
+}
+
+func newTestRedisStores(t *testing.T, rps float64, burst int) (*RedisBlacklistStore, *RedisRateLimiter) {
+	t.Helper()
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+	rules := NewRedisBlacklistStore(client, time.Minute, 200*time.Millisecond, testLogger(), nil)
+	t.Cleanup(rules.Close)
+	limiter := NewRedisRateLimiter(client, rps, burst, 200*time.Millisecond, testLogger(), nil)
+	return rules, limiter
 }
 
 // echoUpstream records the inbound request and echoes it back, so tests can
@@ -46,8 +59,7 @@ func newFixture(t *testing.T, upstream *httptest.Server) *fixture {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	queue := make(chan trafficlog.Entry, 32)
-	rules, _ := NewIPRules(nil)
-	limiter := NewRateLimiter(100, 100)
+	rules, limiter := newTestRedisStores(t, 100, 100)
 	routes, err := ParseRoutes("/api/v1/=" + upstream.URL)
 	if err != nil {
 		t.Fatal(err)
@@ -160,10 +172,10 @@ func TestProxyUnreachableUpstreamReturns502(t *testing.T) {
 	}
 	gin.SetMode(gin.TestMode)
 	queue := make(chan trafficlog.Entry, 1)
-	rules, _ := NewIPRules(nil)
+	rules, limiter := newTestRedisStores(t, 100, 100)
 	router := NewHTTPHandler(Dependencies{
 		Routes: routes, Repository: pingerStub{}, LogQueue: queue,
-		Logger: testLogger(), Rules: rules, Limiter: NewRateLimiter(100, 100),
+		Logger: testLogger(), Rules: rules, Limiter: limiter,
 		Proxy: ProxyOptions{Timeout: time.Second}, SlowRequestThreshold: time.Second, BodyCaptureLimit: 1024,
 	})
 
@@ -234,13 +246,13 @@ func TestReadinessChecksDependencies(t *testing.T) {
 
 	gin.SetMode(gin.TestMode)
 	queue := make(chan trafficlog.Entry, 1)
-	rules, _ := NewIPRules(nil)
+	rules, limiter := newTestRedisStores(t, 1, 1)
 	router := NewHTTPHandler(Dependencies{
 		Repository: pingerStub{err: errors.New("offline")},
 		LogQueue:   queue,
 		Logger:     testLogger(),
 		Rules:      rules,
-		Limiter:    NewRateLimiter(1, 1),
+		Limiter:    limiter,
 	})
 	response = httptest.NewRecorder()
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/readyz", nil))

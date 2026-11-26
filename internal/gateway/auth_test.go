@@ -51,11 +51,7 @@ func newAdminRouter(t *testing.T, mode authz.Mode, keys map[string]ed25519.Publi
 	if err != nil {
 		t.Fatal(err)
 	}
-	rules, err := NewIPRules(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	limiter := NewRateLimiter(100, 100)
+	rules, limiter := newTestRedisStores(t, 100, 100)
 	return NewAdminHandler(staticToken, rules, limiter, testLogger(), metrics, AdminOptions{
 		MetricsRequireAuth: true,
 		Resilience:         &ResilienceSet{},
@@ -160,10 +156,7 @@ func TestMetricsEndpointAuthzAndNoAudit(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	signer, keys := newAdminSigner(t)
 	metrics := NewMetrics()
-	rules, err := NewIPRules(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	rules, limiter := newTestRedisStores(t, 100, 100)
 	var auditLog strings.Builder
 	logger := slog.New(slog.NewTextHandler(&auditLog, nil))
 	authenticator, err := authz.NewAuthenticator(authz.Config{
@@ -172,7 +165,7 @@ func TestMetricsEndpointAuthzAndNoAudit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	router := NewAdminHandler("", rules, NewRateLimiter(100, 100), logger, metrics, AdminOptions{
+	router := NewAdminHandler("", rules, limiter, logger, metrics, AdminOptions{
 		MetricsRequireAuth: true,
 		Auth:               authenticator,
 	})

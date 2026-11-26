@@ -64,11 +64,8 @@ func newUserRouter(t *testing.T, keys map[string]ed25519.PublicKey, service User
 	if err != nil {
 		t.Fatal(err)
 	}
-	rules, err := NewIPRules(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return NewAdminHandler("", rules, NewRateLimiter(100, 100), testLogger(), nil, AdminOptions{
+	rules, limiter := newTestRedisStores(t, 100, 100)
+	return NewAdminHandler("", rules, limiter, testLogger(), nil, AdminOptions{
 		Auth: authenticator, LoginEnabled: true,
 		AuthService: &stubAuthService{}, UserService: service,
 	})
@@ -234,11 +231,8 @@ func TestUserManagementErrorMapping(t *testing.T) {
 func TestUserRoutesDisabledByDefault(t *testing.T) {
 	t.Parallel()
 	gin.SetMode(gin.TestMode)
-	rules, err := NewIPRules(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	router := NewAdminHandler("", rules, NewRateLimiter(100, 100), testLogger(), nil, AdminOptions{})
+	rules, limiter := newTestRedisStores(t, 100, 100)
+	router := NewAdminHandler("", rules, limiter, testLogger(), nil, AdminOptions{})
 	for _, endpoint := range userEndpoints() {
 		response := adminRequest(router, endpoint.Method, endpoint.Path, "", endpoint.Body)
 		if response.Code != http.StatusNotFound || !strings.Contains(response.Body.String(), `"LOGIN_DISABLED"`) {

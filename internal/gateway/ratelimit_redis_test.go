@@ -185,9 +185,11 @@ func TestRedisRateLimiterDegradesWhenRedisDown(t *testing.T) {
 	}
 	mr.Close()
 
-	// Fail-open: the memory fallback admits within its own limits.
-	if !limiter.Allow("192.0.2.5") {
-		t.Fatal("Allow() did not fail open with redis down")
+	// Fail-open: requests are admitted even beyond the configured burst while Redis is unreachable.
+	for i := range 5 {
+		if !limiter.Allow("192.0.2.5") {
+			t.Fatalf("Allow() call %d did not fail open with redis down", i)
+		}
 	}
 	// Config writes fail loudly instead of pretending success.
 	if err := limiter.Update(5, 5); !errors.Is(err, ErrRateLimitUnavailable) {

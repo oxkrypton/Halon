@@ -67,8 +67,7 @@ type Config struct {
 	OTELExporterEndpoint   string
 	OTELTracesSamplerRatio float64
 
-	// Shared state (optional). RedisURL empty keeps the single-replica
-	// in-memory mode; non-empty enables the shared multi-replica mode.
+	// Redis state backend (required).
 	RedisURL          string
 	BlacklistCacheTTL time.Duration
 	RedisDialTimeout  time.Duration
@@ -246,7 +245,7 @@ func LoadConfig() (Config, error) {
 		return Config{}, err
 	}
 
-	// Shared state (optional).
+	// Redis state backend.
 	if cfg.BlacklistCacheTTL, err = envDuration("BLACKLIST_CACHE_TTL", cfg.BlacklistCacheTTL); err != nil {
 		return Config{}, err
 	}
@@ -372,10 +371,10 @@ func LoadConfig() (Config, error) {
 	if math.IsNaN(cfg.OTELTracesSamplerRatio) || cfg.OTELTracesSamplerRatio < 0 || cfg.OTELTracesSamplerRatio > 1 {
 		validationErrors = append(validationErrors, errors.New("OTEL_TRACES_SAMPLER_RATIO must be between 0 and 1"))
 	}
-	if cfg.RedisURL != "" {
-		if _, err := redis.ParseURL(cfg.RedisURL); err != nil {
-			validationErrors = append(validationErrors, fmt.Errorf("REDIS_URL: %w", err))
-		}
+	if cfg.RedisURL == "" {
+		validationErrors = append(validationErrors, errors.New("REDIS_URL is required"))
+	} else if _, err := redis.ParseURL(cfg.RedisURL); err != nil {
+		validationErrors = append(validationErrors, fmt.Errorf("REDIS_URL: %w", err))
 	}
 	if cfg.BlacklistCacheTTL <= 0 || cfg.RedisDialTimeout <= 0 || cfg.RedisOpTimeout <= 0 {
 		validationErrors = append(validationErrors, errors.New("blacklist cache TTL and redis timeouts must be positive"))

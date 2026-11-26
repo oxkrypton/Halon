@@ -23,8 +23,7 @@ func TestUpstreamTimeoutEmitsIncidentAndMetrics(t *testing.T) {
 	})
 	logQueue := make(chan trafficlog.Entry, 1)
 	timeoutQueue := make(chan incident.TimeoutEvent, 1)
-	rules, _ := NewIPRules(nil)
-	limiter := NewRateLimiter(10, 10)
+	rules, limiter := newTestRedisStores(t, 10, 10)
 	metrics := NewMetrics()
 	routes, err := ParseRoutes("/api/v1/=" + upstream.URL)
 	if err != nil {

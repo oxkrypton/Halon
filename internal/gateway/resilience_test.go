@@ -21,7 +21,7 @@ func newResilientGateway(t *testing.T, cfg ResilienceConfig, base http.RoundTrip
 	gin.SetMode(gin.TestMode)
 	metrics := NewMetrics()
 	queue := make(chan trafficlog.Entry, 32)
-	rules, _ := NewIPRules(nil)
+	rules, limiter := newTestRedisStores(t, 1000, 1000)
 	routes, err := ParseRoutes("/api/v1/=http://upstream.test")
 	if err != nil {
 		t.Fatal(err)
@@ -30,7 +30,7 @@ func newResilientGateway(t *testing.T, cfg ResilienceConfig, base http.RoundTrip
 	set := NewResilienceSet(routes.Prefixes(), cfg, func(string) http.RoundTripper { return base })
 	router := NewHTTPHandler(Dependencies{
 		Routes: routes, Repository: pingerStub{}, LogQueue: queue,
-		Logger: testLogger(), Rules: rules, Limiter: NewRateLimiter(1000, 1000), Metrics: metrics,
+		Logger: testLogger(), Rules: rules, Limiter: limiter, Metrics: metrics,
 		Proxy: ProxyOptions{
 			Timeout:              time.Second,
 			RetryBodyBufferBytes: 1024,
@@ -227,7 +227,7 @@ func TestRequestBodyLimitReturns413(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	})
 	queue := make(chan trafficlog.Entry, 32)
-	rules, _ := NewIPRules(nil)
+	rules, limiter := newTestRedisStores(t, 1000, 1000)
 	routes, err := ParseRoutes("/api/v1/=" + upstream.URL)
 	if err != nil {
 		t.Fatal(err)
@@ -235,7 +235,7 @@ func TestRequestBodyLimitReturns413(t *testing.T) {
 	metrics := NewMetrics()
 	router := NewHTTPHandler(Dependencies{
 		Routes: routes, Repository: pingerStub{}, LogQueue: queue,
-		Logger: testLogger(), Rules: rules, Limiter: NewRateLimiter(1000, 1000), Metrics: metrics,
+		Logger: testLogger(), Rules: rules, Limiter: limiter, Metrics: metrics,
 		Proxy:                ProxyOptions{Timeout: time.Second, MaxRequestBodyBytes: 8},
 		SlowRequestThreshold: time.Second, BodyCaptureLimit: 1024,
 	})
@@ -261,14 +261,14 @@ func TestResponseHeaderTimeoutClassifiedAs504(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	})
 	queue := make(chan trafficlog.Entry, 32)
-	rules, _ := NewIPRules(nil)
+	rules, limiter := newTestRedisStores(t, 1000, 1000)
 	routes, err := ParseRoutes("/api/v1/=" + upstream.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
 	router := NewHTTPHandler(Dependencies{
 		Routes: routes, Repository: pingerStub{}, LogQueue: queue,
-		Logger: testLogger(), Rules: rules, Limiter: NewRateLimiter(1000, 1000),
+		Logger: testLogger(), Rules: rules, Limiter: limiter,
 		Proxy: ProxyOptions{
 			Timeout:               5 * time.Second,
 			ResponseHeaderTimeout: 50 * time.Millisecond,
@@ -285,8 +285,7 @@ func TestResponseHeaderTimeoutClassifiedAs504(t *testing.T) {
 
 func TestMetricsEndpointHonorsAuthOption(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	rules, _ := NewIPRules(nil)
-	limiter := NewRateLimiter(1, 1)
+	rules, limiter := newTestRedisStores(t, 1, 1)
 	metrics := NewMetrics()
 	admin := NewAdminHandler(testAdminToken, rules, limiter, testLogger(), metrics, AdminOptions{MetricsRequireAuth: true})
 
@@ -315,8 +314,8 @@ func TestAdminBreakersEndpoint(t *testing.T) {
 		BreakerOpenDuration:      time.Minute,
 		BreakerHalfOpenSuccesses: 1,
 	}, base)
-	rules, _ := NewIPRules(nil)
-	admin := NewAdminHandler(testAdminToken, rules, NewRateLimiter(1, 1), testLogger(), metrics, AdminOptions{Resilience: set})
+	rules, limiter := newTestRedisStores(t, 1, 1)
+	admin := NewAdminHandler(testAdminToken, rules, limiter, testLogger(), metrics, AdminOptions{Resilience: set})
 
 	response := httptest.NewRecorder()
 	admin.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/admin/breakers", nil))

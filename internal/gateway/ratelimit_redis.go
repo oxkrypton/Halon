@@ -24,8 +24,8 @@ const (
 
 // rateLimitScript is a token bucket executed atomically inside Redis. The
 // bucket clock is the Redis server clock (TIME), so replicas never disagree
-// on refill time. Semantics match golang.org/x/time/rate exactly: tokens
-// refill at `rate` per second up to `burst`, one token per request.
+// on refill time. Tokens refill at `rate` per second up to `burst`, one token
+// per request.
 var rateLimitScript = redis.NewScript(`
 local data = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
 local clock = redis.call('TIME')
@@ -49,21 +49,19 @@ redis.call('PEXPIRE', KEYS[1], ARGV[3])
 return allowed
 `)
 
-// RedisRateLimiter is the shared-mode RateLimitBackend. The token buckets
-// live in Redis (one hash per IP), so N replicas together admit exactly the
-// configured rate instead of N times it. Limit parameters live in
-// halon:ratelimit:config (or the configured prefix's config key) and are
-// cached per process for rateLimitConfigCache.
+// RedisRateLimiter backs RateLimitBackend with Redis Lua token buckets (one
+// hash per IP), so all gateway replicas together admit the configured rate.
+// Limit parameters live in halon:ratelimit:config (or the configured prefix's
+// config key) and are cached per process for rateLimitConfigCache.
 //
-// Degradation: when Redis is unreachable, Allow fails open to the embedded
-// in-memory RateLimiter (weaker protection beats rejecting everything),
-// while config writes fail with ErrRateLimitUnavailable (503).
+// Degradation: when Redis is unreachable, Allow fails open (admitting traffic
+// rather than blocking the data plane), while config writes fail with
+// ErrRateLimitUnavailable (503).
 type RedisRateLimiter struct {
 	client    *redis.Client
 	logger    *slog.Logger
 	onHealth  func(bool)
 	opTimeout time.Duration
-	fallback  *RateLimiter
 	prefix    string
 
 	cfgMu     sync.Mutex
@@ -98,8 +96,7 @@ func NewRedisRateLimiter(client *redis.Client, rps float64, burst int, opTimeout
 	}
 	limiter := &RedisRateLimiter{
 		client: client, logger: logger, onHealth: onHealth, opTimeout: opTimeout,
-		fallback: NewRateLimiter(rps, burst),
-		rps:      rps, burst: burst,
+		rps: rps, burst: burst,
 		prefix: DefaultRateLimitKeyPrefix,
 	}
 	for _, opt := range opts {
@@ -118,7 +115,8 @@ func (l *RedisRateLimiter) Allow(ip string) bool {
 	rps, burst, err := l.settings()
 	if err != nil {
 		l.reportHealth(false)
-		return l.fallback.Allow(ip)
+		l.logger.Warn("redis rate limit config refresh failed; failing open", "error", err)
+		return true
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), l.opTimeout)
 	defer cancel()
@@ -126,8 +124,8 @@ func (l *RedisRateLimiter) Allow(ip string) bool {
 	allowed, err := rateLimitScript.Run(ctx, l.client, []string{l.prefix + ip}, rps, burst, ttlMs).Int()
 	if err != nil {
 		l.reportHealth(false)
-		l.logger.Warn("redis rate limit failed; failing open to memory bucket", "error", err)
-		return l.fallback.Allow(ip)
+		l.logger.Warn("redis rate limit failed; failing open", "error", err)
+		return true
 	}
 	l.reportHealth(true)
 	return allowed == 1
@@ -145,7 +143,7 @@ func (l *RedisRateLimiter) Update(rps float64, burst int) error {
 	return nil
 }
 
-// Settings returns the last known parameters; the shared mode tolerates a
+// Settings returns the last known parameters; callers tolerate a
 // config-cache-aged view for the admin readout.
 func (l *RedisRateLimiter) Settings() (float64, int) {
 	l.cfgMu.Lock()
@@ -181,7 +179,6 @@ func (l *RedisRateLimiter) settings() (float64, int, error) {
 	defer l.cfgMu.Unlock()
 	if rpsErr == nil && burstErr == nil && rps > 0 && burst > 0 {
 		l.rps, l.burst = rps, burst
-		_ = l.fallback.Update(rps, burst) // the memory fallback never fails
 	}
 	l.cfgExpiry = time.Now().Add(rateLimitConfigCache)
 	return l.rps, l.burst, nil
@@ -192,7 +189,6 @@ func (l *RedisRateLimiter) cacheSettings(rps float64, burst int) {
 	defer l.cfgMu.Unlock()
 	l.rps, l.burst = rps, burst
 	l.cfgExpiry = time.Now().Add(rateLimitConfigCache)
-	_ = l.fallback.Update(rps, burst) // the memory fallback never fails
 }
 
 func (l *RedisRateLimiter) reportHealth(up bool) {
@@ -202,7 +198,7 @@ func (l *RedisRateLimiter) reportHealth(up bool) {
 }
 
 // bucketTTLMs bounds a bucket key's idle lifetime: the time to refill an
-// empty bucket plus a margin, mirroring the memory mode's idle eviction.
+// empty bucket plus a margin.
 func bucketTTLMs(rps float64, burst int) int64 {
 	refill := float64(burst) / rps
 	return int64(math.Ceil(refill*1000)) + rateLimitIdleMargin.Milliseconds()

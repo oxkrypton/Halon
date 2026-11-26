@@ -116,44 +116,28 @@ func run() error {
 
 	metrics := gateway.NewMetrics()
 
-	// Optional shared-state mode: with REDIS_URL set, blacklist and rate
-	// limit live in Redis so multiple replicas can run. Ping failure does
-	// not abort startup; the stores degrade per the documented policies.
-	sharedStateMode := "memory"
-	var redisClient *redis.Client
-	if cfg.RedisURL != "" {
-		options, err := redis.ParseURL(cfg.RedisURL)
-		if err != nil {
-			return fmt.Errorf("parse REDIS_URL: %w", err)
-		}
-		options.DialTimeout = cfg.RedisDialTimeout
-		options.ReadTimeout = cfg.RedisOpTimeout
-		options.WriteTimeout = cfg.RedisOpTimeout
-		redisClient = redis.NewClient(options)
-		defer func() { _ = redisClient.Close() }()
-		pingContext, cancelPing := context.WithTimeout(context.Background(), cfg.RedisDialTimeout)
-		pingErr := redisClient.Ping(pingContext).Err()
-		cancelPing()
-		metrics.SetRedisUp(pingErr == nil)
-		if pingErr != nil {
-			logger.Warn("redis unreachable at startup; running with degraded shared state", "error", pingErr)
-		}
-		sharedStateMode = "redis"
+	// Redis backs blacklist and rate limiting across gateway replicas. Startup
+	// ping failure does not abort startup; stores degrade per policy.
+	options, err := redis.ParseURL(cfg.RedisURL)
+	if err != nil {
+		return fmt.Errorf("parse REDIS_URL: %w", err)
 	}
-	logger.Info("shared state mode", "shared_state_mode", sharedStateMode)
+	options.DialTimeout = cfg.RedisDialTimeout
+	options.ReadTimeout = cfg.RedisOpTimeout
+	options.WriteTimeout = cfg.RedisOpTimeout
+	redisClient := redis.NewClient(options)
+	defer func() { _ = redisClient.Close() }()
+	pingContext, cancelPing := context.WithTimeout(context.Background(), cfg.RedisDialTimeout)
+	pingErr := redisClient.Ping(pingContext).Err()
+	cancelPing()
+	metrics.SetRedisUp(pingErr == nil)
+	if pingErr != nil {
+		logger.Warn("redis unreachable at startup; running in degraded mode", "error", pingErr)
+	}
 
-	var rules gateway.BlacklistStore
-	var limiter gateway.RateLimitBackend
-	if redisClient != nil {
-		rules = gateway.NewRedisBlacklistStore(redisClient, cfg.BlacklistCacheTTL, cfg.RedisOpTimeout, logger, metrics.SetRedisUp)
-		limiter = gateway.NewRedisRateLimiter(redisClient, cfg.RateLimitRPS, cfg.RateLimitBurst, cfg.RedisOpTimeout, logger, metrics.SetRedisUp)
-	} else {
-		rules, err = gateway.NewIPRules(nil)
-		if err != nil {
-			return err
-		}
-		limiter = gateway.NewRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst)
-	}
+	rules := gateway.NewRedisBlacklistStore(redisClient, cfg.BlacklistCacheTTL, cfg.RedisOpTimeout, logger, metrics.SetRedisUp)
+	defer rules.Close()
+	limiter := gateway.NewRedisRateLimiter(redisClient, cfg.RateLimitRPS, cfg.RateLimitBurst, cfg.RedisOpTimeout, logger, metrics.SetRedisUp)
 
 	queue := make(chan trafficlog.Entry, cfg.LogQueueSize)
 	writer := trafficlog.NewBatchWriter(repository, queue, cfg.LogBatchSize, cfg.LogFlushInterval, logger)
@@ -247,14 +231,10 @@ func run() error {
 		}
 		authService = identityService
 		userService = identityService
-		if redisClient != nil {
-			loginLimiter = gateway.NewRedisRateLimiter(redisClient,
-				cfg.LoginRateLimitRPS, cfg.LoginRateLimitBurst, cfg.RedisOpTimeout,
-				logger, metrics.SetRedisUp,
-				gateway.WithRateLimitKeyPrefix("halon:ratelimit:login:"))
-		} else {
-			loginLimiter = gateway.NewRateLimiter(cfg.LoginRateLimitRPS, cfg.LoginRateLimitBurst)
-		}
+		loginLimiter = gateway.NewRedisRateLimiter(redisClient,
+			cfg.LoginRateLimitRPS, cfg.LoginRateLimitBurst, cfg.RedisOpTimeout,
+			logger, metrics.SetRedisUp,
+			gateway.WithRateLimitKeyPrefix("halon:ratelimit:login:"))
 		logger.Info("local login enabled", "kid", cfg.JWTKID)
 	}
 

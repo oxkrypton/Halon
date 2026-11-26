@@ -8,9 +8,15 @@ import (
 	"github.com/oxkrypton/Halon/internal/authz"
 )
 
-func TestLoadConfig(t *testing.T) {
+func setRequiredGatewayEnv(t *testing.T) {
+	t.Helper()
 	t.Setenv("DATABASE_DSN", "postgres://localhost/halon")
 	t.Setenv("ADMIN_TOKEN", "test-admin-token")
+	t.Setenv("REDIS_URL", "redis://redis:6379/0")
+}
+
+func TestLoadConfig(t *testing.T) {
+	setRequiredGatewayEnv(t)
 	t.Setenv("RATE_LIMIT_RPS", "")
 	t.Setenv("RATE_LIMIT_BURST", "")
 	cfg, err := LoadConfig()
@@ -34,8 +40,7 @@ func TestLoadConfigRequiresSecrets(t *testing.T) {
 }
 
 func TestLoadConfigResilienceDefaults(t *testing.T) {
-	t.Setenv("DATABASE_DSN", "postgres://localhost/halon")
-	t.Setenv("ADMIN_TOKEN", "test-admin-token")
+	setRequiredGatewayEnv(t)
 	cfg, err := LoadConfig()
 	if err != nil {
 		t.Fatal(err)
@@ -81,8 +86,7 @@ func TestLoadConfigRejectsInvalidResilience(t *testing.T) {
 	}
 	for name, envs := range cases {
 		t.Run(name, func(t *testing.T) {
-			t.Setenv("DATABASE_DSN", "postgres://localhost/halon")
-			t.Setenv("ADMIN_TOKEN", "test-admin-token")
+			setRequiredGatewayEnv(t)
 			for key, value := range envs {
 				t.Setenv(key, value)
 			}
@@ -94,8 +98,7 @@ func TestLoadConfigRejectsInvalidResilience(t *testing.T) {
 }
 
 func TestLoadConfigResilienceOverrides(t *testing.T) {
-	t.Setenv("DATABASE_DSN", "postgres://localhost/halon")
-	t.Setenv("ADMIN_TOKEN", "test-admin-token")
+	setRequiredGatewayEnv(t)
 	t.Setenv("LOG_LEVEL", "debug")
 	t.Setenv("RETRY_MAX_ATTEMPTS", "3")
 	t.Setenv("BREAKER_ENABLED", "false")
@@ -133,28 +136,27 @@ func TestLoadConfigSharedState(t *testing.T) {
 	}
 }
 
-func TestLoadConfigSharedStateDefaults(t *testing.T) {
-	t.Setenv("DATABASE_DSN", "postgres://localhost/halon")
-	t.Setenv("ADMIN_TOKEN", "test-admin-token")
+func TestLoadConfigRedisDefaults(t *testing.T) {
+	setRequiredGatewayEnv(t)
 	cfg, err := LoadConfig()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.RedisURL != "" || cfg.BlacklistCacheTTL != 10*time.Second || cfg.RedisDialTimeout != time.Second || cfg.RedisOpTimeout != 500*time.Millisecond {
-		t.Fatalf("unexpected shared state defaults: %+v", cfg)
+	if cfg.RedisURL != "redis://redis:6379/0" || cfg.BlacklistCacheTTL != 10*time.Second || cfg.RedisDialTimeout != time.Second || cfg.RedisOpTimeout != 500*time.Millisecond {
+		t.Fatalf("unexpected redis defaults: %+v", cfg)
 	}
 }
 
-func TestLoadConfigRejectsInvalidSharedState(t *testing.T) {
+func TestLoadConfigRejectsInvalidRedis(t *testing.T) {
 	cases := map[string]map[string]string{
+		"missing redis url":     {"REDIS_URL": ""},
 		"unparseable redis url": {"REDIS_URL": "not a url"},
 		"zero cache ttl":        {"BLACKLIST_CACHE_TTL": "0s"},
 		"negative op timeout":   {"REDIS_OP_TIMEOUT": "-1s"},
 	}
 	for name, envs := range cases {
 		t.Run(name, func(t *testing.T) {
-			t.Setenv("DATABASE_DSN", "postgres://localhost/halon")
-			t.Setenv("ADMIN_TOKEN", "test-admin-token")
+			setRequiredGatewayEnv(t)
 			for key, value := range envs {
 				t.Setenv(key, value)
 			}
@@ -162,27 +164,6 @@ func TestLoadConfigRejectsInvalidSharedState(t *testing.T) {
 				t.Fatalf("LoadConfig() succeeded with %v", envs)
 			}
 		})
-	}
-}
-
-func TestIPRulesValidation(t *testing.T) {
-	rules, err := NewIPRules(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := rules.Add("not-an-ip"); err == nil {
-		t.Fatal("Add() accepted invalid IP")
-	}
-	created, err := rules.Add("2001:0db8::1")
-	if err != nil || !created {
-		t.Fatalf("Add(IPv6) = %v, %v", created, err)
-	}
-	if !rules.Contains("2001:db8::1") {
-		t.Fatal("canonical IPv6 address was not matched")
-	}
-	created, _ = rules.Add("2001:db8::1")
-	if created {
-		t.Fatal("duplicate rule reported as created")
 	}
 }
 
@@ -198,14 +179,14 @@ func loginTestPrivateKey(t *testing.T) (string, ed25519.PublicKey) {
 func setLoginConfig(t *testing.T, privateKey string) {
 	t.Helper()
 	t.Setenv("DATABASE_DSN", "postgres://localhost/halon")
+	t.Setenv("REDIS_URL", "redis://redis:6379/0")
 	t.Setenv("AUTH_MODE", "jwt")
 	t.Setenv("AUTH_LOGIN_ENABLED", "true")
 	t.Setenv("AUTH_JWT_PRIVATE_KEY", privateKey)
 }
 
 func TestLoadConfigLoginDefaults(t *testing.T) {
-	t.Setenv("DATABASE_DSN", "postgres://localhost/halon")
-	t.Setenv("ADMIN_TOKEN", "test-admin-token")
+	setRequiredGatewayEnv(t)
 	cfg, err := LoadConfig()
 	if err != nil {
 		t.Fatal(err)
@@ -288,6 +269,7 @@ func TestLoadConfigRejectsInvalidLoginConfig(t *testing.T) {
 	for name, envs := range cases {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv("DATABASE_DSN", "postgres://localhost/halon")
+			t.Setenv("REDIS_URL", "redis://redis:6379/0")
 			for key, value := range envs {
 				t.Setenv(key, value)
 			}
