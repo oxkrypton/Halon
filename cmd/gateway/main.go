@@ -238,6 +238,8 @@ func run() error {
 		logger.Info("local login enabled", "kid", cfg.JWTKID)
 	}
 
+	tempoClient := gateway.NewTempoClient(cfg.TempoURL, cfg.TempoTimeout)
+
 	adminServer := newHTTPServer(cfg.AdminAddr, gateway.NewAdminHandler(cfg.AdminToken, rules, limiter, logger, metrics, gateway.AdminOptions{
 		MetricsRequireAuth: cfg.MetricsRequireAuth,
 		Resilience:         resilience,
@@ -246,6 +248,16 @@ func run() error {
 		AuthService:        authService,
 		UserService:        userService,
 		LoginLimiter:       loginLimiter,
+		TrafficLogs:        repository,
+		Routes:             routes,
+		Tempo:              tempoClient,
+		SystemInfo: gateway.SystemInfo{
+			AuthMode:     string(cfg.Auth.Mode),
+			LoginEnabled: cfg.LoginEnabled,
+			OTELEnabled:  cfg.OTELEnabled,
+			TempoEnabled: tempoClient != nil,
+			RedisUp:      metrics.RedisUp,
+		},
 	}))
 
 	serverErrors := make(chan error, 2)

@@ -299,3 +299,28 @@ func TestLoadConfigLoginExplicitKIDAndBootstrap(t *testing.T) {
 		t.Fatal("explicit kid was not added to the verifier set")
 	}
 }
+
+func TestLoadConfigTempo(t *testing.T) {
+	setRequiredGatewayEnv(t)
+	t.Setenv("TEMPO_URL", "http://tempo.observability.svc.cluster.local:3200")
+	t.Setenv("TEMPO_TIMEOUT", "3s")
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TempoURL != "http://tempo.observability.svc.cluster.local:3200" || cfg.TempoTimeout != 3*time.Second {
+		t.Fatalf("unexpected tempo config: %+v", cfg)
+	}
+
+	setRequiredGatewayEnv(t)
+	t.Setenv("TEMPO_URL", "ftp://tempo:3200")
+	if _, err := LoadConfig(); err == nil {
+		t.Fatal("expected error for non-http TEMPO_URL")
+	}
+
+	setRequiredGatewayEnv(t)
+	t.Setenv("TEMPO_TIMEOUT", "0s")
+	if _, err := LoadConfig(); err == nil {
+		t.Fatal("expected error for zero TEMPO_TIMEOUT")
+	}
+}

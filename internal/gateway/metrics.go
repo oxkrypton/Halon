@@ -3,6 +3,7 @@ package gateway
 import (
 	"net/http"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -57,7 +58,8 @@ type Metrics struct {
 	timeoutEventsDropped  prometheus.Counter
 	webhookNotifyFailures prometheus.Counter
 
-	redisUp prometheus.Gauge
+	redisUp      prometheus.Gauge
+	redisUpState atomic.Bool
 }
 
 func NewMetrics() *Metrics {
@@ -136,6 +138,7 @@ func NewMetrics() *Metrics {
 		}),
 	}
 	m.redisUp.Set(1)
+	m.redisUpState.Store(true)
 	m.registry.MustRegister(
 		m.requests, m.duration, m.inFlight, m.respSize, m.rejected, m.adminRequests,
 		m.upstreamRequests, m.upstreamDuration, m.upstreamInFlight,
@@ -249,11 +252,20 @@ func (m *Metrics) SetRedisUp(up bool) {
 	if m == nil {
 		return
 	}
+	m.redisUpState.Store(up)
 	if up {
 		m.redisUp.Set(1)
 		return
 	}
 	m.redisUp.Set(0)
+}
+
+// RedisUp reports the latest recorded Redis reachability state.
+func (m *Metrics) RedisUp() bool {
+	if m == nil {
+		return true
+	}
+	return m.redisUpState.Load()
 }
 
 func (m *Metrics) Handler() http.Handler {

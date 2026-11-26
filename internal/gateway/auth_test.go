@@ -90,6 +90,12 @@ func TestAdminRBACMatrix(t *testing.T) {
 		{"breaker read", http.MethodGet, "/admin/breakers", "", map[authz.Role]int{
 			authz.RoleReadOnly: http.StatusOK, authz.RoleOperator: http.StatusOK, authz.RoleFull: http.StatusOK,
 		}},
+		{"system read", http.MethodGet, "/admin/system", "", map[authz.Role]int{
+			authz.RoleReadOnly: http.StatusOK, authz.RoleOperator: http.StatusOK, authz.RoleFull: http.StatusOK,
+		}},
+		{"observability read", http.MethodGet, "/admin/observability/overview", "", map[authz.Role]int{
+			authz.RoleReadOnly: http.StatusServiceUnavailable, authz.RoleOperator: http.StatusServiceUnavailable, authz.RoleFull: http.StatusServiceUnavailable,
+		}},
 		{"blacklist write", http.MethodPut, "/admin/rules/blacklist/192.0.2.10", "", map[authz.Role]int{
 			authz.RoleReadOnly: http.StatusForbidden, authz.RoleOperator: http.StatusCreated, authz.RoleFull: http.StatusCreated,
 		}},

@@ -90,6 +90,12 @@ type AdminOptions struct {
 	AuthService  AuthService
 	UserService  UserService
 	LoginLimiter RateLimitBackend
+
+	// Console observability, route inspection, and distributed trace query dependencies.
+	TrafficLogs TrafficLogReader
+	Routes      *RouteTable
+	Tempo       *TempoClient
+	SystemInfo  SystemInfo
 }
 
 func NewAdminHandler(token string, rules BlacklistStore, limiter RateLimitBackend, logger *slog.Logger, metrics *Metrics, options AdminOptions) *gin.Engine {
@@ -197,6 +203,17 @@ func NewAdminHandler(token string, rules BlacklistStore, limiter RateLimitBacken
 		}
 		c.JSON(http.StatusOK, gin.H{"requests_per_second": request.RequestsPerSecond, "burst": request.Burst})
 	})
+
+	obsRead := authz.Require(authz.PermGatewayObservabilityRead, abortWithError)
+	admin.GET("/system", obsRead, systemInfoHandler(options.Routes, options.SystemInfo, metrics))
+	admin.GET("/observability/overview", obsRead, observabilityOverviewHandler(options.TrafficLogs))
+	admin.GET("/observability/timeseries", obsRead, observabilityTimeSeriesHandler(options.TrafficLogs))
+	admin.GET("/observability/routes", obsRead, observabilityRoutesHandler(options.TrafficLogs))
+	admin.GET("/observability/logs", obsRead, observabilityLogsHandler(options.TrafficLogs))
+	admin.GET("/observability/logs/:id", obsRead, observabilityLogDetailHandler(options.TrafficLogs))
+	admin.GET("/observability/top-ips", obsRead, observabilityTopIPsHandler(options.TrafficLogs))
+	admin.GET("/traces", obsRead, listTracesHandler(options.Tempo, options.TrafficLogs))
+	admin.GET("/traces/:trace_id", obsRead, getTraceHandler(options.Tempo, options.TrafficLogs))
 
 	if options.LoginEnabled && options.AuthService != nil {
 		registerAuthRoutes(router, authenticator, options.AuthService, options.LoginLimiter, logger)

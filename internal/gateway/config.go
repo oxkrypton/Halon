@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -66,6 +67,8 @@ type Config struct {
 	OTELEnabled            bool
 	OTELExporterEndpoint   string
 	OTELTracesSamplerRatio float64
+	TempoURL               string
+	TempoTimeout           time.Duration
 
 	// Redis state backend (required).
 	RedisURL          string
@@ -130,6 +133,8 @@ func LoadConfig() (Config, error) {
 		// otlptracegrpc expects host:port without a scheme.
 		OTELExporterEndpoint:   "otel-collector.observability.svc.cluster.local:4317",
 		OTELTracesSamplerRatio: 1.0,
+		TempoURL:               strings.TrimSpace(os.Getenv("TEMPO_URL")),
+		TempoTimeout:           5 * time.Second,
 
 		RedisURL:          os.Getenv("REDIS_URL"),
 		BlacklistCacheTTL: 10 * time.Second,
@@ -242,6 +247,9 @@ func LoadConfig() (Config, error) {
 	}
 	cfg.OTELExporterEndpoint = envString("OTEL_EXPORTER_OTLP_ENDPOINT", cfg.OTELExporterEndpoint)
 	if cfg.OTELTracesSamplerRatio, err = envFloat("OTEL_TRACES_SAMPLER_RATIO", cfg.OTELTracesSamplerRatio); err != nil {
+		return Config{}, err
+	}
+	if cfg.TempoTimeout, err = envDuration("TEMPO_TIMEOUT", cfg.TempoTimeout); err != nil {
 		return Config{}, err
 	}
 
@@ -370,6 +378,15 @@ func LoadConfig() (Config, error) {
 	}
 	if math.IsNaN(cfg.OTELTracesSamplerRatio) || cfg.OTELTracesSamplerRatio < 0 || cfg.OTELTracesSamplerRatio > 1 {
 		validationErrors = append(validationErrors, errors.New("OTEL_TRACES_SAMPLER_RATIO must be between 0 and 1"))
+	}
+	if cfg.TempoURL != "" {
+		parsedTempo, parseErr := url.Parse(cfg.TempoURL)
+		if parseErr != nil || parsedTempo.Host == "" || (parsedTempo.Scheme != "http" && parsedTempo.Scheme != "https") {
+			validationErrors = append(validationErrors, errors.New("TEMPO_URL must be an absolute http(s) URL"))
+		}
+	}
+	if cfg.TempoTimeout <= 0 {
+		validationErrors = append(validationErrors, errors.New("TEMPO_TIMEOUT must be positive"))
 	}
 	if cfg.RedisURL == "" {
 		validationErrors = append(validationErrors, errors.New("REDIS_URL is required"))

@@ -75,15 +75,25 @@ func AccessLog(options AccessLogOptions) gin.HandlerFunc {
 
 		latency := time.Since(started)
 		status := c.Writer.Status()
+		route := routeLabel(c)
+		traceID := traceIDFromContext(c.Request.Context())
+		outcome, _ := c.Request.Context().Value(upstreamOutcomeKey{}).(*upstreamOutcome)
 		entry := trafficlog.Entry{Base: trafficlog.BaseLog{
 			RequestID: requestIDFromContext(c),
+			TraceID:   traceID,
 			ClientIP:  c.ClientIP(),
 			Method:    c.Request.Method,
 			Path:      c.Request.URL.Path,
+			Route:     route,
 			Status:    status,
 			LatencyMS: float64(latency) / float64(time.Millisecond),
 			CreatedAt: started.UTC(),
 		}}
+		if outcome != nil {
+			entry.Base.UpstreamLatencyMS = float64(outcome.upstreamLatency) / float64(time.Millisecond)
+			entry.Base.UpstreamResult = outcome.result
+			entry.Base.Retries = outcome.retries
+		}
 		if status >= http.StatusBadRequest || latency >= options.SlowThreshold {
 			entry.Detail = &trafficlog.ErrorBody{
 				RequestBody:  requestBody,
@@ -110,7 +120,7 @@ func AccessLog(options AccessLogOptions) gin.HandlerFunc {
 				OccurredAt: time.Now().UTC(),
 				Method:     entry.Base.Method,
 				Path:       entry.Base.Path,
-				Route:      routeLabel(c),
+				Route:      route,
 				ClientIP:   entry.Base.ClientIP,
 				StatusCode: status,
 				LatencyMS:  entry.Base.LatencyMS,
@@ -125,7 +135,6 @@ func AccessLog(options AccessLogOptions) gin.HandlerFunc {
 				}
 			}
 		}
-		outcome, _ := c.Request.Context().Value(upstreamOutcomeKey{}).(*upstreamOutcome)
 		attributes := []any{
 			"request_id", entry.Base.RequestID,
 			"client_ip", entry.Base.ClientIP,
@@ -133,10 +142,10 @@ func AccessLog(options AccessLogOptions) gin.HandlerFunc {
 			"path", entry.Base.Path,
 			"status", entry.Base.Status,
 			"latency_ms", entry.Base.LatencyMS,
-			"route", routeLabel(c),
+			"route", route,
 			"upstream_timeout", timedOut,
 		}
-		if traceID := traceIDFromContext(c.Request.Context()); traceID != "" {
+		if traceID != "" {
 			attributes = append(attributes, "trace_id", traceID)
 		}
 		if outcome != nil {

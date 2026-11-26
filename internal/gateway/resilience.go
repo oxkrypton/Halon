@@ -35,8 +35,9 @@ type ResilienceConfig struct {
 // request so the access log can report it. Writes happen on the proxy handler
 // goroutine before the access log reads it, so no locking is needed.
 type upstreamOutcome struct {
-	result  string
-	retries int
+	result          string
+	retries         int
+	upstreamLatency time.Duration
 }
 
 type upstreamOutcomeKey struct{}
@@ -248,9 +249,11 @@ func (t *observingTransport) RoundTrip(req *http.Request) (*http.Response, error
 			result = UpstreamResultError
 		}
 	}
-	t.metrics.ObserveUpstream(t.route, result, time.Since(started))
+	elapsed := time.Since(started)
+	t.metrics.ObserveUpstream(t.route, result, elapsed)
 	if outcome, ok := req.Context().Value(upstreamOutcomeKey{}).(*upstreamOutcome); ok {
 		outcome.result = result
+		outcome.upstreamLatency += elapsed
 	}
 	return resp, err
 }

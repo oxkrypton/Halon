@@ -26,6 +26,7 @@ func TestRolePermissionMatrix(t *testing.T) {
 		{PermGatewayRulesRead, true, true, true},
 		{PermGatewayBreakerRead, true, true, true},
 		{PermGatewayMetricsRead, true, true, true},
+		{PermGatewayObservabilityRead, true, true, true},
 		{PermToolObserve, true, true, true},
 		{PermGatewayBlacklistWrite, false, true, true},
 		{PermToolK8sRestartPod, false, true, true},

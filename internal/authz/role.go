@@ -23,33 +23,35 @@ const (
 type Permission string
 
 const (
-	PermIncidentRead          Permission = "incident:read"
-	PermGatewayRulesRead      Permission = "gateway:rules:read"
-	PermGatewayBreakerRead    Permission = "gateway:breaker:read"
-	PermGatewayMetricsRead    Permission = "gateway:metrics:read"
-	PermGatewayBlacklistWrite Permission = "gateway:blacklist:write"
-	PermGatewayRateLimitWrite Permission = "gateway:ratelimit:write"
-	PermToolObserve           Permission = "tool:observe"
-	PermToolK8sRestartPod     Permission = "tool:k8s:restart_pod"
-	PermToolK8sScale          Permission = "tool:k8s:scale"
-	PermToolK8sUpdateImage    Permission = "tool:k8s:update_image"
-	PermAuthUserRead          Permission = "auth:user:read"
-	PermAuthUserManage        Permission = "auth:user:manage"
+	PermIncidentRead             Permission = "incident:read"
+	PermGatewayRulesRead         Permission = "gateway:rules:read"
+	PermGatewayBreakerRead       Permission = "gateway:breaker:read"
+	PermGatewayMetricsRead       Permission = "gateway:metrics:read"
+	PermGatewayObservabilityRead Permission = "gateway:observability:read"
+	PermGatewayBlacklistWrite    Permission = "gateway:blacklist:write"
+	PermGatewayRateLimitWrite    Permission = "gateway:ratelimit:write"
+	PermToolObserve              Permission = "tool:observe"
+	PermToolK8sRestartPod        Permission = "tool:k8s:restart_pod"
+	PermToolK8sScale             Permission = "tool:k8s:scale"
+	PermToolK8sUpdateImage       Permission = "tool:k8s:update_image"
+	PermAuthUserRead             Permission = "auth:user:read"
+	PermAuthUserManage           Permission = "auth:user:manage"
 )
 
 var permissionRoles = map[Permission]Role{
-	PermIncidentRead:          RoleReadOnly,
-	PermGatewayRulesRead:      RoleReadOnly,
-	PermGatewayBreakerRead:    RoleReadOnly,
-	PermGatewayMetricsRead:    RoleReadOnly,
-	PermToolObserve:           RoleReadOnly,
-	PermGatewayBlacklistWrite: RoleOperator,
-	PermToolK8sRestartPod:     RoleOperator,
-	PermToolK8sScale:          RoleOperator,
-	PermGatewayRateLimitWrite: RoleFull,
-	PermToolK8sUpdateImage:    RoleFull,
-	PermAuthUserRead:          RoleFull,
-	PermAuthUserManage:        RoleFull,
+	PermIncidentRead:             RoleReadOnly,
+	PermGatewayRulesRead:         RoleReadOnly,
+	PermGatewayBreakerRead:       RoleReadOnly,
+	PermGatewayMetricsRead:       RoleReadOnly,
+	PermGatewayObservabilityRead: RoleReadOnly,
+	PermToolObserve:              RoleReadOnly,
+	PermGatewayBlacklistWrite:    RoleOperator,
+	PermToolK8sRestartPod:        RoleOperator,
+	PermToolK8sScale:             RoleOperator,
+	PermGatewayRateLimitWrite:    RoleFull,
+	PermToolK8sUpdateImage:       RoleFull,
+	PermAuthUserRead:             RoleFull,
+	PermAuthUserManage:           RoleFull,
 }
 
 func ParseRole(value string) (Role, error) {
