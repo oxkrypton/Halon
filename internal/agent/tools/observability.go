@@ -53,116 +53,116 @@ func ObservabilityTools(database *sql.DB, prometheusBaseURL string, httpClient *
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: queryTimeout}
 	}
+	hasPrometheus := strings.TrimSpace(prometheusBaseURL) != ""
+	sources := []string{"error_logs", "traffic_stats", "top_ips"}
+	itemProperties := map[string]any{
+		"request_id": stringProperty("[error_logs] Optional exact gateway X-Request-ID."),
+		"path":       stringProperty("[error_logs, traffic_stats, top_ips] Optional exact request path, for example /api/v1/orders/42."),
+		"minutes":    integerProperty("[error_logs, traffic_stats, top_ips] Lookback window in minutes, default 30.", 1, 1440),
+		"limit":      integerProperty("[error_logs, top_ips] Maximum rows (error_logs: 1..100 default 20; top_ips: 1..50 default 10).", 1, 100),
+	}
+	description := "Read observability data from one or more sources: error_logs (PostgreSQL error and slow request details; use incident request_id first), traffic_stats (request counts, latency percentiles and 5xx counts by path and status code), top_ips (client request and error counts for abuse evidence before gateway_block_ip)."
+	if hasPrometheus {
+		sources = append(sources, "prometheus")
+		itemProperties["query"] = stringProperty("[prometheus] Required PromQL instant query.")
+		itemProperties["time"] = stringProperty("[prometheus] Optional RFC3339 evaluation time; defaults to now.")
+		description += " Also supports prometheus (read-only PromQL instant queries such as rate(halon_gateway_http_requests_total[5m]), histogram_quantile(0.95, sum by (le, route) (rate(halon_gateway_http_request_duration_seconds_bucket[5m]))), and kube_pod_container_status_restarts_total)."
+	}
+	description += " Lightweight aggregations (traffic_stats, top_ips, prometheus) can be combined in one call; query large error_logs payloads separately or keep limit small."
+	itemProperties["source"] = enumStringProperty("Observability data source to query.", sources...)
+
 	return []agent.Tool{
 		{
-			Name: "query_error_logs", Permission: authz.PermToolObserve,
-			Description: "Query PostgreSQL error and slow request details. Use the incident request_id first, then path and time window to find related failures.",
-			Parameters: objectSchema(map[string]any{
-				"request_id": stringProperty("Optional exact gateway X-Request-ID."),
-				"path":       stringProperty("Optional exact request path, for example /api/v1/orders/42."),
-				"minutes":    integerProperty("Lookback window in minutes, default 30.", 1, 1440),
-				"limit":      integerProperty("Maximum rows, default 20.", 1, 100),
-			}),
+			Name:        "read_observability",
+			Permission:  authz.PermToolObserve,
+			Description: description,
+			Parameters:  batchQuerySchema(itemProperties, "One or more observability queries to run sequentially."),
 			Handler: func(ctx context.Context, raw json.RawMessage) (any, error) {
-				input, err := decodeArguments[struct {
-					RequestID string `json:"request_id"`
-					Path      string `json:"path"`
-					Minutes   int    `json:"minutes"`
-					Limit     int    `json:"limit"`
-				}](raw)
-				if err != nil {
-					return nil, err
-				}
-				if input.Minutes == 0 {
-					input.Minutes = 30
-				}
-				if input.Limit == 0 {
-					input.Limit = 20
-				}
-				if input.Minutes < 1 || input.Minutes > 1440 || input.Limit < 1 || input.Limit > 100 {
-					return nil, fmt.Errorf("minutes must be 1..1440 and limit must be 1..100")
-				}
-				return queryErrorLogs(ctx, database, input.RequestID, input.Path, input.Minutes, input.Limit)
-			},
-		},
-		{
-			Name: "query_traffic_stats", Permission: authz.PermToolObserve,
-			Description: "Aggregate PostgreSQL request counts, latency and server errors by exact path and status code.",
-			Parameters: objectSchema(map[string]any{
-				"path":    stringProperty("Optional exact request path."),
-				"minutes": integerProperty("Lookback window in minutes, default 30.", 1, 1440),
-			}),
-			Handler: func(ctx context.Context, raw json.RawMessage) (any, error) {
-				input, err := decodeArguments[struct {
-					Path    string `json:"path"`
-					Minutes int    `json:"minutes"`
-				}](raw)
-				if err != nil {
-					return nil, err
-				}
-				if input.Minutes == 0 {
-					input.Minutes = 30
-				}
-				if input.Minutes < 1 || input.Minutes > 1440 {
-					return nil, fmt.Errorf("minutes must be 1..1440")
-				}
-				return queryTrafficStats(ctx, database, input.Path, input.Minutes)
-			},
-		},
-		{
-			Name: "query_top_ips", Permission: authz.PermToolObserve,
-			Description: "Find clients with unusually high request or error counts. Use this as evidence before calling gateway_block_ip.",
-			Parameters: objectSchema(map[string]any{
-				"path":    stringProperty("Optional exact request path."),
-				"minutes": integerProperty("Lookback window in minutes, default 30.", 1, 1440),
-				"limit":   integerProperty("Maximum clients, default 10.", 1, 50),
-			}),
-			Handler: func(ctx context.Context, raw json.RawMessage) (any, error) {
-				input, err := decodeArguments[struct {
-					Path    string `json:"path"`
-					Minutes int    `json:"minutes"`
-					Limit   int    `json:"limit"`
-				}](raw)
-				if err != nil {
-					return nil, err
-				}
-				if input.Minutes == 0 {
-					input.Minutes = 30
-				}
-				if input.Limit == 0 {
-					input.Limit = 10
-				}
-				if input.Minutes < 1 || input.Minutes > 1440 || input.Limit < 1 || input.Limit > 50 {
-					return nil, fmt.Errorf("minutes must be 1..1440 and limit must be 1..50")
-				}
-				return queryTopIPs(ctx, database, input.Path, input.Minutes, input.Limit)
-			},
-		},
-		{
-			Name: "query_prometheus", Permission: authz.PermToolObserve,
-			Description: "Run a read-only Prometheus instant query. Useful queries include rate(halon_gateway_http_requests_total[5m]), histogram_quantile(0.95, sum by (le, route) (rate(halon_gateway_http_request_duration_seconds_bucket[5m]))), and kube_pod_container_status_restarts_total.",
-			Parameters: objectSchema(map[string]any{
-				"query": stringProperty("PromQL instant query."),
-				"time":  stringProperty("Optional RFC3339 evaluation time; defaults to now."),
-			}, "query"),
-			Handler: func(ctx context.Context, raw json.RawMessage) (any, error) {
-				input, err := decodeArguments[struct {
-					Query string `json:"query"`
-					Time  string `json:"time"`
-				}](raw)
-				if err != nil {
-					return nil, err
-				}
-				input.Query = strings.TrimSpace(input.Query)
-				if input.Query == "" || len(input.Query) > 4096 {
-					return nil, fmt.Errorf("query must contain 1..4096 characters")
-				}
-				if input.Time != "" {
-					if _, err := time.Parse(time.RFC3339, input.Time); err != nil {
-						return nil, fmt.Errorf("time must be RFC3339")
+				return runBatchQueries(raw, func(source string, item json.RawMessage) (any, error) {
+					switch source {
+					case "error_logs":
+						input, err := decodeSourceQuery[struct {
+							Source    string `json:"source"`
+							RequestID string `json:"request_id"`
+							Path      string `json:"path"`
+							Minutes   int    `json:"minutes"`
+							Limit     int    `json:"limit"`
+						}](item, source, "request_id, path, minutes, limit")
+						if err != nil {
+							return nil, err
+						}
+						if input.Minutes == 0 {
+							input.Minutes = 30
+						}
+						if input.Limit == 0 {
+							input.Limit = 20
+						}
+						if input.Minutes < 1 || input.Minutes > 1440 || input.Limit < 1 || input.Limit > 100 {
+							return nil, fmt.Errorf("minutes must be 1..1440 and limit must be 1..100")
+						}
+						return queryErrorLogs(ctx, database, input.RequestID, input.Path, input.Minutes, input.Limit)
+					case "traffic_stats":
+						input, err := decodeSourceQuery[struct {
+							Source  string `json:"source"`
+							Path    string `json:"path"`
+							Minutes int    `json:"minutes"`
+						}](item, source, "path, minutes")
+						if err != nil {
+							return nil, err
+						}
+						if input.Minutes == 0 {
+							input.Minutes = 30
+						}
+						if input.Minutes < 1 || input.Minutes > 1440 {
+							return nil, fmt.Errorf("minutes must be 1..1440")
+						}
+						return queryTrafficStats(ctx, database, input.Path, input.Minutes)
+					case "top_ips":
+						input, err := decodeSourceQuery[struct {
+							Source  string `json:"source"`
+							Path    string `json:"path"`
+							Minutes int    `json:"minutes"`
+							Limit   int    `json:"limit"`
+						}](item, source, "path, minutes, limit")
+						if err != nil {
+							return nil, err
+						}
+						if input.Minutes == 0 {
+							input.Minutes = 30
+						}
+						if input.Limit == 0 {
+							input.Limit = 10
+						}
+						if input.Minutes < 1 || input.Minutes > 1440 || input.Limit < 1 || input.Limit > 50 {
+							return nil, fmt.Errorf("minutes must be 1..1440 and limit must be 1..50")
+						}
+						return queryTopIPs(ctx, database, input.Path, input.Minutes, input.Limit)
+					case "prometheus":
+						if !hasPrometheus {
+							return nil, fmt.Errorf("unsupported source %q; allowed sources: %s", source, strings.Join(sources, ", "))
+						}
+						input, err := decodeSourceQuery[struct {
+							Source string `json:"source"`
+							Query  string `json:"query"`
+							Time   string `json:"time"`
+						}](item, source, "query (required), time")
+						if err != nil {
+							return nil, err
+						}
+						input.Query = strings.TrimSpace(input.Query)
+						if input.Query == "" || len(input.Query) > 4096 {
+							return nil, fmt.Errorf("query must contain 1..4096 characters")
+						}
+						if input.Time != "" {
+							if _, err := time.Parse(time.RFC3339, input.Time); err != nil {
+								return nil, fmt.Errorf("time must be RFC3339")
+							}
+						}
+						return queryPrometheus(ctx, httpClient, prometheusBaseURL, input.Query, input.Time)
+					default:
+						return nil, fmt.Errorf("unsupported source %q; allowed sources: %s", source, strings.Join(sources, ", "))
 					}
-				}
-				return queryPrometheus(ctx, httpClient, prometheusBaseURL, input.Query, input.Time)
+				})
 			},
 		},
 	}

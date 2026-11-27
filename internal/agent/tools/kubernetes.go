@@ -22,8 +22,8 @@ type KubernetesOptions struct {
 	AllowedNamespaces []string
 	MaxReplicas       int
 	ActionCooldown    time.Duration
-	// Cooldowns arbitrates mutating actions across replicas. When nil, mutating
-	// actions fail closed with ErrCooldownUnavailable.
+	// Cooldowns enforces per-resource mutation cooldowns. Defaults to an
+	// in-process MemoryCooldownStore when nil.
 	Cooldowns CooldownStore
 }
 
@@ -36,6 +36,7 @@ type KubernetesToolset struct {
 	maxReplicas       int
 	cooldown          time.Duration
 	cooldowns         CooldownStore
+	locker            *ResourceLocker
 }
 
 func NewKubernetesTools(client kubernetes.Interface, options KubernetesOptions) (*KubernetesToolset, []agent.Tool) {
@@ -48,9 +49,12 @@ func NewKubernetesTools(client kubernetes.Interface, options KubernetesOptions) 
 	if options.ActionCooldown <= 0 {
 		options.ActionCooldown = 2 * time.Minute
 	}
+	if options.Cooldowns == nil {
+		options.Cooldowns = NewMemoryCooldownStore()
+	}
 	toolset := &KubernetesToolset{
 		client: client, namespaces: make(map[string]struct{}), maxReplicas: options.MaxReplicas,
-		cooldown: options.ActionCooldown, cooldowns: options.Cooldowns,
+		cooldown: options.ActionCooldown, cooldowns: options.Cooldowns, locker: NewResourceLocker(),
 	}
 	for _, namespace := range options.AllowedNamespaces {
 		namespace = strings.TrimSpace(namespace)
@@ -158,131 +162,139 @@ func classifyKubernetesError(err error) error {
 }
 
 func (k *KubernetesToolset) tools() []agent.Tool {
-	namespaceProperty := stringProperty("Kubernetes namespace; must be in the configured allowlist.")
+	namespaceProperty := stringProperty("[all] Kubernetes namespace; must be in the configured allowlist.")
 	return []agent.Tool{
 		{
-			Name: "k8s_list_pods", Permission: authz.PermToolObserve,
-			Description: "List pods with phase, readiness, restart counts and container states in an allowed namespace.",
-			Parameters:  objectSchema(map[string]any{"namespace": namespaceProperty, "label_selector": stringProperty("Optional Kubernetes label selector."), "limit": integerProperty("Maximum pods, default 100.", 1, 100)}),
+			Name:       "read_k8s",
+			Permission: authz.PermToolObserve,
+			Description: "Read Kubernetes diagnostic data within allowed namespaces across one or more sources: " +
+				"pods (phase, readiness, restart counts, container states), " +
+				"pod_logs (recent container logs; set previous=true for crashed container logs), " +
+				"events (recent warning and lifecycle events), " +
+				"deployment (replica status, conditions, container images, update strategy). " +
+				"Lightweight metadata queries (pods, events, deployment) can be combined in one call; query large pod_logs separately or cap tail_lines to avoid output truncation.",
+			Parameters: batchQuerySchema(map[string]any{
+				"source":          enumStringProperty("Kubernetes diagnostic data source to read.", "pods", "pod_logs", "events", "deployment"),
+				"namespace":       namespaceProperty,
+				"label_selector":  stringProperty("[pods] Optional Kubernetes label selector."),
+				"limit":           integerProperty("[pods, events] Maximum items, default 100.", 1, 100),
+				"pod":             stringProperty("[pod_logs] Required exact pod name."),
+				"container":       stringProperty("[pod_logs] Optional container name."),
+				"tail_lines":      integerProperty("[pod_logs] Maximum last lines, default 200.", 1, 1000),
+				"since_seconds":   integerProperty("[pod_logs] Lookback seconds, default 900.", 1, 86400),
+				"previous":        booleanProperty("[pod_logs] Read previous terminated container logs."),
+				"involved_object": stringProperty("[events] Optional exact Pod, Deployment or other object name."),
+				"type":            stringProperty("[events] Optional event type such as Warning."),
+				"name":            stringProperty("[deployment] Required exact Deployment name."),
+			}, "One or more Kubernetes diagnostic queries to run sequentially."),
 			Handler: func(ctx context.Context, raw json.RawMessage) (any, error) {
-				input, err := decodeArguments[struct {
-					Namespace     string `json:"namespace"`
-					LabelSelector string `json:"label_selector"`
-					Limit         int    `json:"limit"`
-				}](raw)
-				if err != nil {
-					return nil, err
-				}
-				_, results, err := k.ListPods(ctx, input.Namespace, input.LabelSelector, input.Limit)
-				if err != nil {
-					return nil, err
-				}
-				return results, nil
-			},
-		},
-		{
-			Name: "k8s_get_pod_logs", Permission: authz.PermToolObserve,
-			Description: "Read bounded recent logs from a pod container. Set previous=true to inspect a crashed container's previous instance.",
-			Parameters: objectSchema(map[string]any{
-				"namespace": namespaceProperty, "pod": stringProperty("Exact pod name."), "container": stringProperty("Optional container name."),
-				"tail_lines": integerProperty("Maximum last lines, default 200.", 1, 1000), "since_seconds": integerProperty("Lookback seconds, default 900.", 1, 86400),
-				"previous": map[string]any{"type": "boolean", "description": "Read previous terminated container logs."},
-			}, "pod"),
-			Handler: func(ctx context.Context, raw json.RawMessage) (any, error) {
-				input, err := decodeArguments[struct {
-					Namespace    string `json:"namespace"`
-					Pod          string `json:"pod"`
-					Container    string `json:"container"`
-					TailLines    int    `json:"tail_lines"`
-					SinceSeconds int    `json:"since_seconds"`
-					Previous     bool   `json:"previous"`
-				}](raw)
-				if err != nil {
-					return nil, err
-				}
-				result, err := k.GetPodLogs(ctx, agent.PodLogOptions{
-					Namespace:    input.Namespace,
-					Pod:          input.Pod,
-					Container:    input.Container,
-					TailLines:    input.TailLines,
-					SinceSeconds: input.SinceSeconds,
-					Previous:     input.Previous,
+				return runBatchQueries(raw, func(source string, item json.RawMessage) (any, error) {
+					switch source {
+					case "pods":
+						input, err := decodeSourceQuery[struct {
+							Source        string `json:"source"`
+							Namespace     string `json:"namespace"`
+							LabelSelector string `json:"label_selector"`
+							Limit         int    `json:"limit"`
+						}](item, source, "namespace, label_selector, limit")
+						if err != nil {
+							return nil, err
+						}
+						_, results, err := k.ListPods(ctx, input.Namespace, input.LabelSelector, input.Limit)
+						if err != nil {
+							return nil, err
+						}
+						return results, nil
+					case "pod_logs":
+						input, err := decodeSourceQuery[struct {
+							Source       string `json:"source"`
+							Namespace    string `json:"namespace"`
+							Pod          string `json:"pod"`
+							Container    string `json:"container"`
+							TailLines    int    `json:"tail_lines"`
+							SinceSeconds int    `json:"since_seconds"`
+							Previous     bool   `json:"previous"`
+						}](item, source, "namespace, pod (required), container, tail_lines, since_seconds, previous")
+						if err != nil {
+							return nil, err
+						}
+						result, err := k.GetPodLogs(ctx, agent.PodLogOptions{
+							Namespace:    input.Namespace,
+							Pod:          input.Pod,
+							Container:    input.Container,
+							TailLines:    input.TailLines,
+							SinceSeconds: input.SinceSeconds,
+							Previous:     input.Previous,
+						})
+						if err != nil {
+							return nil, err
+						}
+						return map[string]any{"namespace": result.Namespace, "pod": result.Pod, "container": result.Container, "logs": result.Logs}, nil
+					case "events":
+						input, err := decodeSourceQuery[struct {
+							Source         string `json:"source"`
+							Namespace      string `json:"namespace"`
+							InvolvedObject string `json:"involved_object"`
+							Type           string `json:"type"`
+							Limit          int    `json:"limit"`
+						}](item, source, "namespace, involved_object, type, limit")
+						if err != nil {
+							return nil, err
+						}
+						if input.Limit == 0 {
+							input.Limit = 100
+						}
+						if input.Limit < 1 || input.Limit > 100 {
+							return nil, fmt.Errorf("limit must be 1..100")
+						}
+						if err := k.checkNamespace(&input.Namespace); err != nil {
+							return nil, err
+						}
+						selectors := []fields.Selector{}
+						if input.InvolvedObject != "" {
+							selectors = append(selectors, fields.OneTermEqualSelector("involvedObject.name", input.InvolvedObject))
+						}
+						if input.Type != "" {
+							selectors = append(selectors, fields.OneTermEqualSelector("type", input.Type))
+						}
+						events, err := k.client.CoreV1().Events(input.Namespace).List(ctx, metav1.ListOptions{FieldSelector: fields.AndSelectors(selectors...).String(), Limit: int64(input.Limit)})
+						if err != nil {
+							return nil, err
+						}
+						results := make([]EventSummary, 0, len(events.Items))
+						for _, event := range events.Items {
+							results = append(results, EventSummary{Object: event.InvolvedObject.Name, Kind: event.InvolvedObject.Kind, Type: event.Type, Reason: event.Reason, Message: event.Message, Count: event.Count, LastTimestamp: event.LastTimestamp.Time})
+						}
+						sort.Slice(results, func(i, j int) bool { return results[i].LastTimestamp.After(results[j].LastTimestamp) })
+						return results, nil
+					case "deployment":
+						input, err := decodeSourceQuery[struct {
+							Source    string `json:"source"`
+							Namespace string `json:"namespace"`
+							Name      string `json:"name"`
+						}](item, source, "namespace, name (required)")
+						if err != nil {
+							return nil, err
+						}
+						if input.Name == "" {
+							return nil, fmt.Errorf("name is required")
+						}
+						if err := k.checkNamespace(&input.Namespace); err != nil {
+							return nil, err
+						}
+						deployment, err := k.client.AppsV1().Deployments(input.Namespace).Get(ctx, input.Name, metav1.GetOptions{})
+						if err != nil {
+							return nil, err
+						}
+						containers := make([]map[string]string, 0, len(deployment.Spec.Template.Spec.Containers))
+						for _, container := range deployment.Spec.Template.Spec.Containers {
+							containers = append(containers, map[string]string{"name": container.Name, "image": container.Image})
+						}
+						return map[string]any{"name": deployment.Name, "namespace": deployment.Namespace, "desired_replicas": replicasValue(deployment.Spec.Replicas), "ready_replicas": deployment.Status.ReadyReplicas, "available_replicas": deployment.Status.AvailableReplicas, "updated_replicas": deployment.Status.UpdatedReplicas, "unavailable_replicas": deployment.Status.UnavailableReplicas, "conditions": deployment.Status.Conditions, "containers": containers, "strategy": deployment.Spec.Strategy.Type}, nil
+					default:
+						return nil, fmt.Errorf("unsupported source %q; allowed sources: pods, pod_logs, events, deployment", source)
+					}
 				})
-				if err != nil {
-					return nil, err
-				}
-				return map[string]any{"namespace": result.Namespace, "pod": result.Pod, "container": result.Container, "logs": result.Logs}, nil
-			},
-		},
-		{
-			Name: "k8s_list_events", Permission: authz.PermToolObserve,
-			Description: "List recent Kubernetes warning and lifecycle events, optionally filtered to an exact involved object name.",
-			Parameters:  objectSchema(map[string]any{"namespace": namespaceProperty, "involved_object": stringProperty("Optional exact Pod, Deployment or other object name."), "type": stringProperty("Optional event type such as Warning."), "limit": integerProperty("Maximum events, default 100.", 1, 100)}),
-			Handler: func(ctx context.Context, raw json.RawMessage) (any, error) {
-				input, err := decodeArguments[struct {
-					Namespace      string `json:"namespace"`
-					InvolvedObject string `json:"involved_object"`
-					Type           string `json:"type"`
-					Limit          int    `json:"limit"`
-				}](raw)
-				if err != nil {
-					return nil, err
-				}
-				if input.Limit == 0 {
-					input.Limit = 100
-				}
-				if input.Limit < 1 || input.Limit > 100 {
-					return nil, fmt.Errorf("limit must be 1..100")
-				}
-				if err := k.checkNamespace(&input.Namespace); err != nil {
-					return nil, err
-				}
-				selectors := []fields.Selector{}
-				if input.InvolvedObject != "" {
-					selectors = append(selectors, fields.OneTermEqualSelector("involvedObject.name", input.InvolvedObject))
-				}
-				if input.Type != "" {
-					selectors = append(selectors, fields.OneTermEqualSelector("type", input.Type))
-				}
-				events, err := k.client.CoreV1().Events(input.Namespace).List(ctx, metav1.ListOptions{FieldSelector: fields.AndSelectors(selectors...).String(), Limit: int64(input.Limit)})
-				if err != nil {
-					return nil, err
-				}
-				results := make([]EventSummary, 0, len(events.Items))
-				for _, event := range events.Items {
-					results = append(results, EventSummary{Object: event.InvolvedObject.Name, Kind: event.InvolvedObject.Kind, Type: event.Type, Reason: event.Reason, Message: event.Message, Count: event.Count, LastTimestamp: event.LastTimestamp.Time})
-				}
-				sort.Slice(results, func(i, j int) bool { return results[i].LastTimestamp.After(results[j].LastTimestamp) })
-				return results, nil
-			},
-		},
-		{
-			Name: "k8s_get_deployment", Permission: authz.PermToolObserve,
-			Description: "Get Deployment replica status, conditions, container images and update strategy.",
-			Parameters:  objectSchema(map[string]any{"namespace": namespaceProperty, "name": stringProperty("Exact Deployment name.")}, "name"),
-			Handler: func(ctx context.Context, raw json.RawMessage) (any, error) {
-				input, err := decodeArguments[struct {
-					Namespace string `json:"namespace"`
-					Name      string `json:"name"`
-				}](raw)
-				if err != nil {
-					return nil, err
-				}
-				if input.Name == "" {
-					return nil, fmt.Errorf("name is required")
-				}
-				if err := k.checkNamespace(&input.Namespace); err != nil {
-					return nil, err
-				}
-				deployment, err := k.client.AppsV1().Deployments(input.Namespace).Get(ctx, input.Name, metav1.GetOptions{})
-				if err != nil {
-					return nil, err
-				}
-				containers := make([]map[string]string, 0, len(deployment.Spec.Template.Spec.Containers))
-				for _, container := range deployment.Spec.Template.Spec.Containers {
-					containers = append(containers, map[string]string{"name": container.Name, "image": container.Image})
-				}
-				return map[string]any{"name": deployment.Name, "namespace": deployment.Namespace, "desired_replicas": replicasValue(deployment.Spec.Replicas), "ready_replicas": deployment.Status.ReadyReplicas, "available_replicas": deployment.Status.AvailableReplicas, "updated_replicas": deployment.Status.UpdatedReplicas, "unavailable_replicas": deployment.Status.UnavailableReplicas, "conditions": deployment.Status.Conditions, "containers": containers, "strategy": deployment.Spec.Strategy.Type}, nil
 			},
 		},
 		{
@@ -308,10 +320,9 @@ func (k *KubernetesToolset) tools() []agent.Tool {
 				if err != nil {
 					return nil, err
 				}
-				if err := k.allowAction(ctx, k.podCooldownKey(ctx, pod)); err != nil {
-					return nil, err
-				}
-				if err := k.client.CoreV1().Pods(input.Namespace).Delete(ctx, input.Pod, metav1.DeleteOptions{}); err != nil {
+				if err := k.withResourceAction(ctx, k.podCooldownKey(ctx, pod), func() error {
+					return k.client.CoreV1().Pods(input.Namespace).Delete(ctx, input.Pod, metav1.DeleteOptions{})
+				}); err != nil {
 					return nil, err
 				}
 				return map[string]any{"status": "restart_requested", "namespace": input.Namespace, "pod": input.Pod, "reason": input.Reason}, nil
@@ -340,23 +351,22 @@ func (k *KubernetesToolset) tools() []agent.Tool {
 				if err := k.checkNamespace(&input.Namespace); err != nil {
 					return nil, err
 				}
-				if err := k.allowAction(ctx, deploymentCooldownKey(input.Namespace, input.Name)); err != nil {
-					return nil, err
-				}
 				// #nosec G115 -- input.Replicas is validated to 0..k.maxReplicas above.
 				desiredReplicas := int32(input.Replicas)
-				err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
-					deployment, err := k.client.AppsV1().Deployments(input.Namespace).Get(ctx, input.Name, metav1.GetOptions{})
-					if err != nil {
+				err = k.withResourceAction(ctx, deploymentCooldownKey(input.Namespace, input.Name), func() error {
+					return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+						deployment, err := k.client.AppsV1().Deployments(input.Namespace).Get(ctx, input.Name, metav1.GetOptions{})
+						if err != nil {
+							return err
+						}
+						deployment.Spec.Replicas = &desiredReplicas
+						if deployment.Annotations == nil {
+							deployment.Annotations = map[string]string{}
+						}
+						deployment.Annotations["halon.dev/last-agent-action"] = time.Now().UTC().Format(time.RFC3339) + ": " + input.Reason
+						_, err = k.client.AppsV1().Deployments(input.Namespace).Update(ctx, deployment, metav1.UpdateOptions{})
 						return err
-					}
-					deployment.Spec.Replicas = &desiredReplicas
-					if deployment.Annotations == nil {
-						deployment.Annotations = map[string]string{}
-					}
-					deployment.Annotations["halon.dev/last-agent-action"] = time.Now().UTC().Format(time.RFC3339) + ": " + input.Reason
-					_, err = k.client.AppsV1().Deployments(input.Namespace).Update(ctx, deployment, metav1.UpdateOptions{})
-					return err
+					})
 				})
 				if err != nil {
 					return nil, err
@@ -388,31 +398,39 @@ func (k *KubernetesToolset) tools() []agent.Tool {
 				if err := k.checkNamespace(&input.Namespace); err != nil {
 					return nil, err
 				}
-				if err := k.allowAction(ctx, deploymentCooldownKey(input.Namespace, input.Name)); err != nil {
+				// Validate target Deployment and container existence before
+				// claiming the cooldown window so typos do not lock out fixes.
+				existing, err := k.client.AppsV1().Deployments(input.Namespace).Get(ctx, input.Name, metav1.GetOptions{})
+				if err != nil {
 					return nil, err
 				}
-				err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
-					deployment, err := k.client.AppsV1().Deployments(input.Namespace).Get(ctx, input.Name, metav1.GetOptions{})
-					if err != nil {
-						return err
-					}
-					found := false
-					for i := range deployment.Spec.Template.Spec.Containers {
-						if deployment.Spec.Template.Spec.Containers[i].Name == input.Container {
-							deployment.Spec.Template.Spec.Containers[i].Image = input.Image
-							found = true
-							break
+				if !hasContainer(existing.Spec.Template.Spec.Containers, input.Container) {
+					return nil, fmt.Errorf("container %q not found", input.Container)
+				}
+				err = k.withResourceAction(ctx, deploymentCooldownKey(input.Namespace, input.Name), func() error {
+					return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+						deployment, err := k.client.AppsV1().Deployments(input.Namespace).Get(ctx, input.Name, metav1.GetOptions{})
+						if err != nil {
+							return err
 						}
-					}
-					if !found {
-						return fmt.Errorf("container %q not found", input.Container)
-					}
-					if deployment.Annotations == nil {
-						deployment.Annotations = map[string]string{}
-					}
-					deployment.Annotations["halon.dev/last-agent-action"] = time.Now().UTC().Format(time.RFC3339) + ": " + input.Reason
-					_, err = k.client.AppsV1().Deployments(input.Namespace).Update(ctx, deployment, metav1.UpdateOptions{})
-					return err
+						found := false
+						for i := range deployment.Spec.Template.Spec.Containers {
+							if deployment.Spec.Template.Spec.Containers[i].Name == input.Container {
+								deployment.Spec.Template.Spec.Containers[i].Image = input.Image
+								found = true
+								break
+							}
+						}
+						if !found {
+							return fmt.Errorf("container %q not found", input.Container)
+						}
+						if deployment.Annotations == nil {
+							deployment.Annotations = map[string]string{}
+						}
+						deployment.Annotations["halon.dev/last-agent-action"] = time.Now().UTC().Format(time.RFC3339) + ": " + input.Reason
+						_, err = k.client.AppsV1().Deployments(input.Namespace).Update(ctx, deployment, metav1.UpdateOptions{})
+						return err
+					})
 				})
 				if err != nil {
 					return nil, err
@@ -536,9 +554,21 @@ func findOwner(refs []metav1.OwnerReference, kinds ...string) (metav1.OwnerRefer
 	return metav1.OwnerReference{}, false
 }
 
-// allowAction claims the resource-level cooldown slot for key via an atomic
-// Redis command, so only one replica mutates a resource per window; a store
-// outage rejects the mutation instead of risking a conflict.
+// withResourceAction serializes concurrent mutations on key across sessions
+// and enforces the per-resource cooldown before running action.
+func (k *KubernetesToolset) withResourceAction(ctx context.Context, key string, action func() error) error {
+	if k.locker != nil {
+		unlock := k.locker.Lock(key)
+		defer unlock()
+	}
+	if err := k.allowAction(ctx, key); err != nil {
+		return err
+	}
+	return action()
+}
+
+// allowAction claims the resource-level cooldown slot for key; a store outage
+// rejects the mutation instead of risking unthrottled repeats.
 func (k *KubernetesToolset) allowAction(ctx context.Context, key string) error {
 	if k.cooldowns == nil {
 		return fmt.Errorf("action %s is unavailable: %w", key, ErrCooldownUnavailable)
@@ -551,6 +581,15 @@ func (k *KubernetesToolset) allowAction(ctx context.Context, key string) error {
 		return fmt.Errorf("action %s is cooling down; retry after %s", key, remaining.Round(time.Second))
 	}
 	return nil
+}
+
+func hasContainer(containers []corev1.Container, name string) bool {
+	for _, container := range containers {
+		if container.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 func replicasValue(replicas *int32) int32 {

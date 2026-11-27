@@ -3,106 +3,107 @@ package tools
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"sync"
 	"time"
-
-	"github.com/redis/go-redis/v9"
 )
 
-// CooldownStore arbitrates which replica may execute a mutating action.
-// Claim reserves key for ttl; when the key is already held it reports the
-// remaining wait instead.
+// CooldownStore arbitrates whether a mutating action may proceed on a
+// resource key. Claim reserves key for ttl; when the key is already held it
+// reports the remaining wait instead.
 type CooldownStore interface {
 	Claim(ctx context.Context, key string, ttl time.Duration) (remaining time.Duration, claimed bool, err error)
 }
 
-// ErrCooldownUnavailable marks claim attempts that failed because the
-// backing store is unreachable. Mutation tools surface it as an error:
-// a safety feature must never fail open.
+// ErrCooldownUnavailable marks claim attempts that failed because the backing
+// store is unreachable. Mutation tools surface it as an error so safety
+// cooldowns never fail open.
 var ErrCooldownUnavailable = fmt.Errorf("cooldown store unavailable")
 
-// RedisCooldownStore backs CooldownStore with atomic Redis SET NX PX commands,
-// so all agent replicas together execute a mutating action on a resource at
-// most once per cooldown window. A background pinger keeps the health hook
-// current because mutations can be hours apart.
-type RedisCooldownStore struct {
-	client    *redis.Client
-	logger    *slog.Logger
-	onHealth  func(bool)
-	opTimeout time.Duration
+const maxDeadlinesBeforeSweep = 64
 
-	done chan struct{}
-	wg   sync.WaitGroup
+// MemoryCooldownStore backs CooldownStore with an in-process concurrency-safe
+// expiration table suitable for single-instance agent deployments.
+type MemoryCooldownStore struct {
+	mu        sync.Mutex
+	deadlines map[string]time.Time
+	now       func() time.Time
 }
 
-var _ CooldownStore = (*RedisCooldownStore)(nil)
+var _ CooldownStore = (*MemoryCooldownStore)(nil)
 
-func NewRedisCooldownStore(client *redis.Client, opTimeout time.Duration, logger *slog.Logger, onHealth func(bool)) *RedisCooldownStore {
-	if opTimeout <= 0 {
-		opTimeout = 500 * time.Millisecond
-	}
-	if logger == nil {
-		logger = slog.Default()
-	}
-	store := &RedisCooldownStore{
-		client: client, logger: logger, onHealth: onHealth, opTimeout: opTimeout,
-		done: make(chan struct{}),
-	}
-	store.wg.Add(1)
-	go store.pingLoop()
-	return store
+func NewMemoryCooldownStore() *MemoryCooldownStore {
+	return NewMemoryCooldownStoreWithClock(time.Now)
 }
 
-func (s *RedisCooldownStore) Claim(ctx context.Context, key string, ttl time.Duration) (time.Duration, bool, error) {
-	opContext, cancel := context.WithTimeout(ctx, s.opTimeout)
-	defer cancel()
-	claimed, err := s.client.SetNX(opContext, cooldownKeyPrefix+key, 1, ttl).Result()
-	if err != nil {
-		s.reportHealth(false)
-		return 0, false, fmt.Errorf("%w: %v", ErrCooldownUnavailable, err)
+func NewMemoryCooldownStoreWithClock(now func() time.Time) *MemoryCooldownStore {
+	if now == nil {
+		now = time.Now
 	}
-	s.reportHealth(true)
-	if claimed {
-		return 0, true, nil
+	return &MemoryCooldownStore{
+		deadlines: make(map[string]time.Time),
+		now:       now,
 	}
-	ttlContext, cancelTTL := context.WithTimeout(ctx, s.opTimeout)
-	defer cancelTTL()
-	remaining, err := s.client.PTTL(ttlContext, cooldownKeyPrefix+key).Result()
-	if err != nil {
-		s.reportHealth(false)
-		return 0, false, fmt.Errorf("%w: %v", ErrCooldownUnavailable, err)
-	}
-	s.reportHealth(true)
-	return remaining, false, nil
 }
 
-// Close stops the background pinger.
-func (s *RedisCooldownStore) Close() {
-	close(s.done)
-	s.wg.Wait()
-}
+func (s *MemoryCooldownStore) Claim(_ context.Context, key string, ttl time.Duration) (time.Duration, bool, error) {
+	now := s.now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-func (s *RedisCooldownStore) pingLoop() {
-	defer s.wg.Done()
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-s.done:
-			return
-		case <-ticker.C:
-			ctx, cancel := context.WithTimeout(context.Background(), s.opTimeout)
-			s.reportHealth(s.client.Ping(ctx).Err() == nil)
-			cancel()
+	if expiry, ok := s.deadlines[key]; ok && expiry.After(now) {
+		return expiry.Sub(now), false, nil
+	}
+	if len(s.deadlines) >= maxDeadlinesBeforeSweep {
+		for k, expiry := range s.deadlines {
+			if !expiry.After(now) {
+				delete(s.deadlines, k)
+			}
 		}
 	}
+	s.deadlines[key] = now.Add(ttl)
+	return 0, true, nil
 }
 
-func (s *RedisCooldownStore) reportHealth(up bool) {
-	if s.onHealth != nil {
-		s.onHealth(up)
+type resourceLockEntry struct {
+	mu   sync.Mutex
+	refs int
+}
+
+// ResourceLocker serializes concurrent mutating operations that target the
+// same canonical resource key across sessions while allowing operations on
+// distinct resources to run concurrently.
+type ResourceLocker struct {
+	mu      sync.Mutex
+	entries map[string]*resourceLockEntry
+}
+
+func NewResourceLocker() *ResourceLocker {
+	return &ResourceLocker{
+		entries: make(map[string]*resourceLockEntry),
 	}
 }
 
-const cooldownKeyPrefix = "halon:cooldown:"
+func (l *ResourceLocker) Lock(key string) func() {
+	l.mu.Lock()
+	entry, ok := l.entries[key]
+	if !ok {
+		entry = &resourceLockEntry{}
+		l.entries[key] = entry
+	}
+	entry.refs++
+	l.mu.Unlock()
+
+	entry.mu.Lock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			entry.mu.Unlock()
+			l.mu.Lock()
+			entry.refs--
+			if entry.refs == 0 && l.entries[key] == entry {
+				delete(l.entries, key)
+			}
+			l.mu.Unlock()
+		})
+	}
+}

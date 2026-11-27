@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -41,13 +43,120 @@ func TestObservabilityToolRejectsInvalidArguments(t *testing.T) {
 	}
 	defer func() { _ = database.Close() }()
 	tools := ObservabilityTools(database, "", nil)
-	_, err = tools[0].Handler(context.Background(), json.RawMessage(`{"limit":1000}`))
-	if err == nil {
+	if len(tools) != 1 || tools[0].Name != "read_observability" {
+		t.Fatalf("unexpected tools: %+v", tools)
+	}
+	handler := tools[0].Handler
+
+	for _, raw := range []string{
+		`{}`,
+		`{"queries":[]}`,
+		`{"queries":[{"source":"error_logs"},{"source":"error_logs"},{"source":"error_logs"},{"source":"error_logs"},{"source":"error_logs"},{"source":"error_logs"},{"source":"error_logs"},{"source":"error_logs"},{"source":"error_logs"}]}`,
+		`{"unknown":true,"queries":[{"source":"error_logs"}]}`,
+	} {
+		if _, err := handler(context.Background(), json.RawMessage(raw)); err == nil {
+			t.Fatalf("expected error for %s", raw)
+		}
+	}
+
+	if _, err := handler(context.Background(), json.RawMessage(`{"queries":[{"source":"error_logs","limit":1000}]}`)); err == nil {
 		t.Fatal("expected limit validation error")
 	}
-	_, err = tools[0].Handler(context.Background(), json.RawMessage(`{"unknown":true}`))
-	if err == nil {
-		t.Fatal("expected unknown field validation error")
+	if _, err := handler(context.Background(), json.RawMessage(`{"queries":[{"source":"traffic_stats","limit":10}]}`)); err == nil || !strings.Contains(err.Error(), "allowed fields:") {
+		t.Fatalf("expected allowed fields hint, got %v", err)
+	}
+	if _, err := handler(context.Background(), json.RawMessage(`{"queries":[{"source":"unknown_source"}]}`)); err == nil || !strings.Contains(err.Error(), "allowed sources:") {
+		t.Fatalf("expected allowed sources hint, got %v", err)
+	}
+}
+
+func TestReadObservabilityBatchAndPartialFailure(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = database.Close() }()
+
+	statsRows := sqlmock.NewRows([]string{"path", "status_code", "count", "avg", "max", "p95", "p99", "server_errors"}).
+		AddRow("/api/v1/orders/1", 504, 12, 3005.0, 3100.0, 3090.0, 3099.0, 12)
+	topIPRows := sqlmock.NewRows([]string{"client_ip", "requests", "error_count", "average_ms"}).
+		AddRow("192.0.2.10", 50, 40, 120.5)
+	mock.ExpectQuery("SELECT path, status_code").WithArgs(30).WillReturnRows(statsRows)
+	mock.ExpectQuery("SELECT client_ip, COUNT").WithArgs(30, 10).WillReturnRows(topIPRows)
+
+	tools := ObservabilityTools(database, "", nil)
+	res, err := tools[0].Handler(context.Background(), json.RawMessage(`{
+		"queries": [
+			{"source": "traffic_stats"},
+			{"source": "top_ips"},
+			{"source": "traffic_stats", "limit": 5}
+		]
+	}`))
+	if err != nil {
+		t.Fatalf("partial success should not fail whole batch: %v", err)
+	}
+	results := res.(map[string]any)["results"].([]batchItemResult)
+	if len(results) != 3 {
+		t.Fatalf("len(results) = %d, want 3", len(results))
+	}
+	if results[0].Source != "traffic_stats" || results[0].Error != "" || len(results[0].Data.([]TrafficStatRow)) != 1 {
+		t.Fatalf("unexpected first result: %+v", results[0])
+	}
+	if results[1].Source != "top_ips" || results[1].Error != "" || len(results[1].Data.([]TopIPRow)) != 1 {
+		t.Fatalf("unexpected second result: %+v", results[1])
+	}
+	if results[2].Source != "traffic_stats" || !strings.Contains(results[2].Error, "allowed fields:") {
+		t.Fatalf("unexpected third result: %+v", results[2])
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReadObservabilityPrometheusConditional(t *testing.T) {
+	database, _, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = database.Close() }()
+
+	noPromTool := ObservabilityTools(database, "", nil)[0]
+	noPromProps := noPromTool.Parameters["properties"].(map[string]any)["queries"].(map[string]any)["items"].(map[string]any)["properties"].(map[string]any)
+	noPromSources := noPromProps["source"].(map[string]any)["enum"].([]string)
+	if !reflect.DeepEqual(noPromSources, []string{"error_logs", "traffic_stats", "top_ips"}) {
+		t.Fatalf("sources without prometheus = %v", noPromSources)
+	}
+	if _, exists := noPromProps["query"]; exists {
+		t.Fatal("query field should be omitted when PROMETHEUS_URL is empty")
+	}
+	if _, exists := noPromProps["time"]; exists {
+		t.Fatal("time field should be omitted when PROMETHEUS_URL is empty")
+	}
+	if _, err := noPromTool.Handler(context.Background(), json.RawMessage(`{"queries":[{"source":"prometheus","query":"up"}]}`)); err == nil || !strings.Contains(err.Error(), "unsupported source") {
+		t.Fatalf("expected unsupported source when PROMETHEUS_URL empty, got %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "success", "data": map[string]any{"resultType": "vector", "result": []any{}}})
+	}))
+	defer server.Close()
+
+	withPromTool := ObservabilityTools(database, server.URL, server.Client())[0]
+	withPromProps := withPromTool.Parameters["properties"].(map[string]any)["queries"].(map[string]any)["items"].(map[string]any)["properties"].(map[string]any)
+	withPromSources := withPromProps["source"].(map[string]any)["enum"].([]string)
+	if !reflect.DeepEqual(withPromSources, []string{"error_logs", "traffic_stats", "top_ips", "prometheus"}) {
+		t.Fatalf("sources with prometheus = %v", withPromSources)
+	}
+	if _, exists := withPromProps["query"]; !exists {
+		t.Fatal("query field should be present when PROMETHEUS_URL is configured")
+	}
+	res, err := withPromTool.Handler(context.Background(), json.RawMessage(`{"queries":[{"source":"prometheus","query":"up"}]}`))
+	if err != nil {
+		t.Fatalf("prometheus query failed: %v", err)
+	}
+	results := res.(map[string]any)["results"].([]batchItemResult)
+	if len(results) != 1 || results[0].Data.(map[string]any)["status"] != "success" {
+		t.Fatalf("unexpected prometheus batch result: %+v", results)
 	}
 }
 
