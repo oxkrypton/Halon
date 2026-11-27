@@ -23,6 +23,7 @@ func TestRolePermissionMatrix(t *testing.T) {
 		full       bool
 	}{
 		{PermIncidentRead, true, true, true},
+		{PermIncidentManage, false, true, true},
 		{PermPodLogsRead, true, true, true},
 		{PermGatewayRulesRead, true, true, true},
 		{PermGatewayBreakerRead, true, true, true},

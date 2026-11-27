@@ -24,6 +24,7 @@ type Permission string
 
 const (
 	PermIncidentRead             Permission = "incident:read"
+	PermIncidentManage           Permission = "incident:manage"
 	PermPodLogsRead              Permission = "k8s:pod_logs:read"
 	PermGatewayRulesRead         Permission = "gateway:rules:read"
 	PermGatewayBreakerRead       Permission = "gateway:breaker:read"
@@ -41,6 +42,7 @@ const (
 
 var permissionRoles = map[Permission]Role{
 	PermIncidentRead:             RoleReadOnly,
+	PermIncidentManage:           RoleOperator,
 	PermPodLogsRead:              RoleReadOnly,
 	PermGatewayRulesRead:         RoleReadOnly,
 	PermGatewayBreakerRead:       RoleReadOnly,
