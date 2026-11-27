@@ -48,7 +48,7 @@ export function OverviewPage() {
 
   const ov = overviewQ.data?.overview;
   const rt = overviewQ.data?.runtime;
-  const queueDropped = (rt?.trafficlog_dropped ?? 0) + (rt?.timeout_events_dropped ?? 0);
+  const queueDropped = (rt?.trafficlog_dropped ?? 0) + (rt?.incident_events_dropped ?? 0);
   const webhookFailures = rt?.webhook_notify_failures ?? 0;
   const openBreakers = (breakersQ.data?.breakers || []).filter((b) => b.state === 'open').length;
 
@@ -158,13 +158,13 @@ export function OverviewPage() {
           <Scorecard
             label="队列丢弃"
             value={formatCount(queueDropped)}
-            sub={`日志 ${formatCount(rt?.trafficlog_dropped)} · 超时事件 ${formatCount(rt?.timeout_events_dropped)}`}
+            sub={`日志 ${formatCount(rt?.trafficlog_dropped)} · 故障事件 ${formatCount(rt?.incident_events_dropped)}`}
             tone={queueDropped > 0 ? 'red' : 'green'}
           />
           <Scorecard
             label="Webhook 推送失败"
             value={formatCount(webhookFailures)}
-            sub="超时事件投递 Agent"
+            sub="故障事件投递 Agent"
             tone={webhookFailures > 0 ? 'red' : 'green'}
           />
         </div>
@@ -259,7 +259,7 @@ export function OverviewPage() {
               description="若已部署 Agent 服务且处于 jwt 模式，请使用包含 halon-agent audience 的令牌。"
             />
           ) : (incidentsQ.data?.incidents?.length || 0) === 0 ? (
-            <EmptyState title="暂无超时故障事件" description="上游发生 504 超时后，Agent 将自动生成排查报告。" />
+            <EmptyState title="暂无故障排查事件" description="网关捕捉到异常并达标上报后，Agent 将自动生成排查报告。" />
           ) : (
             <div className="divide-y divide-[#F1F3F4]">
               {(incidentsQ.data?.incidents || []).map((inc) => (
@@ -282,12 +282,17 @@ export function OverviewPage() {
                         }
                         label={inc.status}
                       />
+                      <StatusChip status="muted" label={inc.event_type || 'incident'} />
                       <span className="font-mono text-[12.5px] text-[#202124] truncate">
-                        {inc.method} {inc.path}
+                        {inc.method && inc.path
+                          ? `${inc.method} ${inc.path}`
+                          : inc.summary || inc.scope_key || inc.route || inc.event_type}
                       </span>
                     </div>
                     <div className="mt-0.5 text-[11px] text-[#5F6368] font-mono">
-                      {inc.route} · {formatMS(inc.latency_ms)} · {inc.steps} 步
+                      {inc.scope_key || inc.route || '-'}
+                      {(inc.occurrences || 1) > 1 ? ` · ×${inc.occurrences}` : ''}
+                      {inc.latency_ms ? ` · ${formatMS(inc.latency_ms)}` : ''} · {inc.steps} 步
                     </div>
                   </div>
                   <span className="text-[11.5px] text-[#80868B] tabular-nums shrink-0">

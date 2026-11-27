@@ -33,7 +33,7 @@ export interface RuntimeMetricsSnapshot {
   retry_exhausted_total: number;
   breaker_trips_total: number;
   trafficlog_dropped: number;
-  timeout_events_dropped: number;
+  incident_events_dropped: number;
   webhook_notify_failures: number;
 }
 
