@@ -139,9 +139,10 @@ func TestTruncateToolOutput(t *testing.T) {
 	}
 }
 
-func testEvent() incident.TimeoutEvent {
-	return incident.TimeoutEvent{
-		EventID: "event-1", RequestID: "request-1", OccurredAt: time.Now().UTC(),
+func testEvent() incident.Event {
+	return incident.Event{
+		EventID: "event-1", Type: incident.TypeUpstreamTimeout, ScopeKey: "/api/v1/users/:id",
+		RequestID: "request-1", OccurredAt: time.Now().UTC(),
 		Method: http.MethodGet, Path: "/api/v1/users/1", Route: "/api/v1/users/:id",
 		StatusCode: 504, LatencyMS: 3000,
 	}
@@ -203,5 +204,33 @@ func TestLoopMarksStoredToolOutputTruncated(t *testing.T) {
 	execution := result.Executions[0]
 	if !execution.OutputTruncated || !strings.Contains(execution.Output, "[tool output truncated]") || len(execution.Output) > 2048+64 {
 		t.Fatalf("stored output = %d bytes, truncated=%v", len(execution.Output), execution.OutputTruncated)
+	}
+}
+
+func TestLoopIncludesProfileGuidanceForBuiltinAndCustomTypes(t *testing.T) {
+	var seenUserPrompts []string
+	model := modelFunc(func(_ context.Context, messages []Message, _ []ToolDefinition) (Message, Usage, error) {
+		seenUserPrompts = append(seenUserPrompts, *messages[1].Content)
+		return NewTextMessage("assistant", "done"), Usage{}, nil
+	})
+	registry, _ := NewRegistry(LevelReadOnly)
+	loop := NewLoop(model, registry, 2, 1024, 4096, testLogger())
+
+	if _, err := loop.Run(context.Background(), incident.Event{
+		EventID: "evt-ip", Type: incident.TypeRateLimitAbuse, ScopeKey: "203.0.113.9",
+	}, LevelReadOnly); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(seenUserPrompts[0], "Incident type: rate_limit_abuse") || !strings.Contains(seenUserPrompts[0], "gateway_block_ip") {
+		t.Fatalf("missing profile guidance for rate_limit_abuse: %s", seenUserPrompts[0])
+	}
+
+	if _, err := loop.Run(context.Background(), incident.Event{
+		EventID: "evt-ext", Type: "custom_probe_failed", ScopeKey: "svc-a",
+	}, LevelReadOnly); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(seenUserPrompts[1], "Incident type: custom_probe_failed") || !strings.Contains(seenUserPrompts[1], "Scope key: svc-a") {
+		t.Fatalf("missing fallback guidance for custom type: %s", seenUserPrompts[1])
 	}
 }

@@ -4,28 +4,27 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/alicebob/miniredis/v2"
 	"github.com/oxkrypton/Halon/internal/incident"
 )
 
 type stubReportStore struct {
-	mu          sync.Mutex
-	claims      int
-	saved       []incident.Report
-	processing  []string
-	failed      map[string]string
-	claimExists bool
-	claimErr    error
+	mu                sync.Mutex
+	claims            int
+	saved             []incident.Report
+	processing        []string
+	failed            map[string]string
+	unfinished        []incident.Report
+	loadUnfinishedErr error
+	claimExists       bool
+	claimErr          error
 }
 
-func (s *stubReportStore) Claim(_ context.Context, event incident.TimeoutEvent) (bool, error) {
+func (s *stubReportStore) Claim(_ context.Context, event incident.Event) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.claims++
@@ -55,6 +54,15 @@ func (s *stubReportStore) SaveResult(_ context.Context, report incident.Report) 
 	return nil
 }
 
+func (s *stubReportStore) LoadUnfinished(context.Context) ([]incident.Report, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.loadUnfinishedErr != nil {
+		return nil, s.loadUnfinishedErr
+	}
+	return append([]incident.Report(nil), s.unfinished...), nil
+}
+
 func (s *stubReportStore) MarkFailed(_ context.Context, eventID, cause string, _ time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -82,16 +90,32 @@ func (s *stubReportStore) savedReports() []incident.Report {
 }
 
 func newTestOrchestrator(model Model, store ReportStore, queueSize int) *Orchestrator {
+	return newTestOrchestratorWithOptions(model, store, OrchestratorOptions{
+		QueueSize: queueSize,
+	})
+}
+
+func newTestOrchestratorWithOptions(model Model, store ReportStore, opts OrchestratorOptions) *Orchestrator {
 	registry, _ := NewRegistry(LevelReadOnly, Tool{
 		Name: "read", Description: "Read", Handler: func(context.Context, json.RawMessage) (any, error) {
 			return map[string]bool{"ok": true}, nil
 		},
 	})
 	loop := NewLoop(model, registry, 3, 1024, 4096, testLogger())
-	return NewOrchestrator(loop, store, OrchestratorOptions{
-		Level: LevelReadOnly, Workers: 1, QueueSize: queueSize,
-		RunTimeout: 5 * time.Second, Logger: testLogger(),
-	})
+	if opts.Level == "" {
+		opts.Level = LevelReadOnly
+	}
+	if opts.Workers == 0 {
+		opts.Workers = 1
+	}
+	if opts.QueueSize == 0 {
+		opts.QueueSize = 8
+	}
+	if opts.RunTimeout == 0 {
+		opts.RunTimeout = 5 * time.Second
+	}
+	opts.Logger = testLogger()
+	return NewOrchestrator(loop, store, opts)
 }
 
 func finalMessageModel(text string) Model {
@@ -110,24 +134,13 @@ func TestOrchestratorCompletesInvestigation(t *testing.T) {
 	if err != nil || result.Outcome != SubmitAccepted {
 		t.Fatalf("submit = %+v, err %v", result, err)
 	}
-
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		reports := store.savedReports()
-		if len(reports) == 1 {
-			report := reports[0]
-			if report.Status != incident.StatusCompleted || report.FinalMessage == "" || report.TotalTokens != 2 {
-				t.Fatalf("unexpected report: %+v", report)
-			}
-			if report.StartedAt == nil || report.FinishedAt == nil {
-				t.Fatalf("report must carry investigation timestamps: %+v", report)
-			}
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("investigation did not finish in time")
-		}
-		time.Sleep(5 * time.Millisecond)
+	waitReports(t, store, 1)
+	report := store.savedReports()[0]
+	if report.Status != incident.StatusCompleted || report.FinalMessage == "" || report.TotalTokens != 2 {
+		t.Fatalf("unexpected report: %+v", report)
+	}
+	if report.StartedAt == nil || report.FinishedAt == nil {
+		t.Fatalf("report must carry investigation timestamps: %+v", report)
 	}
 }
 
@@ -143,19 +156,10 @@ func TestOrchestratorMarksFailedRuns(t *testing.T) {
 	if _, err := orchestrator.Submit(context.Background(), testEvent()); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		reports := store.savedReports()
-		if len(reports) == 1 {
-			if reports[0].Status != incident.StatusFailed || !strings.Contains(reports[0].Error, "model unavailable") {
-				t.Fatalf("unexpected report: %+v", reports[0])
-			}
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("failed run was not persisted in time")
-		}
-		time.Sleep(5 * time.Millisecond)
+	waitReports(t, store, 1)
+	reports := store.savedReports()
+	if reports[0].Status != incident.StatusFailed || !strings.Contains(reports[0].Error, "model unavailable") {
+		t.Fatalf("unexpected report: %+v", reports[0])
 	}
 }
 
@@ -188,8 +192,12 @@ func TestOrchestratorReportsFullQueue(t *testing.T) {
 	orchestrator := newTestOrchestrator(finalMessageModel("ok"), store, 1)
 
 	first := testEvent()
+	first.ScopeKey = "/api/v1/users/"
+	first.Route = "/api/v1/users/"
 	second := testEvent()
 	second.EventID = "event-2"
+	second.ScopeKey = "/api/v1/orders/"
+	second.Route = "/api/v1/orders/"
 	if _, err := orchestrator.Submit(context.Background(), first); err != nil {
 		t.Fatal(err)
 	}
@@ -204,313 +212,235 @@ func TestOrchestratorReportsFullQueue(t *testing.T) {
 	}
 }
 
-func newTestOrchestratorWithOptions(model Model, store ReportStore, opts OrchestratorOptions) *Orchestrator {
-	registry, _ := NewRegistry(LevelReadOnly, Tool{
-		Name: "read", Description: "Read", Handler: func(context.Context, json.RawMessage) (any, error) {
-			return map[string]bool{"ok": true}, nil
-		},
-	})
-	loop := NewLoop(model, registry, 3, 1024, 4096, testLogger())
-	if opts.Level == "" {
-		opts.Level = LevelReadOnly
-	}
-	if opts.Workers == 0 {
-		opts.Workers = 1
-	}
-	if opts.QueueSize == 0 {
-		opts.QueueSize = 8
-	}
-	if opts.RunTimeout == 0 {
-		opts.RunTimeout = 5 * time.Second
-	}
-	opts.Logger = testLogger()
-	return NewOrchestrator(loop, store, opts)
-}
-
-func TestOrchestratorSuppressesRouteStorm(t *testing.T) {
-	mr := miniredis.RunT(t)
-	store := &stubReportStore{}
-	orchestrator := newTestOrchestratorWithOptions(finalMessageModel("ok"), store, OrchestratorOptions{
-		CoalesceCooldown: 5 * time.Minute,
-		RetryBackoff:     time.Minute,
-		Suppressor:       newTestRedisRouteSuppressor(t, mr, nil),
-	})
-	go orchestrator.Run()
-	defer orchestrator.Close()
-
-	var accepted, suppressed int
-	for i := 0; i < 50; i++ {
-		evt := testEvent()
-		evt.EventID = fmt.Sprintf("ord-%d", i)
-		evt.Route = "/api/v1/orders/"
-		evt.Path = fmt.Sprintf("/api/v1/orders/%d", i)
-		res, err := orchestrator.Submit(context.Background(), evt)
-		if err != nil {
-			t.Fatalf("submit %d: %v", i, err)
-		}
-		switch res.Outcome {
-		case SubmitAccepted:
-			accepted++
-		case SubmitSuppressed:
-			suppressed++
-			if res.IncidentID != "ord-0" {
-				t.Fatalf("suppressed event %d pointed to %q, want ord-0", i, res.IncidentID)
-			}
+func TestOrchestratorSuppressesConcurrentActiveRouteSession(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	model := modelFunc(func(ctx context.Context, _ []Message, _ []ToolDefinition) (Message, Usage, error) {
+		select {
+		case <-started:
 		default:
-			t.Fatalf("unexpected outcome %s", res.Outcome)
+			close(started)
 		}
-	}
-
-	// A different route is admitted independently.
-	other := testEvent()
-	other.EventID = "usr-0"
-	other.Route = "/api/v1/users/"
-	res, err := orchestrator.Submit(context.Background(), other)
-	if err != nil || res.Outcome != SubmitAccepted {
-		t.Fatalf("other route submit = (%+v, %v), want accepted", res, err)
-	}
-
-	if accepted != 1 || suppressed != 49 {
-		t.Fatalf("orders storm: accepted=%d suppressed=%d, want 1/49", accepted, suppressed)
-	}
-	if claims := store.claimCount(); claims != 2 {
-		t.Fatalf("Claim calls = %d, want 2 (suppressed events must not hit DB)", claims)
-	}
-
-	deadline := time.Now().Add(2 * time.Second)
-	for len(store.savedReports()) < 2 {
-		if time.Now().After(deadline) {
-			t.Fatalf("expected 2 saved reports, got %d", len(store.savedReports()))
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-}
-
-func TestOrchestratorCooldownAndRetryBackoff(t *testing.T) {
-	mr := miniredis.RunT(t)
-	suppressor := newTestRedisRouteSuppressor(t, mr, nil)
-
-	var failNext atomic.Bool
-	failNext.Store(true)
-	model := modelFunc(func(context.Context, []Message, []ToolDefinition) (Message, Usage, error) {
-		if failNext.Load() {
-			return Message{}, Usage{}, errors.New("llm timeout")
-		}
+		<-release
 		return NewTextMessage("assistant", "ok"), Usage{}, nil
 	})
 
 	store := &stubReportStore{}
 	orchestrator := newTestOrchestratorWithOptions(model, store, OrchestratorOptions{
-		CoalesceCooldown: 5 * time.Minute,
-		RetryBackoff:     time.Minute,
-		Suppressor:       suppressor,
+		Workers:   2,
+		QueueSize: 8,
 	})
 	go orchestrator.Run()
 	defer orchestrator.Close()
 
-	// 1) First run fails -> window shrinks to RetryBackoff (1m).
 	evt1 := testEvent()
-	evt1.EventID = "evt-fail"
-	if res, err := orchestrator.Submit(context.Background(), evt1); err != nil || res.Outcome != SubmitAccepted {
-		t.Fatalf("evt1 = (%+v, %v)", res, err)
+	evt1.EventID = "ord-0"
+	evt1.Route = "/api/v1/orders/"
+	res1, err := orchestrator.Submit(context.Background(), evt1)
+	if err != nil || res1.Outcome != SubmitAccepted {
+		t.Fatalf("first submit = (%+v, %v)", res1, err)
 	}
-	waitReports(t, store, 1)
-	waitRouteTTL(t, mr, evt1.Route, func(ttl time.Duration) bool { return ttl > 0 && ttl <= time.Minute })
+	<-started
 
-	// Within 1m backoff, another event is suppressed.
-	mr.FastForward(30 * time.Second)
-	evtBlocked := testEvent()
-	evtBlocked.EventID = "evt-blocked-backoff"
-	if res, err := orchestrator.Submit(context.Background(), evtBlocked); err != nil || res.Outcome != SubmitSuppressed {
-		t.Fatalf("within backoff: (%+v, %v), want suppressed", res, err)
-	}
-
-	// Past 1m backoff (still < 5m cooldown), next event is accepted and succeeds.
-	failNext.Store(false)
-	mr.FastForward(40 * time.Second)
-	evt2 := testEvent()
-	evt2.EventID = "evt-ok"
-	if res, err := orchestrator.Submit(context.Background(), evt2); err != nil || res.Outcome != SubmitAccepted {
-		t.Fatalf("after backoff: (%+v, %v), want accepted", res, err)
-	}
-	waitReports(t, store, 2)
-	waitRouteTTL(t, mr, evt2.Route, func(ttl time.Duration) bool { return ttl > time.Minute && ttl <= 5*time.Minute })
-
-	// After success, window stays closed for full 5m cooldown.
-	mr.FastForward(2 * time.Minute)
-	evtBlockedCooldown := testEvent()
-	evtBlockedCooldown.EventID = "evt-blocked-cooldown"
-	if res, err := orchestrator.Submit(context.Background(), evtBlockedCooldown); err != nil || res.Outcome != SubmitSuppressed {
-		t.Fatalf("within cooldown: (%+v, %v), want suppressed", res, err)
+	// Same (event_type, scope_key) while session is active -> suppressed pointing to ord-0.
+	evt2 := evt1
+	evt2.EventID = "ord-1"
+	res2, err := orchestrator.Submit(context.Background(), evt2)
+	if err != nil || res2.Outcome != SubmitSuppressed || res2.IncidentID != "ord-0" {
+		t.Fatalf("concurrent same (type, scope_key) = (%+v, %v), want suppressed -> ord-0", res2, err)
 	}
 
-	// Past 5m cooldown, a fresh investigation opens.
-	mr.FastForward(4 * time.Minute)
-	evt3 := testEvent()
-	evt3.EventID = "evt-reopen"
-	if res, err := orchestrator.Submit(context.Background(), evt3); err != nil || res.Outcome != SubmitAccepted {
-		t.Fatalf("after cooldown: (%+v, %v), want accepted", res, err)
+	// Same route but DIFFERENT event_type is admitted independently.
+	diffType := evt1
+	diffType.EventID = "ord-err-0"
+	diffType.Type = incident.TypeUpstreamError
+	diffType.StatusCode = 502
+	resDiffType, err := orchestrator.Submit(context.Background(), diffType)
+	if err != nil || resDiffType.Outcome != SubmitAccepted {
+		t.Fatalf("different event type on same route = (%+v, %v), want accepted", resDiffType, err)
 	}
+
+	// Different route is admitted independently.
+	other := evt1
+	other.EventID = "usr-0"
+	other.Route = "/api/v1/users/"
+	other.ScopeKey = "/api/v1/users/"
+	resOther, err := orchestrator.Submit(context.Background(), other)
+	if err != nil || resOther.Outcome != SubmitAccepted {
+		t.Fatalf("other route = (%+v, %v), want accepted", resOther, err)
+	}
+	if claims := store.claimCount(); claims != 3 {
+		t.Fatalf("Claim calls = %d, want 3 (suppressed events must not hit DB)", claims)
+	}
+
+	close(release)
 	waitReports(t, store, 3)
+
+	// Once ord-0 completes, a new session on /api/v1/orders/ is accepted.
+	deadline := time.Now().Add(time.Second)
+	for len(orchestrator.ListSessions()) > 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	evt3 := evt1
+	evt3.EventID = "ord-2"
+	res3, err := orchestrator.Submit(context.Background(), evt3)
+	if err != nil || res3.Outcome != SubmitAccepted {
+		t.Fatalf("after completion = (%+v, %v), want accepted", res3, err)
+	}
+	waitReports(t, store, 4)
 }
 
-func TestOrchestratorReleasesWindowOnClaimFailureOrDuplicate(t *testing.T) {
-	mr := miniredis.RunT(t)
-	store := &stubReportStore{claimErr: errors.New("db hiccup")}
-	orchestrator := newTestOrchestratorWithOptions(finalMessageModel("ok"), store, OrchestratorOptions{
-		CoalesceCooldown: 5 * time.Minute,
-		Suppressor:       newTestRedisRouteSuppressor(t, mr, nil),
+func TestOrchestratorListsAndCancelsSessions(t *testing.T) {
+	runningCh := make(chan struct{})
+	model := modelFunc(func(ctx context.Context, _ []Message, _ []ToolDefinition) (Message, Usage, error) {
+		select {
+		case <-runningCh:
+		default:
+			close(runningCh)
+		}
+		<-ctx.Done()
+		return Message{}, Usage{}, ctx.Err()
 	})
 
-	evt1 := testEvent()
-	evt1.EventID = "evt-1"
-	if _, err := orchestrator.Submit(context.Background(), evt1); err == nil {
-		t.Fatal("expected claim error")
-	}
-
-	// DB recovers, but next event is an old duplicate (claimed=false).
-	store.mu.Lock()
-	store.claimErr = nil
-	store.claimExists = true
-	store.mu.Unlock()
-	evt2 := testEvent()
-	evt2.EventID = "evt-2"
-	if res, err := orchestrator.Submit(context.Background(), evt2); err != nil || res.Outcome != SubmitDuplicate {
-		t.Fatalf("duplicate submit = (%+v, %v), want duplicate", res, err)
-	}
-
-	// Neither failure nor duplicate should leave the route suppressed.
-	store.mu.Lock()
-	store.claimExists = false
-	store.mu.Unlock()
-	evt3 := testEvent()
-	evt3.EventID = "evt-3"
-	if res, err := orchestrator.Submit(context.Background(), evt3); err != nil || res.Outcome != SubmitAccepted {
-		t.Fatalf("subsequent submit = (%+v, %v), want accepted", res, err)
-	}
-}
-
-func TestOrchestratorSettleDelay(t *testing.T) {
-	mr := miniredis.RunT(t)
 	store := &stubReportStore{}
-	orchestrator := newTestOrchestratorWithOptions(finalMessageModel("ok"), store, OrchestratorOptions{
-		CoalesceCooldown: 5 * time.Minute,
-		SettleDelay:      60 * time.Millisecond,
-		Suppressor:       newTestRedisRouteSuppressor(t, mr, nil),
+	orchestrator := newTestOrchestratorWithOptions(model, store, OrchestratorOptions{
+		Workers:   1,
+		QueueSize: 4,
 	})
 	go orchestrator.Run()
 	defer orchestrator.Close()
 
-	started := time.Now()
-	evt := testEvent()
-	if res, err := orchestrator.Submit(context.Background(), evt); err != nil || res.Outcome != SubmitAccepted {
-		t.Fatalf("submit = (%+v, %v)", res, err)
+	evtRun := testEvent()
+	evtRun.EventID = "sess-run"
+	evtRun.ScopeKey = "/api/v1/orders/"
+	evtRun.Route = "/api/v1/orders/"
+	evtRun.Occurrences = 4
+	if _, err := orchestrator.Submit(context.Background(), evtRun); err != nil {
+		t.Fatal(err)
 	}
-	// Another event during settle delay is suppressed.
-	evt2 := testEvent()
-	evt2.EventID = "evt-during-settle"
-	if res, err := orchestrator.Submit(context.Background(), evt2); err != nil || res.Outcome != SubmitSuppressed {
-		t.Fatalf("during settle = (%+v, %v), want suppressed", res, err)
+	<-runningCh
+
+	evtQueue := testEvent()
+	evtQueue.EventID = "sess-queue"
+	evtQueue.ScopeKey = "/api/v1/users/"
+	evtQueue.Route = "/api/v1/users/"
+	if _, err := orchestrator.Submit(context.Background(), evtQueue); err != nil {
+		t.Fatal(err)
 	}
-	// Investigation must not complete before settle delay elapses.
+
+	sessions := orchestrator.ListSessions()
+	if len(sessions) != 2 || sessions[0].SessionID != "sess-run" || sessions[0].EventType != incident.TypeUpstreamTimeout || sessions[0].State != SessionRunning || sessions[0].Occurrences != 4 || sessions[1].SessionID != "sess-queue" || sessions[1].State != SessionQueued {
+		t.Fatalf("unexpected ListSessions: %+v", sessions)
+	}
+
+	// Cancel queued session first.
+	if err := orchestrator.CancelSession(context.Background(), "sess-queue"); err != nil {
+		t.Fatalf("cancel queued session: %v", err)
+	}
+	if cause := store.failedReports()["sess-queue"]; !strings.Contains(cause, "cancelled by operator") {
+		t.Fatalf("queued cancel failure cause = %q", cause)
+	}
+
+	// Cancel running session.
+	if err := orchestrator.CancelSession(context.Background(), "sess-run"); err != nil {
+		t.Fatalf("cancel running session: %v", err)
+	}
 	waitReports(t, store, 1)
-	if elapsed := time.Since(started); elapsed < 50*time.Millisecond {
-		t.Fatalf("investigation finished too early: %v < 50ms", elapsed)
+	if rep := store.savedReports()[0]; rep.Status != incident.StatusFailed || !strings.Contains(rep.Error, "cancelled by operator") {
+		t.Fatalf("running cancel report = %+v", rep)
+	}
+
+	if err := orchestrator.CancelSession(context.Background(), "missing"); !errors.Is(err, ErrSessionNotFound) {
+		t.Fatalf("cancel missing = %v, want ErrSessionNotFound", err)
 	}
 }
 
-func TestOrchestratorCloseCancelsPendingSettleAndReleasesWindow(t *testing.T) {
-	mr := miniredis.RunT(t)
-	store := &stubReportStore{}
-	suppressor := newTestRedisRouteSuppressor(t, mr, nil)
-	orchestrator := newTestOrchestratorWithOptions(finalMessageModel("ok"), store, OrchestratorOptions{
-		CoalesceCooldown: 5 * time.Minute,
-		SettleDelay:      10 * time.Second,
-		Suppressor:       suppressor,
+func TestOrchestratorCancelActiveAbortsRunningSession(t *testing.T) {
+	runningCh := make(chan struct{})
+	model := modelFunc(func(ctx context.Context, _ []Message, _ []ToolDefinition) (Message, Usage, error) {
+		close(runningCh)
+		<-ctx.Done()
+		return Message{}, Usage{}, ctx.Err()
 	})
-	go orchestrator.Run()
+	store := &stubReportStore{}
+	orchestrator := newTestOrchestrator(model, store, 2)
+	done := make(chan struct{})
+	go func() {
+		orchestrator.Run()
+		close(done)
+	}()
 
-	evt := testEvent()
-	if res, err := orchestrator.Submit(context.Background(), evt); err != nil || res.Outcome != SubmitAccepted {
-		t.Fatalf("submit = (%+v, %v)", res, err)
+	if _, err := orchestrator.Submit(context.Background(), testEvent()); err != nil {
+		t.Fatal(err)
 	}
+	<-runningCh
 
-	closeStart := time.Now()
-	orchestrator.Close()
-	if elapsed := time.Since(closeStart); elapsed > time.Second {
-		t.Fatalf("Close waited for settle timer (%v)", elapsed)
+	go orchestrator.Close()
+	orchestrator.CancelActive()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("CancelActive did not abort running session in time")
 	}
-
-	if cause := store.failedReports()[evt.EventID]; !strings.Contains(cause, "shut down") {
-		t.Fatalf("abandoned pending event was not marked failed: %v", store.failedReports())
-	}
-	if acquired, _, err := suppressor.TryAcquire(context.Background(), evt.Route, "evt-next", time.Minute); err != nil || !acquired {
-		t.Fatalf("route window was not released on Close: acquired=%v err=%v", acquired, err)
+	waitReports(t, store, 1)
+	if rep := store.savedReports()[0]; rep.Status != incident.StatusFailed || !strings.Contains(rep.Error, "shut down") {
+		t.Fatalf("unexpected shutdown report: %+v", rep)
 	}
 }
 
-func TestOrchestratorSettlePendingCountsTowardQueueCap(t *testing.T) {
-	store := &stubReportStore{}
-	orchestrator := newTestOrchestratorWithOptions(finalMessageModel("ok"), store, OrchestratorOptions{
-		QueueSize:   1,
-		SettleDelay: 10 * time.Second,
+func TestOrchestratorRecoverUnfinished(t *testing.T) {
+	now := time.Now().UTC()
+	base := testEvent()
+	mkReport := func(id, route string, status incident.ReportStatus, occurred time.Time) incident.Report {
+		e := base
+		e.EventID = id
+		e.ScopeKey = route
+		e.Route = route
+		e.OccurredAt = occurred
+		r := incident.NewReport(e)
+		r.Status = status
+		return r
+	}
+
+	store := &stubReportStore{
+		unfinished: []incident.Report{
+			mkReport("proc-1", "/api/v1/a/", incident.StatusProcessing, now.Add(-2*time.Minute)),
+			mkReport("expired-1", "/api/v1/b/", incident.StatusQueued, now.Add(-2*time.Hour)),
+			mkReport("queued-fresh-1", "/api/v1/c/", incident.StatusQueued, now.Add(-5*time.Minute)),
+			mkReport("queued-dup-route", "/api/v1/c/", incident.StatusQueued, now.Add(-3*time.Minute)),
+		},
+	}
+
+	orchestrator := newTestOrchestratorWithOptions(finalMessageModel("recovered"), store, OrchestratorOptions{
+		Workers:        1,
+		QueueSize:      8,
+		RecoveryMaxAge: 30 * time.Minute,
 	})
 	go orchestrator.Run()
 	defer orchestrator.Close()
 
-	evt1 := testEvent()
-	evt1.EventID = "evt-1"
-	if res, err := orchestrator.Submit(context.Background(), evt1); err != nil || res.Outcome != SubmitAccepted {
-		t.Fatalf("first submit = (%+v, %v)", res, err)
+	requeued, failed, err := orchestrator.RecoverUnfinished(context.Background())
+	if err != nil {
+		t.Fatalf("RecoverUnfinished: %v", err)
 	}
-	evt2 := testEvent()
-	evt2.EventID = "evt-2"
-	if _, err := orchestrator.Submit(context.Background(), evt2); !errors.Is(err, ErrQueueFull) {
-		t.Fatalf("second submit err = %v, want ErrQueueFull", err)
+	if requeued != 1 || failed != 3 {
+		t.Fatalf("requeued=%d failed=%d, want 1/3", requeued, failed)
 	}
-}
 
-func TestOrchestratorMultiReplicaSharedSuppression(t *testing.T) {
-	mr := miniredis.RunT(t)
-	storeA, storeB := &stubReportStore{}, &stubReportStore{}
-	orchA := newTestOrchestratorWithOptions(finalMessageModel("ok"), storeA, OrchestratorOptions{
-		CoalesceCooldown: 5 * time.Minute,
-		Suppressor:       newTestRedisRouteSuppressor(t, mr, nil),
-	})
-	orchB := newTestOrchestratorWithOptions(finalMessageModel("ok"), storeB, OrchestratorOptions{
-		CoalesceCooldown: 5 * time.Minute,
-		Suppressor:       newTestRedisRouteSuppressor(t, mr, nil),
-	})
-	go orchA.Run()
-	go orchB.Run()
-	defer orchA.Close()
-	defer orchB.Close()
+	failedMap := store.failedReports()
+	if !strings.Contains(failedMap["proc-1"], "interrupted") {
+		t.Fatalf("processing row cause = %q", failedMap["proc-1"])
+	}
+	if !strings.Contains(failedMap["expired-1"], "expired") {
+		t.Fatalf("expired row cause = %q", failedMap["expired-1"])
+	}
+	if !strings.Contains(failedMap["queued-dup-route"], "superseded") {
+		t.Fatalf("duplicate-route row cause = %q", failedMap["queued-dup-route"])
+	}
 
-	accepted, suppressed := 0, 0
-	for i := 0; i < 20; i++ {
-		evt := testEvent()
-		evt.EventID = fmt.Sprintf("multi-%d", i)
-		evt.Route = "/api/v1/orders/"
-		target := orchA
-		if i%2 == 1 {
-			target = orchB
-		}
-		res, err := target.Submit(context.Background(), evt)
-		if err != nil {
-			t.Fatalf("submit %d: %v", i, err)
-		}
-		switch res.Outcome {
-		case SubmitAccepted:
-			accepted++
-		case SubmitSuppressed:
-			suppressed++
-		}
-	}
-	if accepted != 1 || suppressed != 19 {
-		t.Fatalf("multi-replica storm: accepted=%d suppressed=%d, want 1/19", accepted, suppressed)
-	}
-	if got := storeA.claimCount() + storeB.claimCount(); got != 1 {
-		t.Fatalf("total DB claims across replicas = %d, want 1", got)
+	waitReports(t, store, 1)
+	if rep := store.savedReports()[0]; rep.EventID != "queued-fresh-1" || rep.Status != incident.StatusCompleted {
+		t.Fatalf("recovered report = %+v", rep)
 	}
 }
 
@@ -520,22 +450,6 @@ func waitReports(t *testing.T, store *stubReportStore, want int) {
 	for len(store.savedReports()) < want {
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out waiting for %d saved reports (got %d)", want, len(store.savedReports()))
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-}
-
-func waitRouteTTL(t *testing.T, mr *miniredis.Miniredis, route string, check func(time.Duration) bool) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	key := routeSuppressKeyPrefix + route
-	for {
-		ttl := mr.TTL(key)
-		if check(ttl) {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for route TTL on %s (last=%v)", key, ttl)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}

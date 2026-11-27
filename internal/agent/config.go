@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/oxkrypton/Halon/internal/authz"
-	"github.com/redis/go-redis/v9"
 )
 
 // Config holds the agent service configuration loaded from the environment.
@@ -38,20 +37,10 @@ type Config struct {
 	Workers             int
 	QueueSize           int
 	RunTimeout          time.Duration
+	RecoveryMaxAge      time.Duration
 	DedupTTL            time.Duration
 	OpenAITimeout       time.Duration
 	ShutdownTimeout     time.Duration
-
-	// Per-route storm suppression and settle delay. CoalesceCooldown == 0
-	// disables route suppression; SettleDelay == 0 enqueues immediately.
-	CoalesceCooldown time.Duration
-	RetryBackoff     time.Duration
-	SettleDelay      time.Duration
-
-	// Redis state backend (required).
-	RedisURL         string
-	RedisDialTimeout time.Duration
-	RedisOpTimeout   time.Duration
 }
 
 func LoadConfig() (Config, error) {
@@ -75,15 +64,10 @@ func LoadConfig() (Config, error) {
 		Workers:             2,
 		QueueSize:           64,
 		RunTimeout:          5 * time.Minute,
+		RecoveryMaxAge:      30 * time.Minute,
 		DedupTTL:            10 * time.Minute,
 		OpenAITimeout:       60 * time.Second,
 		ShutdownTimeout:     30 * time.Second,
-		CoalesceCooldown:    5 * time.Minute,
-		RetryBackoff:        time.Minute,
-		SettleDelay:         15 * time.Second,
-		RedisURL:            os.Getenv("REDIS_URL"),
-		RedisDialTimeout:    time.Second,
-		RedisOpTimeout:      500 * time.Millisecond,
 	}
 
 	var err error
@@ -111,6 +95,9 @@ func LoadConfig() (Config, error) {
 	if cfg.RunTimeout, err = envDuration("AGENT_RUN_TIMEOUT", cfg.RunTimeout); err != nil {
 		return Config{}, err
 	}
+	if cfg.RecoveryMaxAge, err = envDuration("AGENT_RECOVERY_MAX_AGE", cfg.RecoveryMaxAge); err != nil {
+		return Config{}, err
+	}
 	if cfg.DedupTTL, err = envDuration("AGENT_DEDUP_TTL", cfg.DedupTTL); err != nil {
 		return Config{}, err
 	}
@@ -118,25 +105,6 @@ func LoadConfig() (Config, error) {
 		return Config{}, err
 	}
 	if cfg.ShutdownTimeout, err = envDuration("SHUTDOWN_TIMEOUT", cfg.ShutdownTimeout); err != nil {
-		return Config{}, err
-	}
-	if cfg.CoalesceCooldown, err = envDuration("INCIDENT_COALESCE_COOLDOWN", cfg.CoalesceCooldown); err != nil {
-		return Config{}, err
-	}
-	defaultRetryBackoff := cfg.RetryBackoff
-	if cfg.CoalesceCooldown >= 0 && cfg.CoalesceCooldown < defaultRetryBackoff {
-		defaultRetryBackoff = cfg.CoalesceCooldown
-	}
-	if cfg.RetryBackoff, err = envDuration("INCIDENT_RETRY_BACKOFF", defaultRetryBackoff); err != nil {
-		return Config{}, err
-	}
-	if cfg.SettleDelay, err = envDuration("INCIDENT_SETTLE_DELAY", cfg.SettleDelay); err != nil {
-		return Config{}, err
-	}
-	if cfg.RedisDialTimeout, err = envDuration("REDIS_DIAL_TIMEOUT", cfg.RedisDialTimeout); err != nil {
-		return Config{}, err
-	}
-	if cfg.RedisOpTimeout, err = envDuration("REDIS_OP_TIMEOUT", cfg.RedisOpTimeout); err != nil {
 		return Config{}, err
 	}
 	if cfg.OperationLevel, err = ParseOperationLevel(envString("AGENT_OPERATION_LEVEL", string(LevelReadOnly))); err != nil {
@@ -173,22 +141,8 @@ func LoadConfig() (Config, error) {
 	if cfg.MaxSteps <= 0 || cfg.MaxToolOutput <= 0 || cfg.MaxStoredToolOutput <= 0 || cfg.Workers <= 0 || cfg.QueueSize <= 0 {
 		validationErrors = append(validationErrors, errors.New("agent steps, tool output limits, workers, and queue size must be positive"))
 	}
-	if cfg.RunTimeout <= 0 || cfg.DedupTTL <= 0 || cfg.OpenAITimeout <= 0 || cfg.ShutdownTimeout <= 0 {
-		validationErrors = append(validationErrors, errors.New("timeouts and dedup TTL must be positive"))
-	}
-	if cfg.CoalesceCooldown < 0 || cfg.RetryBackoff < 0 || cfg.SettleDelay < 0 {
-		validationErrors = append(validationErrors, errors.New("incident suppression cooldown, retry backoff, and settle delay must be non-negative"))
-	}
-	if cfg.CoalesceCooldown > 0 && cfg.RetryBackoff > cfg.CoalesceCooldown {
-		validationErrors = append(validationErrors, errors.New("INCIDENT_RETRY_BACKOFF must not exceed INCIDENT_COALESCE_COOLDOWN"))
-	}
-	if cfg.RedisURL == "" {
-		validationErrors = append(validationErrors, errors.New("REDIS_URL is required"))
-	} else if _, err := redis.ParseURL(cfg.RedisURL); err != nil {
-		validationErrors = append(validationErrors, fmt.Errorf("REDIS_URL: %w", err))
-	}
-	if cfg.RedisDialTimeout <= 0 || cfg.RedisOpTimeout <= 0 {
-		validationErrors = append(validationErrors, errors.New("redis timeouts must be positive"))
+	if cfg.RunTimeout <= 0 || cfg.RecoveryMaxAge <= 0 || cfg.DedupTTL <= 0 || cfg.OpenAITimeout <= 0 || cfg.ShutdownTimeout <= 0 {
+		validationErrors = append(validationErrors, errors.New("timeouts, recovery max age, and dedup TTL must be positive"))
 	}
 	return cfg, errors.Join(validationErrors...)
 }

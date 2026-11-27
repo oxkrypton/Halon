@@ -3,6 +3,7 @@ package agent
 import (
 	"net/http"
 
+	"github.com/oxkrypton/Halon/internal/incident"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -19,45 +20,47 @@ const (
 type Metrics struct {
 	registry *prometheus.Registry
 
-	redisUp            prometheus.Gauge
+	activeSessions     prometheus.Gauge
 	incidentAdmissions *prometheus.CounterVec
 }
 
 func NewMetrics() *Metrics {
 	m := &Metrics{
 		registry: prometheus.NewRegistry(),
-		redisUp: prometheus.NewGauge(prometheus.GaugeOpts{
-			Name: "halon_agent_redis_up",
-			Help: "Whether Redis is reachable (1) or degraded (0).",
+		activeSessions: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "halon_agent_active_sessions",
+			Help: "Number of active incident investigation sessions (queued, running, or cancelling).",
 		}),
 		incidentAdmissions: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "halon_agent_incident_admissions_total",
-			Help: "Timeout events received by the agent, partitioned by admission outcome (accepted/duplicate/suppressed).",
-		}, []string{"outcome"}),
+			Help: "Incident events received by the agent, partitioned by bounded event type and admission outcome.",
+		}, []string{"type", "outcome"}),
 	}
-	m.redisUp.Set(1)
-	m.registry.MustRegister(m.redisUp, m.incidentAdmissions)
+	m.registry.MustRegister(m.activeSessions, m.incidentAdmissions)
 	return m
 }
 
-// IncIncidentAdmission increments the admission counter for one outcome label.
-func (m *Metrics) IncIncidentAdmission(outcome string) {
-	if m == nil {
-		return
+func metricEventTypeLabel(eventType incident.EventType) string {
+	if incident.IsBuiltinEventType(eventType) {
+		return string(eventType)
 	}
-	m.incidentAdmissions.WithLabelValues(outcome).Inc()
+	return "other"
 }
 
-// SetRedisUp records Redis reachability.
-func (m *Metrics) SetRedisUp(up bool) {
+// IncIncidentAdmission increments the admission counter for one event type and outcome label.
+func (m *Metrics) IncIncidentAdmission(eventType incident.EventType, outcome string) {
 	if m == nil {
 		return
 	}
-	if up {
-		m.redisUp.Set(1)
+	m.incidentAdmissions.WithLabelValues(metricEventTypeLabel(eventType), outcome).Inc()
+}
+
+// SetActiveSessions records the current active session count.
+func (m *Metrics) SetActiveSessions(count int) {
+	if m == nil {
 		return
 	}
-	m.redisUp.Set(0)
+	m.activeSessions.Set(float64(count))
 }
 
 func (m *Metrics) Handler() http.Handler {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -13,7 +14,6 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/redis/go-redis/v9"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -56,72 +56,46 @@ func run(logger *slog.Logger) error {
 
 	metrics := agent.NewMetrics()
 
-	// Redis arbitrates action cooldowns and route storm suppression across
-	// agent replicas. Startup ping failure does not abort startup; mutation
-	// tools fail closed while route suppression fails open.
-	options, err := redis.ParseURL(cfg.RedisURL)
-	if err != nil {
-		return fmt.Errorf("parse REDIS_URL: %w", err)
-	}
-	options.DialTimeout = cfg.RedisDialTimeout
-	options.ReadTimeout = cfg.RedisOpTimeout
-	options.WriteTimeout = cfg.RedisOpTimeout
-	redisClient := redis.NewClient(options)
-	defer func() { _ = redisClient.Close() }()
-	pingContext, cancelPing := context.WithTimeout(context.Background(), cfg.RedisDialTimeout)
-	pingErr := redisClient.Ping(pingContext).Err()
-	cancelPing()
-	metrics.SetRedisUp(pingErr == nil)
-	if pingErr != nil {
-		logger.Warn("redis unreachable at startup; running in degraded mode", "error", pingErr)
-	}
-
 	clientset, err := kubernetesClientset()
 	if err != nil {
 		return fmt.Errorf("create kubernetes client: %w", err)
 	}
-	cooldownStore := tools.NewRedisCooldownStore(redisClient, cfg.RedisOpTimeout, logger, metrics.SetRedisUp)
-	defer cooldownStore.Close()
-	kubernetesOptions := tools.KubernetesOptions{
-		AllowedNamespaces: cfg.K8sNamespaces,
-		MaxReplicas:       cfg.K8sMaxReplicas,
-		ActionCooldown:    cfg.K8sActionCooldown,
-		Cooldowns:         cooldownStore,
-	}
-	kubernetesToolset, kubernetesTools := tools.NewKubernetesTools(clientset, kubernetesOptions)
 	sqlDB, err := store.SQLDB()
 	if err != nil {
 		return fmt.Errorf("access postgres connection pool: %w", err)
 	}
-	allTools := append(tools.ObservabilityTools(sqlDB, cfg.PrometheusURL, nil), kubernetesTools...)
-	allTools = append(allTools, tools.NewGatewayActionTool(kubernetesToolset, cfg.GatewayAdminURL, cfg.GatewayAdminToken, nil))
+	kubernetesToolset, allTools := assembleTools(sqlDB, clientset, cfg)
 	registry, err := agent.NewRegistry(cfg.OperationLevel, allTools...)
 	if err != nil {
 		return fmt.Errorf("register agent tools: %w", err)
 	}
+	logger.Info("agent tools registered", "level", cfg.OperationLevel, "tools", registeredToolNames(registry))
 
 	model := agent.NewOpenAIClient(cfg.OpenAIBaseURL, cfg.OpenAIAPIKey, cfg.OpenAIModel, cfg.OpenAITimeout)
 	loop := agent.NewLoop(model, registry, cfg.MaxSteps, cfg.MaxToolOutput, cfg.MaxStoredToolOutput, logger)
-	var routeSuppressor agent.RouteSuppressor
-	if cfg.CoalesceCooldown > 0 {
-		routeSuppressor = agent.NewRedisRouteSuppressor(redisClient, cfg.RedisOpTimeout, logger, metrics.SetRedisUp)
-	}
 	orchestrator := agent.NewOrchestrator(loop, store, agent.OrchestratorOptions{
-		Level:            cfg.OperationLevel,
-		Workers:          cfg.Workers,
-		QueueSize:        cfg.QueueSize,
-		RunTimeout:       cfg.RunTimeout,
-		CoalesceCooldown: cfg.CoalesceCooldown,
-		RetryBackoff:     cfg.RetryBackoff,
-		SettleDelay:      cfg.SettleDelay,
-		Suppressor:       routeSuppressor,
-		Logger:           logger,
+		Level:          cfg.OperationLevel,
+		Workers:        cfg.Workers,
+		QueueSize:      cfg.QueueSize,
+		RunTimeout:     cfg.RunTimeout,
+		RecoveryMaxAge: cfg.RecoveryMaxAge,
+		Metrics:        metrics,
+		Logger:         logger,
 	})
 	orchestratorDone := make(chan struct{})
 	go func() {
 		orchestrator.Run()
 		close(orchestratorDone)
 	}()
+
+	recoveryContext, cancelRecovery := context.WithTimeout(context.Background(), 15*time.Second)
+	requeued, failed, recoveryErr := orchestrator.RecoverUnfinished(recoveryContext)
+	cancelRecovery()
+	if recoveryErr != nil {
+		logger.Error("startup incident recovery incomplete", "requeued", requeued, "failed", failed, "error", recoveryErr)
+	} else if requeued > 0 || failed > 0 {
+		logger.Info("startup incident recovery completed", "requeued", requeued, "failed", failed)
+	}
 
 	// In jwt mode INGEST_TOKEN is only a webhook credential; it must not
 	// grant report reads through the static-token fallback.
@@ -179,11 +153,13 @@ func run(logger *slog.Logger) error {
 		shutdownErrors = append(shutdownErrors, fmt.Errorf("http server shutdown: %w", err))
 	}
 
-	// Drain queued investigations; each in-flight run is bounded by RunTimeout.
-	orchestrator.Close()
+	// Drain queued sessions; abort any remaining active runs if ShutdownTimeout expires.
+	go orchestrator.Close()
 	select {
 	case <-orchestratorDone:
 	case <-shutdownContext.Done():
+		orchestrator.CancelActive()
+		<-orchestratorDone
 		shutdownErrors = append(shutdownErrors, errors.New("orchestrator drain timed out"))
 	}
 	return errors.Join(append(shutdownErrors, runError)...)
@@ -250,4 +226,27 @@ func kubernetesClientset() (kubernetes.Interface, error) {
 		return nil, fmt.Errorf("load kubeconfig: %w", err)
 	}
 	return kubernetes.NewForConfig(config)
+}
+
+func assembleTools(sqlDB *sql.DB, clientset kubernetes.Interface, cfg agent.Config) (*tools.KubernetesToolset, []agent.Tool) {
+	cooldownStore := tools.NewMemoryCooldownStore()
+	kubernetesOptions := tools.KubernetesOptions{
+		AllowedNamespaces: cfg.K8sNamespaces,
+		MaxReplicas:       cfg.K8sMaxReplicas,
+		ActionCooldown:    cfg.K8sActionCooldown,
+		Cooldowns:         cooldownStore,
+	}
+	kubernetesToolset, kubernetesTools := tools.NewKubernetesTools(clientset, kubernetesOptions)
+	allTools := append(tools.ObservabilityTools(sqlDB, cfg.PrometheusURL, nil), kubernetesTools...)
+	allTools = append(allTools, tools.NewGatewayTools(kubernetesToolset, cfg.GatewayAdminURL, cfg.GatewayAdminToken, nil)...)
+	return kubernetesToolset, allTools
+}
+
+func registeredToolNames(registry *agent.Registry) []string {
+	definitions := registry.Definitions()
+	names := make([]string, 0, len(definitions))
+	for _, definition := range definitions {
+		names = append(names, definition.Function.Name)
+	}
+	return names
 }

@@ -128,7 +128,7 @@ func TestAgentAPIBRBAC(t *testing.T) {
 		return rec.Code
 	}
 
-	for _, path := range []string{"/api/v1/k8s/pods", "/api/v1/k8s/pods/demo/logs"} {
+	for _, path := range []string{"/api/v1/sessions", "/api/v1/k8s/pods", "/api/v1/k8s/pods/demo/logs"} {
 		legacyRouter := newAuthTestRouter(t, authz.ModeLegacy, keys, testIngestToken)
 		if got := doGet(legacyRouter, path, testIngestToken); got != http.StatusOK {
 			t.Fatalf("legacy %s = %d, want 200", path, got)
@@ -149,5 +149,29 @@ func TestAgentAPIBRBAC(t *testing.T) {
 		if got := doGet(strict, path, pcrToken); got != http.StatusForbidden {
 			t.Fatalf("jwt pcr token %s = %d, want 403", path, got)
 		}
+	}
+
+	operatorToken := agentTokenFor(t, signer, authz.RoleOperator)
+	doPost := func(r *gin.Engine, path, token string) int {
+		req := httptest.NewRequest(http.MethodPost, path, nil)
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	// Session cancellation requires incident:manage (operator+).
+	if got := doPost(strict, "/api/v1/sessions/evt-missing/cancel", jwtToken); got != http.StatusForbidden {
+		t.Fatalf("readonly cancel = %d, want 403", got)
+	}
+	if got := doPost(strict, "/api/v1/sessions/evt-missing/cancel", operatorToken); got != http.StatusNotFound {
+		t.Fatalf("operator cancel missing = %d, want 404", got)
+	}
+	if got := postEvent(t, strict, testIngestToken, validEventBody()); got.Code != http.StatusAccepted {
+		t.Fatalf("ingest before cancel = %d", got.Code)
+	}
+	if got := doPost(strict, "/api/v1/sessions/evt-100/cancel", operatorToken); got != http.StatusOK {
+		t.Fatalf("operator cancel active = %d, want 200", got)
 	}
 }

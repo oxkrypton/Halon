@@ -21,7 +21,7 @@ const maxIncidentBodyBytes = 64 << 10
 // ReportReader is the read contract the incident API needs.
 type ReportReader interface {
 	Get(ctx context.Context, eventID string) (*incident.Report, error)
-	List(ctx context.Context, limit int) ([]incident.Report, error)
+	List(ctx context.Context, eventType incident.EventType, limit int) ([]incident.Report, error)
 	Ping(ctx context.Context) error
 }
 
@@ -36,7 +36,7 @@ type ServerDeps struct {
 	Metrics      *Metrics
 }
 
-// NewHTTPHandler exposes the timeout incident ingest API and report queries.
+// NewHTTPHandler exposes the incident ingest API, session management, and report queries.
 func NewHTTPHandler(deps ServerDeps) *gin.Engine {
 	logger := deps.Logger
 	if logger == nil {
@@ -77,11 +77,18 @@ func NewHTTPHandler(deps ServerDeps) *gin.Engine {
 	}
 
 	api := router.Group("/api/v1")
-	// The webhook keeps its single-purpose service credential in every mode.
-	api.POST("/incidents/timeout", bearerAuth(deps.IngestToken), ingestTimeout(deps, logger))
+	// Webhook ingest keeps its single-purpose service credential in every mode.
+	ingestAuth := bearerAuth(deps.IngestToken)
+	api.POST("/incidents", ingestAuth, ingestIncident(deps, logger, ""))
+	api.POST("/incidents/timeout", ingestAuth, ingestIncident(deps, logger, incident.TypeUpstreamTimeout))
+
 	reports := api.Group("", authz.Middleware(authenticator, abortWithAPIError), authz.Require(authz.PermIncidentRead, abortWithAPIError))
 	reports.GET("/incidents", listReports(deps.Reports))
 	reports.GET("/incidents/:event_id", getReport(deps.Reports))
+	reports.GET("/sessions", listSessions(deps.Orchestrator))
+
+	sessionManage := api.Group("", authz.Middleware(authenticator, abortWithAPIError), authz.Require(authz.PermIncidentManage, abortWithAPIError))
+	sessionManage.POST("/sessions/:event_id/cancel", cancelSession(deps.Orchestrator))
 
 	k8s := api.Group("/k8s", authz.Middleware(authenticator, abortWithAPIError), authz.Require(authz.PermPodLogsRead, abortWithAPIError))
 	k8s.GET("/pods", listPods(deps.Pods))
@@ -96,21 +103,41 @@ func NewHTTPHandler(deps ServerDeps) *gin.Engine {
 	return router
 }
 
-func ingestTimeout(deps ServerDeps, logger *slog.Logger) gin.HandlerFunc {
+func ingestIncident(deps ServerDeps, logger *slog.Logger, defaultType incident.EventType) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxIncidentBodyBytes)
-		var event incident.TimeoutEvent
+		var event incident.Event
 		if err := c.ShouldBindJSON(&event); err != nil {
-			abortWithAPIError(c, http.StatusBadRequest, "INVALID_EVENT", "request body must be one valid timeout event JSON object")
+			abortWithAPIError(c, http.StatusBadRequest, "INVALID_EVENT", "request body must be one valid incident event JSON object")
 			return
 		}
+		if event.Type == "" && defaultType != "" {
+			event.Type = defaultType
+		} else if event.Type != "" {
+			parsed, err := incident.ParseEventType(string(event.Type))
+			if err != nil {
+				abortWithAPIError(c, http.StatusBadRequest, "INVALID_EVENT", err.Error())
+				return
+			}
+			event.Type = parsed
+		}
+		if event.OccurredAt.IsZero() {
+			event.OccurredAt = time.Now().UTC()
+		}
+		event.ScopeKey = event.EffectiveScopeKey()
 		if err := event.Validate(); err != nil {
 			abortWithAPIError(c, http.StatusBadRequest, "INVALID_EVENT", err.Error())
 			return
 		}
 		if deps.Deduper != nil && deps.Deduper.Seen(event.EventID) {
-			deps.Metrics.IncIncidentAdmission(AdmissionDuplicate)
-			c.JSON(http.StatusOK, gin.H{"event_id": event.EventID, "accepted": false, "duplicate": true, "suppressed": false})
+			deps.Metrics.IncIncidentAdmission(event.Type, AdmissionDuplicate)
+			c.JSON(http.StatusOK, gin.H{
+				"event_id":   event.EventID,
+				"event_type": event.Type,
+				"accepted":   false,
+				"duplicate":  true,
+				"suppressed": false,
+			})
 			return
 		}
 		result, err := deps.Orchestrator.Submit(c.Request.Context(), event)
@@ -123,27 +150,35 @@ func ingestTimeout(deps ServerDeps, logger *slog.Logger) gin.HandlerFunc {
 			return
 		}
 		if err != nil {
-			logger.Error("submit incident", "event_id", event.EventID, "error", err)
+			logger.Error("submit incident", "event_id", event.EventID, "event_type", event.Type, "error", err)
 			abortWithAPIError(c, http.StatusInternalServerError, "SUBMIT_FAILED", "failed to queue the incident")
 			return
 		}
 		switch result.Outcome {
 		case SubmitDuplicate:
-			deps.Metrics.IncIncidentAdmission(AdmissionDuplicate)
-			c.JSON(http.StatusOK, gin.H{"event_id": event.EventID, "accepted": false, "duplicate": true, "suppressed": false})
+			deps.Metrics.IncIncidentAdmission(event.Type, AdmissionDuplicate)
+			c.JSON(http.StatusOK, gin.H{
+				"event_id":   event.EventID,
+				"event_type": event.Type,
+				"accepted":   false,
+				"duplicate":  true,
+				"suppressed": false,
+			})
 		case SubmitSuppressed:
-			deps.Metrics.IncIncidentAdmission(AdmissionSuppressed)
+			deps.Metrics.IncIncidentAdmission(event.Type, AdmissionSuppressed)
 			c.JSON(http.StatusOK, gin.H{
 				"event_id":    event.EventID,
+				"event_type":  event.Type,
 				"incident_id": result.IncidentID,
 				"accepted":    false,
 				"duplicate":   false,
 				"suppressed":  true,
 			})
 		default:
-			deps.Metrics.IncIncidentAdmission(AdmissionAccepted)
+			deps.Metrics.IncIncidentAdmission(event.Type, AdmissionAccepted)
 			c.JSON(http.StatusAccepted, gin.H{
 				"event_id":    event.EventID,
+				"event_type":  event.Type,
 				"incident_id": result.IncidentID,
 				"accepted":    true,
 				"duplicate":   false,
@@ -155,6 +190,15 @@ func ingestTimeout(deps ServerDeps, logger *slog.Logger) gin.HandlerFunc {
 
 func listReports(reports ReportReader) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		var eventType incident.EventType
+		if rawType := strings.TrimSpace(c.Query("type")); rawType != "" {
+			parsed, err := incident.ParseEventType(rawType)
+			if err != nil {
+				abortWithAPIError(c, http.StatusBadRequest, "INVALID_EVENT_TYPE", err.Error())
+				return
+			}
+			eventType = parsed
+		}
 		limit := 50
 		if raw := c.Query("limit"); raw != "" {
 			var parsed int
@@ -166,7 +210,7 @@ func listReports(reports ReportReader) gin.HandlerFunc {
 		}
 		ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 		defer cancel()
-		list, err := reports.List(ctx, limit)
+		list, err := reports.List(ctx, eventType, limit)
 		if err != nil {
 			abortWithAPIError(c, http.StatusInternalServerError, "QUERY_FAILED", "failed to list incident reports")
 			return
@@ -194,6 +238,42 @@ func getReport(reports ReportReader) gin.HandlerFunc {
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"incident": report})
+	}
+}
+
+func listSessions(orchestrator *Orchestrator) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		sessions := []SessionSnapshot{}
+		if orchestrator != nil {
+			sessions = orchestrator.ListSessions()
+		}
+		c.JSON(http.StatusOK, gin.H{"sessions": sessions})
+	}
+}
+
+func cancelSession(orchestrator *Orchestrator) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		eventID := strings.TrimSpace(c.Param("event_id"))
+		if eventID == "" || len(eventID) > 64 {
+			abortWithAPIError(c, http.StatusBadRequest, "INVALID_EVENT_ID", "event id is required")
+			return
+		}
+		if orchestrator == nil {
+			abortWithAPIError(c, http.StatusServiceUnavailable, "ORCHESTRATOR_UNAVAILABLE", "orchestrator is unavailable")
+			return
+		}
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+		defer cancel()
+		err := orchestrator.CancelSession(ctx, eventID)
+		if errors.Is(err, ErrSessionNotFound) {
+			abortWithAPIError(c, http.StatusNotFound, "SESSION_NOT_FOUND", "no active session exists for this event id")
+			return
+		}
+		if err != nil {
+			abortWithAPIError(c, http.StatusInternalServerError, "CANCEL_FAILED", "failed to cancel investigation session")
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"session_id": eventID, "status": "cancelled"})
 	}
 }
 

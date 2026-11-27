@@ -4,12 +4,14 @@ import (
 	"crypto/ed25519"
 	"io"
 	"log/slog"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/oxkrypton/Halon/internal/agent"
 	"github.com/oxkrypton/Halon/internal/authz"
+	"k8s.io/client-go/kubernetes/fake"
 )
 
 const (
@@ -183,6 +185,98 @@ func TestCheckGatewayCredentialTokenTypes(t *testing.T) {
 			config.Mode = mode
 			if err := checkGatewayCredential(fixture.logger, config, configuredGatewayURL, opaque, agent.LevelFull); err != nil {
 				t.Fatalf("two-dot static token rejected: %v", err)
+			}
+		})
+	}
+}
+
+func TestAssembleToolsConditionalRegistration(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name           string
+		cfg            agent.Config
+		wantTools      []string
+		wantPrometheus bool
+	}{
+		{
+			name:           "readonly without prometheus or gateway",
+			cfg:            agent.Config{OperationLevel: agent.LevelReadOnly},
+			wantTools:      []string{"read_k8s", "read_observability"},
+			wantPrometheus: false,
+		},
+		{
+			name: "readonly with prometheus and gateway url missing token",
+			cfg: agent.Config{
+				OperationLevel:  agent.LevelReadOnly,
+				PrometheusURL:   "http://prometheus:9090",
+				GatewayAdminURL: configuredGatewayURL,
+			},
+			wantTools:      []string{"read_k8s", "read_observability"},
+			wantPrometheus: true,
+		},
+		{
+			name: "readonly with prometheus and gateway",
+			cfg: agent.Config{
+				OperationLevel:    agent.LevelReadOnly,
+				PrometheusURL:     "http://prometheus:9090",
+				GatewayAdminURL:   configuredGatewayURL,
+				GatewayAdminToken: staticGatewayToken,
+			},
+			wantTools:      []string{"read_gateway", "read_k8s", "read_observability"},
+			wantPrometheus: true,
+		},
+		{
+			name: "operator with gateway",
+			cfg: agent.Config{
+				OperationLevel:    agent.LevelOperator,
+				GatewayAdminURL:   configuredGatewayURL,
+				GatewayAdminToken: staticGatewayToken,
+			},
+			wantTools:      []string{"gateway_block_ip", "k8s_restart_pod", "k8s_scale_deployment", "read_gateway", "read_k8s", "read_observability"},
+			wantPrometheus: false,
+		},
+		{
+			name: "full with gateway",
+			cfg: agent.Config{
+				OperationLevel:    agent.LevelFull,
+				GatewayAdminURL:   configuredGatewayURL,
+				GatewayAdminToken: staticGatewayToken,
+			},
+			wantTools:      []string{"gateway_block_ip", "k8s_restart_pod", "k8s_scale_deployment", "k8s_update_deployment_image", "read_gateway", "read_k8s", "read_observability"},
+			wantPrometheus: false,
+		},
+	}
+
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			_, allTools := assembleTools(nil, fake.NewClientset(), test.cfg)
+			registry, err := agent.NewRegistry(test.cfg.OperationLevel, allTools...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			gotTools := registeredToolNames(registry)
+			if !reflect.DeepEqual(gotTools, test.wantTools) {
+				t.Fatalf("tools = %v, want %v", gotTools, test.wantTools)
+			}
+			var obsDef agent.ToolDefinition
+			for _, def := range registry.Definitions() {
+				if def.Function.Name == "read_observability" {
+					obsDef = def
+					break
+				}
+			}
+			queriesProp := obsDef.Function.Parameters["properties"].(map[string]any)["queries"].(map[string]any)
+			itemProps := queriesProp["items"].(map[string]any)["properties"].(map[string]any)
+			sourceEnum := itemProps["source"].(map[string]any)["enum"].([]string)
+			hasPromEnum := false
+			for _, s := range sourceEnum {
+				if s == "prometheus" {
+					hasPromEnum = true
+				}
+			}
+			_, hasQueryField := itemProps["query"]
+			if hasPromEnum != test.wantPrometheus || hasQueryField != test.wantPrometheus {
+				t.Fatalf("prometheus exposure mismatch: enum=%v field=%v want=%v", hasPromEnum, hasQueryField, test.wantPrometheus)
 			}
 		})
 	}

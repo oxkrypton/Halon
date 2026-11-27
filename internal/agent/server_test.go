@@ -12,16 +12,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
 
 	"github.com/oxkrypton/Halon/internal/incident"
 )
 
 type stubReportReader struct {
-	mu      sync.Mutex
-	reports map[string]*incident.Report
-	pingErr error
+	mu           sync.Mutex
+	reports      map[string]*incident.Report
+	pingErr      error
+	lastListType incident.EventType
 }
 
 func (s *stubReportReader) Get(_ context.Context, eventID string) (*incident.Report, error) {
@@ -34,11 +34,15 @@ func (s *stubReportReader) Get(_ context.Context, eventID string) (*incident.Rep
 	return report, nil
 }
 
-func (s *stubReportReader) List(_ context.Context, limit int) ([]incident.Report, error) {
+func (s *stubReportReader) List(_ context.Context, eventType incident.EventType, limit int) ([]incident.Report, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.lastListType = eventType
 	result := make([]incident.Report, 0, len(s.reports))
 	for _, report := range s.reports {
+		if eventType != "" && report.EventType != eventType {
+			continue
+		}
 		result = append(result, *report)
 	}
 	return result, nil
@@ -124,9 +128,9 @@ func newTestRouter(store *stubReportStore, reader ReportReader, deduper *inciden
 	})
 }
 
-func postEvent(t *testing.T, router *gin.Engine, token, body string) *httptest.ResponseRecorder {
+func postEventAt(t *testing.T, router *gin.Engine, path, token, body string) *httptest.ResponseRecorder {
 	t.Helper()
-	request := httptest.NewRequest(http.MethodPost, "/api/v1/incidents/timeout", strings.NewReader(body))
+	request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
 	if token != "" {
 		request.Header.Set("Authorization", "Bearer "+token)
@@ -136,13 +140,17 @@ func postEvent(t *testing.T, router *gin.Engine, token, body string) *httptest.R
 	return response
 }
 
+func postEvent(t *testing.T, router *gin.Engine, token, body string) *httptest.ResponseRecorder {
+	return postEventAt(t, router, "/api/v1/incidents", token, body)
+}
+
 func validEventBody() string {
-	return `{"event_id":"evt-100","request_id":"req-100","occurred_at":"2026-11-16T12:00:00Z",` +
+	return `{"event_id":"evt-100","type":"upstream_timeout","request_id":"req-100","occurred_at":"2026-11-16T12:00:00Z",` +
 		`"method":"GET","path":"/api/v1/users/1","route":"/api/v1/users/:id","client_ip":"10.0.0.8",` +
 		`"status_code":504,"latency_ms":3001}`
 }
 
-func TestIngestAcceptsValidEvent(t *testing.T) {
+func TestIngestAcceptsValidEventAndLegacyTimeoutEndpoint(t *testing.T) {
 	t.Parallel()
 
 	router := newTestRouter(&stubReportStore{}, &stubReportReader{}, incident.NewDeduper(time.Minute))
@@ -150,8 +158,22 @@ func TestIngestAcceptsValidEvent(t *testing.T) {
 	if response.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 	}
-	if !strings.Contains(response.Body.String(), `"accepted":true`) {
+	if !strings.Contains(response.Body.String(), `"accepted":true`) || !strings.Contains(response.Body.String(), `"event_type":"upstream_timeout"`) {
 		t.Fatalf("body = %s", response.Body.String())
+	}
+
+	// Non-HTTP event (breaker_open) on /api/v1/incidents without request fields.
+	breakerBody := `{"event_id":"evt-brk-1","type":"breaker_open","scope_key":"/api/v1/orders/","route":"/api/v1/orders/","summary":"circuit breaker opened","occurrences":3}`
+	brkResp := postEvent(t, router, testIngestToken, breakerBody)
+	if brkResp.Code != http.StatusAccepted || !strings.Contains(brkResp.Body.String(), `"event_type":"breaker_open"`) {
+		t.Fatalf("breaker ingest = %d %s", brkResp.Code, brkResp.Body.String())
+	}
+
+	// Legacy /api/v1/incidents/timeout defaults missing type to upstream_timeout.
+	legacyBody := `{"event_id":"evt-legacy-1","request_id":"req-legacy","occurred_at":"2026-11-16T12:00:00Z","method":"GET","path":"/api/v1/legacy/1","route":"/api/v1/legacy/","client_ip":"10.0.0.8","status_code":504,"latency_ms":3001}`
+	legacyResp := postEventAt(t, router, "/api/v1/incidents/timeout", testIngestToken, legacyBody)
+	if legacyResp.Code != http.StatusAccepted || !strings.Contains(legacyResp.Body.String(), `"event_type":"upstream_timeout"`) {
+		t.Fatalf("legacy timeout ingest = %d %s", legacyResp.Code, legacyResp.Body.String())
 	}
 }
 
@@ -194,12 +216,19 @@ func TestIngestRequiresBearerToken(t *testing.T) {
 func TestReportQueries(t *testing.T) {
 	t.Parallel()
 
-	report := incident.NewReport(incident.TimeoutEvent{
-		EventID: "evt-9", RequestID: "req-9", OccurredAt: time.Now().UTC(),
+	report := incident.NewReport(incident.Event{
+		EventID: "evt-9", Type: incident.TypeUpstreamTimeout, ScopeKey: "/p",
+		RequestID: "req-9", OccurredAt: time.Now().UTC(),
 		Method: "GET", Path: "/p", Route: "/p", ClientIP: "10.0.0.1", StatusCode: 504,
 	})
 	report.Status = incident.StatusCompleted
-	reader := &stubReportReader{reports: map[string]*incident.Report{"evt-9": &report}}
+	errReport := incident.NewReport(incident.Event{
+		EventID: "evt-10", Type: incident.TypeUpstreamError, ScopeKey: "/err",
+		RequestID: "req-10", OccurredAt: time.Now().UTC(),
+		Method: "GET", Path: "/err", Route: "/err", ClientIP: "10.0.0.2", StatusCode: 502,
+	})
+	errReport.Status = incident.StatusCompleted
+	reader := &stubReportReader{reports: map[string]*incident.Report{"evt-9": &report, "evt-10": &errReport}}
 	router := newTestRouter(&stubReportStore{}, reader, incident.NewDeduper(time.Minute))
 
 	request := httptest.NewRequest(http.MethodGet, "/api/v1/incidents", nil)
@@ -208,6 +237,22 @@ func TestReportQueries(t *testing.T) {
 	router.ServeHTTP(response, request)
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "evt-9") {
 		t.Fatalf("list: status = %d, body = %s", response.Code, response.Body.String())
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "/api/v1/incidents?type=upstream_error", nil)
+	request.Header.Set("Authorization", "Bearer "+testIngestToken)
+	response = httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "evt-10") || strings.Contains(response.Body.String(), "evt-9") {
+		t.Fatalf("filtered list: status = %d, body = %s", response.Code, response.Body.String())
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "/api/v1/incidents?type=Invalid!", nil)
+	request.Header.Set("Authorization", "Bearer "+testIngestToken)
+	response = httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("invalid type query = %d, want 400", response.Code)
 	}
 
 	request = httptest.NewRequest(http.MethodGet, "/api/v1/incidents/evt-9", nil)
@@ -254,16 +299,14 @@ func TestHealthAndReadiness(t *testing.T) {
 	}
 }
 
-func TestIngestSuppressesStormAndRecordsMetrics(t *testing.T) {
+func TestIngestSuppressesActiveRouteAndRecordsMetrics(t *testing.T) {
 	t.Parallel()
 
 	gin.SetMode(gin.TestMode)
-	mr := miniredis.RunT(t)
 	store := &stubReportStore{}
 	metrics := NewMetrics()
 	orchestrator := newTestOrchestratorWithOptions(finalMessageModel("ok"), store, OrchestratorOptions{
-		CoalesceCooldown: 5 * time.Minute,
-		Suppressor:       newTestRedisRouteSuppressor(t, mr, nil),
+		Metrics: metrics,
 	})
 	router := NewHTTPHandler(ServerDeps{
 		Orchestrator: orchestrator,
@@ -286,22 +329,32 @@ func TestIngestSuppressesStormAndRecordsMetrics(t *testing.T) {
 		t.Fatalf("dup = %d %s", dup.Code, dup.Body.String())
 	}
 
-	// 3) Different event_id on same route -> 200 suppressed, pointing to evt-100.
+	// 3) Different event_id while route session is active -> 200 suppressed, pointing to evt-100.
 	secondBody := strings.Replace(validEventBody(), "evt-100", "evt-101", 1)
 	sup := postEvent(t, router, testIngestToken, secondBody)
 	if sup.Code != http.StatusOK || !strings.Contains(sup.Body.String(), `"suppressed":true`) || !strings.Contains(sup.Body.String(), `"incident_id":"evt-100"`) {
 		t.Fatalf("suppressed = %d %s", sup.Code, sup.Body.String())
 	}
 
-	// 4) Prometheus /metrics reports all three admission outcomes.
+	// 4) Sessions endpoint exposes the active queued session.
+	sessReq := httptest.NewRequest(http.MethodGet, "/api/v1/sessions", nil)
+	sessReq.Header.Set("Authorization", "Bearer "+testIngestToken)
+	sessRec := httptest.NewRecorder()
+	router.ServeHTTP(sessRec, sessReq)
+	if sessRec.Code != http.StatusOK || !strings.Contains(sessRec.Body.String(), `"session_id":"evt-100"`) {
+		t.Fatalf("sessions = %d %s", sessRec.Code, sessRec.Body.String())
+	}
+
+	// 5) Prometheus /metrics reports admission outcomes and active sessions.
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 	body := rec.Body.String()
 	for _, want := range []string{
-		`halon_agent_incident_admissions_total{outcome="accepted"} 1`,
-		`halon_agent_incident_admissions_total{outcome="duplicate"} 1`,
-		`halon_agent_incident_admissions_total{outcome="suppressed"} 1`,
+		`halon_agent_incident_admissions_total{outcome="accepted",type="upstream_timeout"} 1`,
+		`halon_agent_incident_admissions_total{outcome="duplicate",type="upstream_timeout"} 1`,
+		`halon_agent_incident_admissions_total{outcome="suppressed",type="upstream_timeout"} 1`,
+		`halon_agent_active_sessions 1`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("metrics missing %q:\n%s", want, body)

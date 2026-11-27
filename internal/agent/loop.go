@@ -13,13 +13,13 @@ import (
 	"github.com/oxkrypton/Halon/internal/incident"
 )
 
-const DefaultSystemPrompt = `You are Halon's Kubernetes incident-response agent. Investigate the supplied gateway timeout with observable evidence before making changes.
+const DefaultSystemPrompt = `You are Halon's Kubernetes incident-response agent. Investigate the supplied gateway incident with observable evidence before making changes.
 
 Rules:
-1. Start with traffic logs, error details, Prometheus metrics, pod state, events, and recent logs. Correlate timestamps and request IDs.
+1. Start by gathering evidence with read_observability (traffic logs, error details, top client IPs, and Prometheus metrics when available), read_gateway (live blacklist, rate limits, circuit breakers, and active incident windows when available), and read_k8s (pod state, events, deployments, and logs). Correlate timestamps, scope keys, and request IDs when present.
 2. Distinguish evidence, inference, and uncertainty. Never invent metrics, commands, actions, or a root cause.
 3. Use only the tools exposed in this run. Their availability is enforced by the configured operation level.
-4. Prefer the smallest reversible remediation. Do not restart or scale repeatedly, and do not mutate anything without supporting evidence.
+4. Prefer the smallest reversible remediation. Do not restart, scale, or block repeatedly, and do not mutate anything without supporting evidence.
 5. After a mutation, verify the resulting state and say whether the incident was actually resolved.
 6. Finish without a tool call when the investigation is complete. Write the final response as a Chinese Markdown report with these sections: 事件摘要、排查过程、根因分析、证据、执行操作、修复验证、后续建议. If evidence is insufficient, explicitly say 无法确定根因.`
 
@@ -39,19 +39,31 @@ func NewLoop(model Model, registry *Registry, maxSteps, maxToolOutput, maxStored
 	return &Loop{model: model, registry: registry, maxSteps: maxSteps, maxToolOutput: maxToolOutput, maxStoredOutput: maxStoredOutput, logger: logger}
 }
 
-func (l *Loop) Run(ctx context.Context, event incident.TimeoutEvent, level OperationLevel) (RunResult, error) {
+func (l *Loop) Run(ctx context.Context, event incident.Event, level OperationLevel) (RunResult, error) {
+	return l.RunWithProgress(ctx, event, level, nil)
+}
+
+func (l *Loop) RunWithProgress(ctx context.Context, event incident.Event, level OperationLevel, onStep func(step int)) (RunResult, error) {
 	result := RunResult{Incident: event}
 	if err := event.Validate(); err != nil {
 		return result, err
 	}
+	profile := ProfileFor(event.Type)
 	eventJSON, _ := json.Marshal(event)
+	userPrompt := fmt.Sprintf(
+		"Operation level: %s\nIncident type: %s (%s)\nScope key: %s\nInvestigation guidance: %s\nEvent payload:\n%s",
+		level, event.Type, profile.Title, event.EffectiveScopeKey(), profile.FocusPrompt, eventJSON,
+	)
 	messages := []Message{
 		NewTextMessage("system", DefaultSystemPrompt),
-		NewTextMessage("user", fmt.Sprintf("Operation level: %s\nInvestigate this gateway timeout event:\n%s", level, eventJSON)),
+		NewTextMessage("user", userPrompt),
 	}
 
 	for step := 1; step <= l.maxSteps; step++ {
 		result.Steps = step
+		if onStep != nil {
+			onStep(step)
+		}
 		assistant, usage, err := l.model.Complete(ctx, messages, l.registry.Definitions())
 		result.Usage.PromptTokens += usage.PromptTokens
 		result.Usage.CompletionTokens += usage.CompletionTokens
@@ -84,6 +96,7 @@ func (l *Loop) Run(ctx context.Context, event incident.TimeoutEvent, level Opera
 			result.Executions = append(result.Executions, execution)
 			l.logger.Info("agent tool executed",
 				"event_id", event.EventID,
+				"event_type", event.Type,
 				"step", step,
 				"tool", call.Function.Name,
 				"level", execution.Level,

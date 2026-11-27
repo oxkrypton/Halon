@@ -112,11 +112,11 @@ type ToolExecution struct {
 }
 
 type RunResult struct {
-	Incident     incident.TimeoutEvent `json:"incident"`
-	FinalMessage string                `json:"final_message"`
-	Steps        int                   `json:"steps"`
-	Executions   []ToolExecution       `json:"executions"`
-	Usage        Usage                 `json:"usage"`
+	Incident     incident.Event  `json:"incident"`
+	FinalMessage string          `json:"final_message"`
+	Steps        int             `json:"steps"`
+	Executions   []ToolExecution `json:"executions"`
+	Usage        Usage           `json:"usage"`
 }
 
 var ErrMaxSteps = errors.New("agent reached maximum model steps")
