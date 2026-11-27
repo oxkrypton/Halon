@@ -46,7 +46,7 @@
 | 文件 | 内容 |
 | --- | --- |
 | `observability.go` | 4 个只读工具(3 个 SQL + PromQL);行类型 `ErrorLogRow`/`TrafficStatRow`/`TopIPRow` |
-| `kubernetes.go` | `KubernetesToolset`(白名单、副本上限、冷却)与 6 个 K8s 工具 |
+| `kubernetes.go` | `KubernetesToolset`(白名单、副本上限、冷却)与 6 个 K8s 工具;同时实现 `agent.PodLogReader`(`AllowedNamespaces`、`ListPods`、`GetPodLogs`)供 Agent HTTP API 复用 |
 | `cooldown.go` | `CooldownStore` 接口(Claim)、`ErrCooldownUnavailable` 与 `RedisCooldownStore`(SET NX PX 裁决 + 后台 Ping 保活指标) |
 | `gateway.go` | `NewGatewayActionTool`:封禁 IP,经网关管理接口,复用 K8s 冷却器 |
 | `schema.go` | `objectSchema`/`decodeArguments`/`queryContext` 等工具构造函数 |

@@ -15,6 +15,7 @@
 | 权限 | readonly | operator | full |
 | --- | :-: | :-: | :-: |
 | `incident:read` | ✓ | ✓ | ✓ |
+| `k8s:pod_logs:read` | ✓ | ✓ | ✓ |
 | `gateway:rules:read` / `gateway:breaker:read` | ✓ | ✓ | ✓ |
 | `gateway:metrics:read`(`/metrics` 抓取) | ✓ | ✓ | ✓ |
 | `gateway:observability:read`(`/admin/system`、`/admin/observability/*`、`/admin/traces/*`) | ✓ | ✓ | ✓ |
@@ -108,7 +109,7 @@
 | 位置 | 做法 |
 | --- | --- |
 | 网关管理接口 `:9090` | `authz.Middleware` + 按路由 `authz.Require(perm)`;无令牌/验签失败 401 `UNAUTHORIZED`,权限不足 403 `FORBIDDEN` / `PASSWORD_CHANGE_REQUIRED`,错误体仍是 `{error:{code,message,request_id}}` |
-| Agent HTTP API | ingest 独立于角色体系;`GET /incidents*` 要求 `incident:read` |
+| Agent HTTP API | ingest 独立于角色体系;`GET /incidents*` 要求 `incident:read`;`GET /k8s/pods*` 要求 `k8s:pod_logs:read` |
 | Agent 工具层 | `Tool.Permission` 取代 `Level`;`Registry` 注册时过滤、执行时再校验一次 |
 | Agent → 网关 | `GATEWAY_ADMIN_TOKEN` 可为 JWT,启动自检要求 `typ=agent` 且角色与 `AGENT_OPERATION_LEVEL` 一致,否则启动失败。若 `GATEWAY_ADMIN_URL` 已配置且操作级别为 `operator`/`full`,令牌为空也直接启动失败(避免运行时才 401);`GATEWAY_ADMIN_URL` 为空时允许空令牌(由工具自身报「未配置」),但 `jwt` 模式下非空静态令牌仍拒绝。静态令牌在级别低于 `full` 时打 WARN |
 | `readonly` Agent | 工具集里没有网关写操作,部署时可不配 `GATEWAY_ADMIN_TOKEN` |

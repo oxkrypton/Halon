@@ -37,8 +37,6 @@ make deploy-observability   # kubectl apply -f deploy/kubernetes/observability/
 | --- | --- | --- |
 | OTel Collector | 接收网关 OTLP traces(4317/4318),转发 Tempo | 集群内服务 |
 | Tempo | 追踪存储(单二进制,本地存储,保留 24h) | Web 控制台 Traces 页面(`TEMPO_URL`)或 HTTP API `:3200` |
-| Loki | 日志存储(单二进制,保留 72h) | HTTP API / `logcli`:`kubectl port-forward -n observability service/loki 3100:3100` |
-| Alloy | 每节点日志采集(Kubernetes API,只采 `app.kubernetes.io/part-of=halon` 的 Pod) | DaemonSet |
 | Prometheus | 抓取 `gateway-admin:9090/metrics`,评估告警规则 | 集群内服务 |
 | Alertmanager | 告警分组路由(默认无 receiver,需自行配置通知渠道) | 集群内服务 |
 
@@ -46,7 +44,7 @@ make deploy-observability   # kubectl apply -f deploy/kubernetes/observability/
 
 ### 可选 Web 管理控制台(`deploy/kubernetes/web/`)
 
-提供 P50/P95/P99 分位数、类 Jaeger 链路追踪、请求日志、AI 故障报告与网关管控界面,`make deploy` **不**包含它:
+提供 P50/P95/P99 分位数与运行态保护看板、类 Jaeger 链路追踪、请求日志、经 Agent 直连 K8s API 的容器实时日志、AI 故障报告与网关管控界面,`make deploy` **不**包含它:
 
 ```bash
 make docker-build-web
@@ -57,8 +55,6 @@ kubectl port-forward service/halon-web 18090:8080
 容器基于 `nginxinc/nginx-unprivileged`（非 root UID 101、只读根文件系统）,把 `/api/gateway/*` 反代至 `gateway-admin:9090`,把 `/api/agent/*` 反代至 `agent:8081`。
 
 对接已有 Prometheus:集群已有 kube-prometheus-stack 时跳过 `14-prometheus.yaml`/`15-alertmanager.yaml`,把 `14-prometheus.yaml` 里的 `halon-gateway` scrape job 与告警规则组(`prometheus-rules` ConfigMap 内容)并入现有安装即可。
-
-Loki 基数约定:`trace_id`、`route`、`status` 可做 label 或查询条件;`path`、`client_ip` 只作为日志字段检索,严禁进 label(Loki 高基数会显著拖慢)。
 
 ### Redis(`deploy/kubernetes/redis.yaml`)
 

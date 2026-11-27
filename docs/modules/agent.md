@@ -18,7 +18,8 @@
 | `orchestrator.go` | `Orchestrator`:`Submit`(校验→按路由抑制窗口→Claim→聚集延迟/入队)→ worker 池 `investigate`(限时运行 + 落库 + 刷新冷却/退避 TTL)→ `Close` 取消挂起定时器并排空 |
 | `suppress.go` | `RouteSuppressor` / `RedisRouteSuppressor`:基于 Redis Lua 的按路由超时风暴抑制(owner 守卫防误改,Redis 不可达时 fail-open) |
 | `metrics.go` | Prometheus 指标:`halon_agent_redis_up`、`halon_agent_incident_admissions_total{outcome}` |
-| `server.go` | HTTP API:事件接收(仅 INGEST_TOKEN)、报告查询(`incident:read` JWT,兼容期内可用 INGEST_TOKEN)、健康探针、`/metrics` |
+| `pods.go` | `PodLogReader` 契约与 K8s 只读代理处理器(`/api/v1/k8s/pods`、`/api/v1/k8s/pods/:pod/logs`,10s 超时与错误映射) |
+| `server.go` | HTTP API:事件接收(仅 INGEST_TOKEN)、报告查询(`incident:read`)、Pod/日志只读查询(`k8s:pod_logs:read`)、健康探针、`/metrics` |
 | `config.go` | `LoadConfig()`:全部环境变量与启动校验 |
 
 工具实现在独立的 [agent-tools](agent-tools.md) 模块。
@@ -29,13 +30,15 @@
 
 ## HTTP API
 
-事件体最大 64 KiB。鉴权分两条:`POST /api/v1/incidents/timeout` 只认 `Authorization: Bearer <INGEST_TOKEN>`(常量时间比较),不进入角色体系;报告查询要求 `incident:read`,即 `AUTH_MODE=hybrid/legacy` 下可用 INGEST_TOKEN 兼容,`jwt` 下必须用 `aud=halon-agent` 的 JWT。详见 [auth.md](auth.md)。
+事件体最大 64 KiB。鉴权分两条:`POST /api/v1/incidents/timeout` 只认 `Authorization: Bearer <INGEST_TOKEN>`(常量时间比较),不进入角色体系;报告查询(`incident:read`)与 Pod/容器日志查询(`k8s:pod_logs:read`)在 `AUTH_MODE=hybrid/legacy` 下可用 INGEST_TOKEN 兼容,`jwt` 下必须用 `aud=halon-agent` 的 JWT。详见 [auth.md](auth.md)。
 
 | 接口 | 权限 | 行为 |
 | --- | --- | --- |
 | `POST /api/v1/incidents/timeout` | INGEST_TOKEN | 校验事件 → `Deduper.Seen`(内存去重)→ `Orchestrator.Submit`(按路由抑制 + 存储幂等)。新事件 `202 {accepted:true, incident_id}`;重复 `200 {duplicate:true}`;同路由窗口内抑制 `200 {suppressed:true, incident_id}`;队列满 `503 QUEUE_FULL` |
 | `GET /api/v1/incidents?limit=` | `incident:read` | 报告列表(1..200,默认 50) |
 | `GET /api/v1/incidents/:event_id` | `incident:read` | 单条报告;不存在 `404 REPORT_NOT_FOUND` |
+| `GET /api/v1/k8s/pods?namespace=&label_selector=&limit=` | `k8s:pod_logs:read` | 列出白名单命名空间内 Pod 状态、容器状态与重启次数(`limit` 1..100,默认 100);越权命名空间 `403 NAMESPACE_FORBIDDEN`,未注入 K8s 客户端 `503 K8S_UNAVAILABLE` |
+| `GET /api/v1/k8s/pods/:pod/logs?namespace=&container=&tail_lines=&since_seconds=&previous=` | `k8s:pod_logs:read` | 读取 Pod 容器有界日志(`tail_lines` 1..1000 默认 200、`since_seconds` 1..86400 默认 900、单次上限 1 MiB、支持 `previous=true`);Pod 不存在 `404 POD_NOT_FOUND`,非法参数或无前序崩溃实例 `400 INVALID_REQUEST` |
 | `GET /healthz` / `GET /readyz` | — | 存活 / PostgreSQL 就绪 |
 | `GET /metrics` | — | Prometheus 指标(无需鉴权):`halon_agent_redis_up`(Redis 可达性)与 `halon_agent_incident_admissions_total{outcome="accepted|duplicate|suppressed"}` |
 
@@ -64,8 +67,8 @@
 - `openai_test.go`:httptest 假服务器覆盖重试与错误;
 - `suppress_test.go`:Redis(miniredis)路由窗口生命周期、owner 守卫、40 并发双副本抢窗、Redis 故障 fail-open 降级;
 - `orchestrator_test.go`:完成/失败/重复/非法事件/队列满/风暴抑制/成功冷却与失败退避/聚集延迟与 `Close()` 清理/双副本共享抑制;
-- `auth_test.go`:三种 `AUTH_MODE` 下的 ingest 与报告读取、JWT 与 INGEST_TOKEN 边界;
-- `server_test.go`:gin 测试路由覆盖鉴权、去重、抑制响应、`/metrics` 准入计数、校验、查询、探针。
+- `auth_test.go`:三种 `AUTH_MODE` 下的 ingest、报告读取与 Pod/容器日志接口权限、JWT 与 INGEST_TOKEN 边界;
+- `server_test.go`:gin 测试路由覆盖鉴权、去重、抑制响应、`/metrics` 准入计数、校验、查询、Pod/日志代理接口及探针。
 
 ## 修改本模块时必须同步检查
 

@@ -16,10 +16,11 @@ Google Cloud Console / Cloud Trace 风格的轻量级管理控制台，将 P50/P
 | 页面 | 路径 | 能力与数据源 |
 | --- | --- | --- |
 | 登录页 | — | 支持账号密码登录（`AUTH_LOGIN_ENABLED=true`，含 `must_change_password` 强制改密流程）与 Bearer Token 登录（`legacy` `ADMIN_TOKEN` 或 `halonctl` 签发的 JWT） |
-| 概览看板 | `/` | 总请求/QPS、P50/P95/P99 延迟、5xx 错误率、当前副本熔断状态；ECharts 分位数曲线与状态码分布图；Top 慢路由榜与最近 AI 故障报告 |
+| 概览看板 | `/` | 总请求/QPS、P50/P95/P99 延迟、5xx 错误率、当前副本熔断状态与运行态保护/队列健康卡片(在途请求、前置拒绝、重试与熔断触发、队列丢弃、Webhook 失败);ECharts 分位数曲线与状态码分布图;Top 慢路由榜与最近 AI 故障报告 |
 | 链路追踪 (Traces) | `/traces` | 类 Jaeger 筛选条与耗时散点图，自研 Google Cloud Trace 风格 Span 瀑布流与右侧属性/报文检查器；配置 `TEMPO_URL` 时查询 Tempo 分布式链路，否则自动降级为基于 PostgreSQL `base_logs` 的网关+上游瀑布流 |
 | 路由与 P99 分析 | `/routes` | 按路由前缀或精确路径聚合 Avg / P50 / P95 / P99 / Max 与 5xx 率，点击行下钻时序图与样本请求 |
 | 请求与错误日志 | `/logs` | 多条件筛选（route/path/request_id/trace_id/client_ip/状态码/最小耗时）与分页，点击行查看美化后的 Request/Response Body 并支持跳转 Trace |
+| 容器日志 | `/pod-logs` | 查询 Agent `GET /api/v1/k8s/pods*`，支持命名空间与 Halon 组件筛选、Pod/容器切换、尾部行数与时间窗口、上次崩溃实例 (`previous`) 与关键字高亮过滤 |
 | AI 故障报告 | `/incidents` | 查询 Agent `GET /api/v1/incidents*`，渲染中文 Markdown 报告与工具调用轨迹时间线，支持联动关联日志与 Trace |
 | 网关管控 | `/gateway` | 路由与每副本熔断器状态、Top IP 榜与 Redis 共享黑名单管理（`operator+`，显示 `<=10s` 传播窗口提示）、Redis Lua 全局限流配置（`full`） |
 | 用户与权限 | `/users` | `full` 角色在 `AUTH_LOGIN_ENABLED=true` 下管理本地账号、角色与临时密码重置 |

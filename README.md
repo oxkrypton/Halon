@@ -31,8 +31,8 @@ Gin Gateway -- bounded channel --> Batch Writer --> PostgreSQL
                                                    |-- error_body
                                                    |-- incident_reports
 
-Gin Gateway -- /metrics + OTLP traces + JSON logs --> 可选观测栈
-                                                   (Prometheus / Tempo / Loki)
+Gin Gateway -- /metrics + OTLP traces --> 可选观测栈
+                                         (Prometheus / Tempo)
 
 Gateway Admin (:9090) -- Bearer Token --> blacklist / rate-limit / breakers
 
@@ -55,7 +55,7 @@ Gin Gateway -- 504 webhook --> Agent Service (:8081)
 - 基于 Redis 的 IP 黑名单(进程内缓存 + pub/sub 失效与 TTL 兜底)及按客户端 IP 的 Redis Lua 令牌桶限流。
 - 独立管理端口 `:9090`,支持动态更新黑名单和限流参数、查询各路由熔断状态,暴露 Prometheus 指标(全指标清单见 [docs/modules/gateway.md](docs/modules/gateway.md))。
 - 可选 OpenTelemetry 追踪(`OTEL_ENABLED`):自动注入/透传 W3C `traceparent`,上游零改动;`trace_id`、`route`、`upstream_latency_ms` 写入 PostgreSQL `base_logs` 并打印到结构化日志。配套可选观测栈见 `deploy/kubernetes/observability/`。
-- 可选 Web 管理控制台(`web/`):Google Cloud Console 风格 React 前端,内置 P50/P95/P99 分位数趋势、类 Jaeger 链路追踪瀑布流(支持 Tempo 或 PG 降级)、请求/错误日志、Agent AI 故障报告与熔断/黑名单/限流/用户管控,详见 [docs/modules/web.md](docs/modules/web.md)。
+- 可选 Web 管理控制台(`web/`):Google Cloud Console 风格 React 前端,内置 P50/P95/P99 分位数与运行态保护/队列健康看板、类 Jaeger 链路追踪瀑布流(支持 Tempo 或 PG 降级)、请求/错误日志、基于 K8s API 的实时容器日志、Agent AI 故障报告与熔断/黑名单/限流/用户管控,详见 [docs/modules/web.md](docs/modules/web.md)。
 - `/healthz` 存活检查和 `/readyz` 数据库就绪检查。
 - HTTP 超时、Panic 恢复、平滑退出及非 root 容器运行。
 
@@ -209,6 +209,8 @@ curl -X PUT http://localhost:9090/admin/rules/rate-limit \
 | `POST /api/v1/incidents/timeout` | `INGEST_TOKEN` | 接收超时事件并排队排查;重复事件返回 `duplicate: true`,同路由冷却期内返回 `suppressed: true` |
 | `GET /api/v1/incidents` | `incident:read` | 列出最近的故障报告,`limit` 参数最大 200 |
 | `GET /api/v1/incidents/:event_id` | `incident:read` | 查询单个事件的排查报告与工具调用轨迹 |
+| `GET /api/v1/k8s/pods` | `k8s:pod_logs:read` | 列出白名单命名空间下的 Pod 状态、Ready 与重启次数(`namespace`/`label_selector`/`limit`) |
+| `GET /api/v1/k8s/pods/:pod/logs` | `k8s:pod_logs:read` | 读取 Pod 容器有界日志(`namespace`/`container`/`tail_lines`/`since_seconds`/`previous`,单次上限 1 MiB) |
 | `GET /healthz` / `GET /readyz` | — | 存活检查 / PostgreSQL 就绪检查 |
 | `GET /metrics` | — | Prometheus 指标(`halon_agent_redis_up`、`halon_agent_incident_admissions_total`,无需鉴权) |
 
@@ -419,7 +421,7 @@ kubectl rollout restart deployment/agent
 │   ├── postgres.yaml             # PostgreSQL StatefulSet、Service 和 PVC
 │   ├── redis.yaml                # Redis Deployment 和 Service(开发参考清单)
 │   ├── web/                      # 可选 Web 管理控制台 Deployment 和 Service
-│   └── observability/            # 可选观测栈:OTel Collector、Tempo、Loki、Alloy、Prometheus、Alertmanager
+│   └── observability/            # 可选观测栈:OTel Collector、Tempo、Prometheus、Alertmanager
 ├── web/                          # Google 风格 React + TypeScript 管理控制台(Vite + ECharts + Nginx)
 ├── docs/
 │   ├── README.md                 # 文档索引与文档维护规则
