@@ -19,6 +19,7 @@ import type { TimeWindow } from '../api/observability';
 
 export type Permission =
   | 'incident:read'
+  | 'k8s:pod_logs:read'
   | 'gateway:rules:read'
   | 'gateway:breaker:read'
   | 'gateway:metrics:read'
@@ -36,6 +37,7 @@ const ROLE_RANK: Record<Role, number> = {
 
 const PERMISSION_REQUIRED_ROLE: Record<Permission, Role> = {
   'incident:read': 'readonly',
+  'k8s:pod_logs:read': 'readonly',
   'gateway:rules:read': 'readonly',
   'gateway:breaker:read': 'readonly',
   'gateway:metrics:read': 'readonly',

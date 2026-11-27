@@ -17,6 +17,26 @@ export interface OverviewStats {
   unique_clients: number;
 }
 
+export interface RejectedCounts {
+  total: number;
+  blacklist: number;
+  rate_limit: number;
+  concurrency_limit: number;
+  body_too_large: number;
+}
+
+export interface RuntimeMetricsSnapshot {
+  in_flight_requests: number;
+  upstream_in_flight: number;
+  rejected: RejectedCounts;
+  retries_total: number;
+  retry_exhausted_total: number;
+  breaker_trips_total: number;
+  trafficlog_dropped: number;
+  timeout_events_dropped: number;
+  webhook_notify_failures: number;
+}
+
 export interface TimeSeriesPoint {
   ts: string;
   requests: number;
@@ -76,7 +96,7 @@ export interface TopClientStat {
 export function fetchOverview(window: TimeWindow, route = '') {
   const params = new URLSearchParams({ window });
   if (route) params.set('route', route);
-  return apiFetch<{ overview: OverviewStats; window: string }>(
+  return apiFetch<{ overview: OverviewStats; runtime?: RuntimeMetricsSnapshot; window: string }>(
     `/api/gateway/admin/observability/overview?${params}`,
   );
 }

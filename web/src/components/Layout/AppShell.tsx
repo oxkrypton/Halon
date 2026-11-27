@@ -7,6 +7,7 @@ import {
   GitBranch,
   Route,
   FileText,
+  Terminal,
   Sparkles,
   Shield,
   Users,
@@ -252,6 +253,12 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                 <FileText className="h-4 w-4" />
                 请求与错误日志
               </NavLink>
+              {can('k8s:pod_logs:read') && (
+                <NavLink to="/pod-logs" className={navItemClass}>
+                  <Terminal className="h-4 w-4" />
+                  容器日志
+                </NavLink>
+              )}
               <NavLink to="/incidents" className={navItemClass}>
                 <Sparkles className="h-4 w-4" />
                 AI 故障报告

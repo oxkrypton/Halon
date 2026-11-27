@@ -47,6 +47,9 @@ export function OverviewPage() {
   });
 
   const ov = overviewQ.data?.overview;
+  const rt = overviewQ.data?.runtime;
+  const queueDropped = (rt?.trafficlog_dropped ?? 0) + (rt?.timeout_events_dropped ?? 0);
+  const webhookFailures = rt?.webhook_notify_failures ?? 0;
   const openBreakers = (breakersQ.data?.breakers || []).filter((b) => b.state === 'open').length;
 
   return (
@@ -124,6 +127,47 @@ export function OverviewPage() {
           sub={`总计 ${(breakersQ.data?.breakers || []).length} 条路由 (当前副本)`}
           tone={openBreakers > 0 ? 'red' : 'green'}
         />
+      </div>
+
+      {/* Runtime Protection & Queue Health (current replica) */}
+      <div>
+        <div className="mb-2 flex items-center justify-between">
+          <h2 className="text-[12.5px] font-medium text-[#5F6368]">
+            运行态保护与队列健康（当前副本）
+          </h2>
+        </div>
+        <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-5 gap-3.5">
+          <Scorecard
+            label="进行中请求"
+            value={formatCount(rt?.in_flight_requests)}
+            sub={`上游在途 ${formatCount(rt?.upstream_in_flight)}`}
+            tone="blue"
+          />
+          <Scorecard
+            label="网关前置拒绝"
+            value={formatCount(rt?.rejected?.total)}
+            sub={`黑名单 ${formatCount(rt?.rejected?.blacklist)} · 限流 ${formatCount(rt?.rejected?.rate_limit)} · 并发 ${formatCount(rt?.rejected?.concurrency_limit)} · 体大 ${formatCount(rt?.rejected?.body_too_large)}`}
+            tone={(rt?.rejected?.total ?? 0) > 0 ? 'yellow' : 'default'}
+          />
+          <Scorecard
+            label="上游重试"
+            value={formatCount(rt?.retries_total)}
+            sub={`预算耗尽 ${formatCount(rt?.retry_exhausted_total)} · 熔断触发 ${formatCount(rt?.breaker_trips_total)}`}
+            tone={(rt?.retry_exhausted_total ?? 0) > 0 ? 'yellow' : 'default'}
+          />
+          <Scorecard
+            label="队列丢弃"
+            value={formatCount(queueDropped)}
+            sub={`日志 ${formatCount(rt?.trafficlog_dropped)} · 超时事件 ${formatCount(rt?.timeout_events_dropped)}`}
+            tone={queueDropped > 0 ? 'red' : 'green'}
+          />
+          <Scorecard
+            label="Webhook 推送失败"
+            value={formatCount(webhookFailures)}
+            sub="超时事件投递 Agent"
+            tone={webhookFailures > 0 ? 'red' : 'green'}
+          />
+        </div>
       </div>
 
       {/* Main Charts */}

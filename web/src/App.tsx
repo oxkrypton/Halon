@@ -7,6 +7,7 @@ import { OverviewPage } from './pages/OverviewPage';
 import { TracesPage } from './pages/TracesPage';
 import { RoutesPage } from './pages/RoutesPage';
 import { LogsPage } from './pages/LogsPage';
+import { PodLogsPage } from './pages/PodLogsPage';
 import { IncidentsPage } from './pages/IncidentsPage';
 import { GatewayControlPage } from './pages/GatewayControlPage';
 import { UsersPage } from './pages/UsersPage';
@@ -43,6 +44,7 @@ function ConsoleRoutes() {
         <Route path="/traces" element={<TracesPage />} />
         <Route path="/routes" element={<RoutesPage />} />
         <Route path="/logs" element={<LogsPage />} />
+        <Route path="/pod-logs" element={<PodLogsPage />} />
         <Route path="/incidents" element={<IncidentsPage />} />
         <Route path="/gateway" element={<GatewayControlPage />} />
         <Route path="/users" element={<UsersPage />} />
