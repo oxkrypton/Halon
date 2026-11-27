@@ -29,6 +29,7 @@ type ServerDeps struct {
 	Orchestrator *Orchestrator
 	Deduper      *incident.Deduper
 	Reports      ReportReader
+	Pods         PodLogReader
 	IngestToken  string
 	Auth         *authz.Authenticator
 	Logger       *slog.Logger
@@ -81,6 +82,10 @@ func NewHTTPHandler(deps ServerDeps) *gin.Engine {
 	reports := api.Group("", authz.Middleware(authenticator, abortWithAPIError), authz.Require(authz.PermIncidentRead, abortWithAPIError))
 	reports.GET("/incidents", listReports(deps.Reports))
 	reports.GET("/incidents/:event_id", getReport(deps.Reports))
+
+	k8s := api.Group("/k8s", authz.Middleware(authenticator, abortWithAPIError), authz.Require(authz.PermPodLogsRead, abortWithAPIError))
+	k8s.GET("/pods", listPods(deps.Pods))
+	k8s.GET("/pods/:pod/logs", getPodLogs(deps.Pods))
 
 	router.NoRoute(func(c *gin.Context) {
 		abortWithAPIError(c, http.StatusNotFound, "ROUTE_NOT_FOUND", "route not found")

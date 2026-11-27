@@ -11,6 +11,7 @@ import (
 	"github.com/oxkrypton/Halon/internal/agent"
 	"github.com/oxkrypton/Halon/internal/authz"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/kubernetes"
@@ -26,12 +27,15 @@ type KubernetesOptions struct {
 	Cooldowns CooldownStore
 }
 
+var _ agent.PodLogReader = (*KubernetesToolset)(nil)
+
 type KubernetesToolset struct {
-	client      kubernetes.Interface
-	namespaces  map[string]struct{}
-	maxReplicas int
-	cooldown    time.Duration
-	cooldowns   CooldownStore
+	client            kubernetes.Interface
+	namespaces        map[string]struct{}
+	allowedNamespaces []string
+	maxReplicas       int
+	cooldown          time.Duration
+	cooldowns         CooldownStore
 }
 
 func NewKubernetesTools(client kubernetes.Interface, options KubernetesOptions) (*KubernetesToolset, []agent.Tool) {
@@ -54,7 +58,103 @@ func NewKubernetesTools(client kubernetes.Interface, options KubernetesOptions) 
 			toolset.namespaces[namespace] = struct{}{}
 		}
 	}
+	for namespace := range toolset.namespaces {
+		toolset.allowedNamespaces = append(toolset.allowedNamespaces, namespace)
+	}
+	sort.Strings(toolset.allowedNamespaces)
 	return toolset, toolset.tools()
+}
+
+// AllowedNamespaces returns a sorted copy of the configured namespace allowlist.
+func (k *KubernetesToolset) AllowedNamespaces() []string {
+	out := make([]string, len(k.allowedNamespaces))
+	copy(out, k.allowedNamespaces)
+	return out
+}
+
+// ListPods lists pod summaries in an allowed namespace.
+func (k *KubernetesToolset) ListPods(ctx context.Context, namespace, labelSelector string, limit int) (string, []agent.PodSummary, error) {
+	if limit == 0 {
+		limit = 100
+	}
+	if limit < 1 || limit > 100 {
+		return "", nil, fmt.Errorf("limit must be 1..100: %w", agent.ErrInvalidPodRequest)
+	}
+	if err := k.checkNamespace(&namespace); err != nil {
+		return "", nil, err
+	}
+	pods, err := k.client.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: strings.TrimSpace(labelSelector),
+		Limit:         int64(limit),
+	})
+	if err != nil {
+		return "", nil, classifyKubernetesError(err)
+	}
+	results := make([]agent.PodSummary, 0, len(pods.Items))
+	for _, pod := range pods.Items {
+		results = append(results, summarizePod(pod))
+	}
+	sort.Slice(results, func(i, j int) bool { return results[i].Name < results[j].Name })
+	return namespace, results, nil
+}
+
+// GetPodLogs reads bounded recent logs from a pod container.
+func (k *KubernetesToolset) GetPodLogs(ctx context.Context, options agent.PodLogOptions) (agent.PodLogResult, error) {
+	options.Pod = strings.TrimSpace(options.Pod)
+	options.Container = strings.TrimSpace(options.Container)
+	options.Namespace = strings.TrimSpace(options.Namespace)
+	if options.Pod == "" || len(options.Pod) > 253 || strings.ContainsAny(options.Pod, "/ \t\r\n") {
+		return agent.PodLogResult{}, fmt.Errorf("pod is required and must be a valid pod name: %w", agent.ErrInvalidPodRequest)
+	}
+	if len(options.Container) > 253 || strings.ContainsAny(options.Container, " \t\r\n") {
+		return agent.PodLogResult{}, fmt.Errorf("invalid container name: %w", agent.ErrInvalidPodRequest)
+	}
+	if options.TailLines == 0 {
+		options.TailLines = 200
+	}
+	if options.SinceSeconds == 0 {
+		options.SinceSeconds = 900
+	}
+	if options.TailLines < 1 || options.TailLines > 1000 || options.SinceSeconds < 1 || options.SinceSeconds > 86400 {
+		return agent.PodLogResult{}, fmt.Errorf("tail_lines must be 1..1000 and since_seconds must be 1..86400: %w", agent.ErrInvalidPodRequest)
+	}
+	if err := k.checkNamespace(&options.Namespace); err != nil {
+		return agent.PodLogResult{}, err
+	}
+	tailLines := int64(options.TailLines)
+	since := time.Now().Add(-time.Duration(options.SinceSeconds) * time.Second)
+	limitBytes := int64(1 << 20)
+	logs, err := k.client.CoreV1().Pods(options.Namespace).GetLogs(options.Pod, &corev1.PodLogOptions{
+		Container:  options.Container,
+		TailLines:  &tailLines,
+		SinceTime:  &metav1.Time{Time: since},
+		Previous:   options.Previous,
+		LimitBytes: &limitBytes,
+		Timestamps: true,
+	}).DoRaw(ctx)
+	if err != nil {
+		return agent.PodLogResult{}, classifyKubernetesError(err)
+	}
+	return agent.PodLogResult{
+		Namespace: options.Namespace,
+		Pod:       options.Pod,
+		Container: options.Container,
+		Previous:  options.Previous,
+		Logs:      string(logs),
+	}, nil
+}
+
+func classifyKubernetesError(err error) error {
+	switch {
+	case apierrors.IsNotFound(err):
+		return fmt.Errorf("%w: %v", agent.ErrPodNotFound, err)
+	case apierrors.IsBadRequest(err):
+		return fmt.Errorf("%w: %v", agent.ErrInvalidPodRequest, err)
+	case apierrors.IsForbidden(err):
+		return fmt.Errorf("%w: %v", agent.ErrNamespaceForbidden, err)
+	default:
+		return err
+	}
 }
 
 func (k *KubernetesToolset) tools() []agent.Tool {
@@ -73,22 +173,9 @@ func (k *KubernetesToolset) tools() []agent.Tool {
 				if err != nil {
 					return nil, err
 				}
-				if input.Limit == 0 {
-					input.Limit = 100
-				}
-				if input.Limit < 1 || input.Limit > 100 {
-					return nil, fmt.Errorf("limit must be 1..100")
-				}
-				if err := k.checkNamespace(&input.Namespace); err != nil {
-					return nil, err
-				}
-				pods, err := k.client.CoreV1().Pods(input.Namespace).List(ctx, metav1.ListOptions{LabelSelector: input.LabelSelector, Limit: int64(input.Limit)})
+				_, results, err := k.ListPods(ctx, input.Namespace, input.LabelSelector, input.Limit)
 				if err != nil {
 					return nil, err
-				}
-				results := make([]PodSummary, 0, len(pods.Items))
-				for _, pod := range pods.Items {
-					results = append(results, summarizePod(pod))
 				}
 				return results, nil
 			},
@@ -113,29 +200,18 @@ func (k *KubernetesToolset) tools() []agent.Tool {
 				if err != nil {
 					return nil, err
 				}
-				if input.Pod == "" {
-					return nil, fmt.Errorf("pod is required")
-				}
-				if input.TailLines == 0 {
-					input.TailLines = 200
-				}
-				if input.SinceSeconds == 0 {
-					input.SinceSeconds = 900
-				}
-				if input.TailLines < 1 || input.TailLines > 1000 || input.SinceSeconds < 1 || input.SinceSeconds > 86400 {
-					return nil, fmt.Errorf("tail_lines must be 1..1000 and since_seconds must be 1..86400")
-				}
-				if err := k.checkNamespace(&input.Namespace); err != nil {
-					return nil, err
-				}
-				tailLines := int64(input.TailLines)
-				since := time.Now().Add(-time.Duration(input.SinceSeconds) * time.Second)
-				limitBytes := int64(1 << 20)
-				logs, err := k.client.CoreV1().Pods(input.Namespace).GetLogs(input.Pod, &corev1.PodLogOptions{Container: input.Container, TailLines: &tailLines, SinceTime: &metav1.Time{Time: since}, Previous: input.Previous, LimitBytes: &limitBytes, Timestamps: true}).DoRaw(ctx)
+				result, err := k.GetPodLogs(ctx, agent.PodLogOptions{
+					Namespace:    input.Namespace,
+					Pod:          input.Pod,
+					Container:    input.Container,
+					TailLines:    input.TailLines,
+					SinceSeconds: input.SinceSeconds,
+					Previous:     input.Previous,
+				})
 				if err != nil {
 					return nil, err
 				}
-				return map[string]any{"namespace": input.Namespace, "pod": input.Pod, "container": input.Container, "logs": string(logs)}, nil
+				return map[string]any{"namespace": result.Namespace, "pod": result.Pod, "container": result.Container, "logs": result.Logs}, nil
 			},
 		},
 		{
@@ -347,22 +423,8 @@ func (k *KubernetesToolset) tools() []agent.Tool {
 	}
 }
 
-type PodSummary struct {
-	Name       string           `json:"name"`
-	Phase      string           `json:"phase"`
-	Ready      bool             `json:"ready"`
-	Restarts   int32            `json:"restarts"`
-	Node       string           `json:"node"`
-	CreatedAt  time.Time        `json:"created_at"`
-	Containers []ContainerState `json:"containers"`
-}
-type ContainerState struct {
-	Name         string `json:"name"`
-	Ready        bool   `json:"ready"`
-	RestartCount int32  `json:"restart_count"`
-	State        string `json:"state"`
-	Reason       string `json:"reason"`
-}
+type PodSummary = agent.PodSummary
+type ContainerState = agent.ContainerState
 type EventSummary struct {
 	Object        string    `json:"object"`
 	Kind          string    `json:"kind"`
@@ -373,8 +435,14 @@ type EventSummary struct {
 	LastTimestamp time.Time `json:"last_timestamp"`
 }
 
-func summarizePod(pod corev1.Pod) PodSummary {
-	summary := PodSummary{Name: pod.Name, Phase: string(pod.Status.Phase), Node: pod.Spec.NodeName, CreatedAt: pod.CreationTimestamp.Time}
+func summarizePod(pod corev1.Pod) agent.PodSummary {
+	summary := agent.PodSummary{
+		Name:       pod.Name,
+		Phase:      string(pod.Status.Phase),
+		Node:       pod.Spec.NodeName,
+		CreatedAt:  pod.CreationTimestamp.Time,
+		Containers: make([]agent.ContainerState, 0, len(pod.Status.ContainerStatuses)),
+	}
 	ready := len(pod.Status.ContainerStatuses) > 0
 	for _, status := range pod.Status.ContainerStatuses {
 		ready = ready && status.Ready
@@ -388,21 +456,30 @@ func summarizePod(pod corev1.Pod) PodSummary {
 			state, reason = "terminated", status.State.Terminated.Reason
 		}
 		summary.Restarts += status.RestartCount
-		summary.Containers = append(summary.Containers, ContainerState{Name: status.Name, Ready: status.Ready, RestartCount: status.RestartCount, State: state, Reason: reason})
+		summary.Containers = append(summary.Containers, agent.ContainerState{Name: status.Name, Ready: status.Ready, RestartCount: status.RestartCount, State: state, Reason: reason})
 	}
 	summary.Ready = ready
 	return summary
 }
 
 func (k *KubernetesToolset) checkNamespace(namespace *string) error {
+	*namespace = strings.TrimSpace(*namespace)
 	if *namespace == "" {
-		*namespace = "default"
+		if _, ok := k.namespaces["default"]; ok {
+			*namespace = "default"
+		} else if _, all := k.namespaces["*"]; all {
+			*namespace = "default"
+		} else if len(k.allowedNamespaces) > 0 {
+			*namespace = k.allowedNamespaces[0]
+		} else {
+			*namespace = "default"
+		}
 	}
 	if _, all := k.namespaces["*"]; all {
 		return nil
 	}
 	if _, ok := k.namespaces[*namespace]; !ok {
-		return fmt.Errorf("namespace %q is not in the agent allowlist", *namespace)
+		return fmt.Errorf("namespace %q: %w", *namespace, agent.ErrNamespaceForbidden)
 	}
 	return nil
 }

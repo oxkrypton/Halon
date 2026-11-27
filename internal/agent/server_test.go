@@ -2,7 +2,9 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -44,6 +46,68 @@ func (s *stubReportReader) List(_ context.Context, limit int) ([]incident.Report
 
 func (s *stubReportReader) Ping(context.Context) error {
 	return s.pingErr
+}
+
+type stubPodLogReader struct {
+	namespaces []string
+	pods       []PodSummary
+	listErr    error
+	logs       map[string]PodLogResult
+	logsErr    error
+}
+
+func (s *stubPodLogReader) AllowedNamespaces() []string {
+	out := make([]string, len(s.namespaces))
+	copy(out, s.namespaces)
+	return out
+}
+
+func (s *stubPodLogReader) ListPods(_ context.Context, namespace, _ string, _ int) (string, []PodSummary, error) {
+	if s.listErr != nil {
+		return "", nil, s.listErr
+	}
+	resolved := namespace
+	if resolved == "" {
+		if len(s.namespaces) > 0 && s.namespaces[0] != "*" {
+			resolved = s.namespaces[0]
+		} else {
+			resolved = "default"
+		}
+	}
+	if resolved == "forbidden-ns" {
+		return "", nil, fmt.Errorf("namespace %q: %w", resolved, ErrNamespaceForbidden)
+	}
+	return resolved, s.pods, nil
+}
+
+func (s *stubPodLogReader) GetPodLogs(_ context.Context, opts PodLogOptions) (PodLogResult, error) {
+	if s.logsErr != nil {
+		return PodLogResult{}, s.logsErr
+	}
+	if opts.Namespace == "forbidden-ns" {
+		return PodLogResult{}, fmt.Errorf("namespace %q: %w", opts.Namespace, ErrNamespaceForbidden)
+	}
+	if opts.Pod == "missing" {
+		return PodLogResult{}, ErrPodNotFound
+	}
+	if opts.Previous && opts.Pod == "no-previous" {
+		return PodLogResult{}, fmt.Errorf("previous terminated container not found: %w", ErrInvalidPodRequest)
+	}
+	if res, ok := s.logs[opts.Pod]; ok {
+		res.Previous = opts.Previous
+		return res, nil
+	}
+	ns := opts.Namespace
+	if ns == "" {
+		ns = "default"
+	}
+	return PodLogResult{
+		Namespace: ns,
+		Pod:       opts.Pod,
+		Container: opts.Container,
+		Previous:  opts.Previous,
+		Logs:      "2026-11-27T12:00:00Z {\"level\":\"INFO\",\"msg\":\"ok\"}\n",
+	}, nil
 }
 
 const testIngestToken = "test-ingest-token-0123456789"
@@ -241,6 +305,115 @@ func TestIngestSuppressesStormAndRecordsMetrics(t *testing.T) {
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("metrics missing %q:\n%s", want, body)
+		}
+	}
+}
+
+func TestPodAndLogEndpoints(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+
+	doGet := func(router *gin.Engine, path string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Authorization", "Bearer "+testIngestToken)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// Nil Pods dependency returns 503 K8S_UNAVAILABLE.
+	unconfigured := newTestRouter(&stubReportStore{}, &stubReportReader{}, incident.NewDeduper(time.Minute))
+	for _, path := range []string{"/api/v1/k8s/pods", "/api/v1/k8s/pods/gateway-1/logs"} {
+		rec := doGet(unconfigured, path)
+		if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), `"K8S_UNAVAILABLE"`) {
+			t.Fatalf("%s with nil Pods = %d %s", path, rec.Code, rec.Body.String())
+		}
+	}
+
+	podsReader := &stubPodLogReader{
+		namespaces: []string{"default", "staging"},
+		pods: []PodSummary{{
+			Name:     "gateway-1",
+			Phase:    "Running",
+			Ready:    true,
+			Restarts: 1,
+			Node:     "node-a",
+			Containers: []ContainerState{{
+				Name:         "gateway",
+				Ready:        true,
+				RestartCount: 1,
+				State:        "running",
+			}},
+		}},
+		logs: map[string]PodLogResult{
+			"gateway-1": {
+				Namespace: "default",
+				Pod:       "gateway-1",
+				Container: "gateway",
+				Logs:      "line-1\nline-2\n",
+			},
+		},
+	}
+	router := NewHTTPHandler(ServerDeps{
+		Orchestrator: newTestOrchestrator(finalMessageModel("ok"), &stubReportStore{}, 8),
+		Deduper:      incident.NewDeduper(time.Minute),
+		Reports:      &stubReportReader{},
+		Pods:         podsReader,
+		IngestToken:  testIngestToken,
+		Logger:       testLogger(),
+	})
+
+	// Happy paths.
+	podsResp := doGet(router, "/api/v1/k8s/pods?namespace=default&label_selector=app%3Dgateway&limit=50")
+	if podsResp.Code != http.StatusOK {
+		t.Fatalf("list pods = %d %s", podsResp.Code, podsResp.Body.String())
+	}
+	var listBody struct {
+		Namespace  string       `json:"namespace"`
+		Namespaces []string     `json:"namespaces"`
+		Pods       []PodSummary `json:"pods"`
+	}
+	if err := json.Unmarshal(podsResp.Body.Bytes(), &listBody); err != nil {
+		t.Fatal(err)
+	}
+	if listBody.Namespace != "default" || len(listBody.Namespaces) != 2 || len(listBody.Pods) != 1 || listBody.Pods[0].Name != "gateway-1" {
+		t.Fatalf("unexpected list response: %+v", listBody)
+	}
+
+	logsResp := doGet(router, "/api/v1/k8s/pods/gateway-1/logs?namespace=default&container=gateway&tail_lines=100&since_seconds=300&previous=true")
+	if logsResp.Code != http.StatusOK {
+		t.Fatalf("get logs = %d %s", logsResp.Code, logsResp.Body.String())
+	}
+	var logsBody PodLogResult
+	if err := json.Unmarshal(logsResp.Body.Bytes(), &logsBody); err != nil {
+		t.Fatal(err)
+	}
+	if logsBody.Pod != "gateway-1" || logsBody.Container != "gateway" || !logsBody.Previous || !strings.Contains(logsBody.Logs, "line-1") {
+		t.Fatalf("unexpected logs response: %+v", logsBody)
+	}
+
+	// Error mapping and parameter validation.
+	cases := []struct {
+		path   string
+		status int
+		code   string
+	}{
+		{"/api/v1/k8s/pods?namespace=forbidden-ns", http.StatusForbidden, "NAMESPACE_FORBIDDEN"},
+		{"/api/v1/k8s/pods?limit=0", http.StatusBadRequest, "INVALID_REQUEST"},
+		{"/api/v1/k8s/pods?limit=101", http.StatusBadRequest, "INVALID_REQUEST"},
+		{"/api/v1/k8s/pods/missing/logs?namespace=default", http.StatusNotFound, "POD_NOT_FOUND"},
+		{"/api/v1/k8s/pods/gateway-1/logs?namespace=forbidden-ns", http.StatusForbidden, "NAMESPACE_FORBIDDEN"},
+		{"/api/v1/k8s/pods/no-previous/logs?previous=true", http.StatusBadRequest, "INVALID_REQUEST"},
+		{"/api/v1/k8s/pods/gateway-1/logs?tail_lines=0", http.StatusBadRequest, "INVALID_REQUEST"},
+		{"/api/v1/k8s/pods/gateway-1/logs?tail_lines=1001", http.StatusBadRequest, "INVALID_REQUEST"},
+		{"/api/v1/k8s/pods/gateway-1/logs?since_seconds=0", http.StatusBadRequest, "INVALID_REQUEST"},
+		{"/api/v1/k8s/pods/gateway-1/logs?since_seconds=90000", http.StatusBadRequest, "INVALID_REQUEST"},
+		{"/api/v1/k8s/pods/gateway-1/logs?previous=notabool", http.StatusBadRequest, "INVALID_REQUEST"},
+	}
+	for _, tc := range cases {
+		rec := doGet(router, tc.path)
+		if rec.Code != tc.status || !strings.Contains(rec.Body.String(), tc.code) {
+			t.Fatalf("%s = %d %s, want %d %s", tc.path, rec.Code, rec.Body.String(), tc.status, tc.code)
 		}
 	}
 }

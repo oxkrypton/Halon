@@ -3,8 +3,10 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -15,7 +17,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/rest"
 )
 
 func TestKubernetesListPodsAndNamespaceGuard(t *testing.T) {
@@ -283,6 +287,145 @@ func TestOperationLevelsExposeExpectedKubernetesTools(t *testing.T) {
 	full, _ := agent.NewRegistry(agent.LevelFull, toolList...)
 	if len(full.Definitions()) != len(toolList) {
 		t.Fatalf("full exposed %d of %d tools", len(full.Definitions()), len(toolList))
+	}
+}
+
+func TestKubernetesToolsetPodLogReader(t *testing.T) {
+	t.Parallel()
+
+	client := fake.NewClientset(
+		&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "gateway-b",
+				Namespace:         "halon",
+				Labels:            map[string]string{"app.kubernetes.io/part-of": "halon"},
+				CreationTimestamp: metav1.Time{Time: time.Now()},
+			},
+			Status: corev1.PodStatus{
+				Phase: corev1.PodRunning,
+				ContainerStatuses: []corev1.ContainerStatus{{
+					Name:  "gateway",
+					Ready: true,
+					State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+				}},
+			},
+		},
+		&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "agent-a",
+				Namespace: "halon",
+				Labels:    map[string]string{"app.kubernetes.io/part-of": "halon"},
+			},
+		},
+		&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "other-pod",
+				Namespace: "halon",
+			},
+		},
+	)
+
+	toolset, _ := NewKubernetesTools(client, KubernetesOptions{AllowedNamespaces: []string{"prod", "halon"}})
+	if got := toolset.AllowedNamespaces(); !reflect.DeepEqual(got, []string{"halon", "prod"}) {
+		t.Fatalf("AllowedNamespaces = %v, want [halon prod]", got)
+	}
+
+	resolvedNS, pods, err := toolset.ListPods(context.Background(), "", "app.kubernetes.io/part-of=halon", 0)
+	if err != nil {
+		t.Fatalf("ListPods default fallback: %v", err)
+	}
+	if resolvedNS != "halon" || len(pods) != 2 || pods[0].Name != "agent-a" || pods[1].Name != "gateway-b" {
+		t.Fatalf("ListPods = (%q, %+v)", resolvedNS, pods)
+	}
+
+	if _, _, err := toolset.ListPods(context.Background(), "kube-system", "", 10); !errors.Is(err, agent.ErrNamespaceForbidden) {
+		t.Fatalf("forbidden namespace err = %v, want ErrNamespaceForbidden", err)
+	}
+	if _, _, err := toolset.ListPods(context.Background(), "halon", "", 101); !errors.Is(err, agent.ErrInvalidPodRequest) {
+		t.Fatalf("invalid limit err = %v, want ErrInvalidPodRequest", err)
+	}
+
+	wildcardToolset, _ := NewKubernetesTools(client, KubernetesOptions{AllowedNamespaces: []string{"*"}})
+	if resolved, _, err := wildcardToolset.ListPods(context.Background(), "", "", 10); err != nil || resolved != "default" {
+		t.Fatalf("wildcard ListPods = (%q, %v)", resolved, err)
+	}
+
+	logRes, err := toolset.GetPodLogs(context.Background(), agent.PodLogOptions{
+		Namespace: "halon",
+		Pod:       "gateway-b",
+		Container: "gateway",
+		Previous:  true,
+	})
+	if err != nil {
+		t.Fatalf("GetPodLogs: %v", err)
+	}
+	if logRes.Namespace != "halon" || logRes.Pod != "gateway-b" || logRes.Container != "gateway" || !logRes.Previous || logRes.Logs == "" {
+		t.Fatalf("unexpected GetPodLogs result: %+v", logRes)
+	}
+
+	for _, bad := range []agent.PodLogOptions{
+		{Namespace: "halon", Pod: ""},
+		{Namespace: "halon", Pod: "bad/pod"},
+		{Namespace: "halon", Pod: "gateway-b", Container: "bad container"},
+		{Namespace: "halon", Pod: "gateway-b", TailLines: 1001},
+		{Namespace: "halon", Pod: "gateway-b", SinceSeconds: 86401},
+	} {
+		if _, err := toolset.GetPodLogs(context.Background(), bad); !errors.Is(err, agent.ErrInvalidPodRequest) {
+			t.Fatalf("bad options %+v: err = %v, want ErrInvalidPodRequest", bad, err)
+		}
+	}
+	if _, err := toolset.GetPodLogs(context.Background(), agent.PodLogOptions{Namespace: "kube-system", Pod: "gateway-b"}); !errors.Is(err, agent.ErrNamespaceForbidden) {
+		t.Fatalf("forbidden GetPodLogs err = %v, want ErrNamespaceForbidden", err)
+	}
+
+	// Verify real client-go StatusError decoding for 404/400/403 from the API server.
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(r.URL.Path, "/pods/missing/log"):
+			w.WriteHeader(http.StatusNotFound)
+			_ = json.NewEncoder(w).Encode(metav1.Status{
+				TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"},
+				Status:   metav1.StatusFailure,
+				Reason:   metav1.StatusReasonNotFound,
+				Message:  `pods "missing" not found`,
+				Code:     http.StatusNotFound,
+			})
+		case strings.Contains(r.URL.Path, "/pods/noprev/log"):
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(metav1.Status{
+				TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"},
+				Status:   metav1.StatusFailure,
+				Reason:   metav1.StatusReasonBadRequest,
+				Message:  "previous terminated container not found",
+				Code:     http.StatusBadRequest,
+			})
+		default:
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(metav1.Status{
+				TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"},
+				Status:   metav1.StatusFailure,
+				Reason:   metav1.StatusReasonForbidden,
+				Message:  "forbidden",
+				Code:     http.StatusForbidden,
+			})
+		}
+	}))
+	defer apiServer.Close()
+
+	realClient, err := kubernetes.NewForConfig(&rest.Config{Host: apiServer.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	realToolset, _ := NewKubernetesTools(realClient, KubernetesOptions{AllowedNamespaces: []string{"default"}})
+	if _, err := realToolset.GetPodLogs(context.Background(), agent.PodLogOptions{Pod: "missing"}); !errors.Is(err, agent.ErrPodNotFound) {
+		t.Fatalf("missing pod err = %v, want ErrPodNotFound", err)
+	}
+	if _, err := realToolset.GetPodLogs(context.Background(), agent.PodLogOptions{Pod: "noprev", Previous: true}); !errors.Is(err, agent.ErrInvalidPodRequest) {
+		t.Fatalf("no previous err = %v, want ErrInvalidPodRequest", err)
+	}
+	if _, err := realToolset.GetPodLogs(context.Background(), agent.PodLogOptions{Pod: "denied"}); !errors.Is(err, agent.ErrNamespaceForbidden) {
+		t.Fatalf("forbidden err = %v, want ErrNamespaceForbidden", err)
 	}
 }
 

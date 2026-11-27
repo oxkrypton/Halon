@@ -40,6 +40,7 @@ func newAuthTestRouter(t *testing.T, mode authz.Mode, keys map[string]ed25519.Pu
 		Orchestrator: newTestOrchestrator(finalMessageModel("ok"), &stubReportStore{}, 8),
 		Deduper:      incident.NewDeduper(time.Minute),
 		Reports:      &stubReportReader{},
+		Pods:         &stubPodLogReader{namespaces: []string{"default"}},
 		IngestToken:  testIngestToken,
 		Auth:         authenticator,
 		Logger:       testLogger(),
@@ -103,5 +104,50 @@ func TestAgentAPIBRBAC(t *testing.T) {
 	}
 	if response := postEvent(t, strict, jwtToken, validEventBody()); response.Code != http.StatusUnauthorized {
 		t.Fatalf("ingest accepted a human JWT: %d", response.Code)
+	}
+
+	// Pod log endpoints require k8s:pod_logs:read across legacy, hybrid, and jwt modes.
+	pcrToken, err := signer.Issue(authz.IssueOptions{
+		Subject:                "human-1",
+		Type:                   authz.TypeHuman,
+		Role:                   authz.RoleFull,
+		PasswordChangeRequired: true,
+		Audiences:              []authz.Audience{authz.AudienceAgent},
+		TTL:                    time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	doGet := func(r *gin.Engine, path, token string) int {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	for _, path := range []string{"/api/v1/k8s/pods", "/api/v1/k8s/pods/demo/logs"} {
+		legacyRouter := newAuthTestRouter(t, authz.ModeLegacy, keys, testIngestToken)
+		if got := doGet(legacyRouter, path, testIngestToken); got != http.StatusOK {
+			t.Fatalf("legacy %s = %d, want 200", path, got)
+		}
+		hybridRouter := newAuthTestRouter(t, authz.ModeHybrid, keys, testIngestToken)
+		if got := doGet(hybridRouter, path, testIngestToken); got != http.StatusOK {
+			t.Fatalf("hybrid static %s = %d, want 200", path, got)
+		}
+		if got := doGet(hybridRouter, path, jwtToken); got != http.StatusOK {
+			t.Fatalf("hybrid jwt %s = %d, want 200", path, got)
+		}
+		if got := doGet(strict, path, jwtToken); got != http.StatusOK {
+			t.Fatalf("jwt %s = %d, want 200", path, got)
+		}
+		if got := doGet(strict, path, testIngestToken); got != http.StatusUnauthorized {
+			t.Fatalf("jwt ingest token %s = %d, want 401", path, got)
+		}
+		if got := doGet(strict, path, pcrToken); got != http.StatusForbidden {
+			t.Fatalf("jwt pcr token %s = %d, want 403", path, got)
+		}
 	}
 }

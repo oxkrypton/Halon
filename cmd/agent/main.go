@@ -141,6 +141,7 @@ func run(logger *slog.Logger) error {
 			Orchestrator: orchestrator,
 			Deduper:      incident.NewDeduper(cfg.DedupTTL),
 			Reports:      store,
+			Pods:         kubernetesToolset,
 			IngestToken:  cfg.IngestToken,
 			Auth:         authenticator,
 			Logger:       logger,
