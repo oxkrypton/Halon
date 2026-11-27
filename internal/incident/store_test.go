@@ -3,6 +3,7 @@ package incident_test
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
 	"time"
 
@@ -29,17 +30,21 @@ func newMockStore(t *testing.T) (*incident.Store, sqlmock.Sqlmock) {
 	return incident.NewStore(gormDB), mock
 }
 
-func testEvent() incident.TimeoutEvent {
-	return incident.TimeoutEvent{
-		EventID:    "evt-1",
-		RequestID:  "req-1",
-		OccurredAt: time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC),
-		Method:     "GET",
-		Path:       "/api/v1/users/42",
-		Route:      "/api/v1/users/:id",
-		ClientIP:   "10.0.0.8",
-		StatusCode: 504,
-		LatencyMS:  3001.5,
+func testEvent() incident.Event {
+	return incident.Event{
+		EventID:     "evt-1",
+		Type:        incident.TypeUpstreamTimeout,
+		ScopeKey:    "/api/v1/users/:id",
+		RequestID:   "req-1",
+		OccurredAt:  time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC),
+		Method:      "GET",
+		Path:        "/api/v1/users/42",
+		Route:       "/api/v1/users/:id",
+		ClientIP:    "10.0.0.8",
+		StatusCode:  504,
+		LatencyMS:   3001.5,
+		Summary:     "upstream timeout on /api/v1/users/:id",
+		Occurrences: 1,
 	}
 }
 
@@ -98,7 +103,7 @@ func TestSaveResultUpdatesClaimedReport(t *testing.T) {
 	report.Status = incident.StatusCompleted
 	report.FinalMessage = "# 事件摘要\n……"
 	report.Steps = 3
-	report.Executions = incident.JSONB(`[{"name":"k8s_list_pods"}]`)
+	report.Executions = incident.JSONB(`[{"name":"read_k8s"}]`)
 	if err := store.SaveResult(context.Background(), report); err != nil {
 		t.Fatalf("save result: %v", err)
 	}
@@ -132,11 +137,11 @@ func TestLoadUnfinishedReturnsOrphans(t *testing.T) {
 
 	store, mock := newMockStore(t)
 	rows := sqlmock.NewRows([]string{
-		"event_id", "request_id", "occurred_at", "method", "path", "route",
+		"event_id", "event_type", "scope_key", "request_id", "occurred_at", "method", "path", "route",
 		"client_ip", "status_code", "latency_ms", "status",
 	}).
-		AddRow("evt-old", "req-1", time.Date(2026, 11, 16, 10, 0, 0, 0, time.UTC), "GET", "/a", "/a", "10.0.0.1", 504, 3000.0, "queued").
-		AddRow("evt-new", "req-2", time.Date(2026, 11, 16, 11, 0, 0, 0, time.UTC), "POST", "/b", "/b", "10.0.0.2", 504, 3100.5, "processing")
+		AddRow("evt-old", "upstream_timeout", "/a", "req-1", time.Date(2026, 11, 16, 10, 0, 0, 0, time.UTC), "GET", "/a", "/a", "10.0.0.1", 504, 3000.0, "queued").
+		AddRow("evt-new", "breaker_open", "/b", "", time.Date(2026, 11, 16, 11, 0, 0, 0, time.UTC), "", "", "/b", "", 0, 0.0, "processing")
 	mock.ExpectQuery(`SELECT \* FROM "incident_reports" WHERE status IN \(\$1,\$2\) ORDER BY occurred_at ASC`).
 		WithArgs("queued", "processing").
 		WillReturnRows(rows)
@@ -150,9 +155,8 @@ func TestLoadUnfinishedReturnsOrphans(t *testing.T) {
 	}
 
 	event := reports[1].Event()
-	if event.EventID != "evt-new" || event.RequestID != "req-2" || event.Method != "POST" ||
-		event.Path != "/b" || event.Route != "/b" || event.ClientIP != "10.0.0.2" ||
-		event.StatusCode != 504 || event.LatencyMS != 3100.5 {
+	if event.EventID != "evt-new" || event.Type != incident.TypeBreakerOpen ||
+		event.ScopeKey != "/b" || event.Route != "/b" || event.StatusCode != 0 {
 		t.Fatalf("reconstructed event lost fields: %+v", event)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -193,13 +197,64 @@ func TestMarkFailedClosesUnfinishedRow(t *testing.T) {
 	}
 }
 
-func TestReportEventRoundTrip(t *testing.T) {
+func TestReportEventRoundTripAndValidation(t *testing.T) {
 	t.Parallel()
 
 	want := testEvent()
+	want.Occurrences = 7
+	want.Details = map[string]any{"attempt": float64(3), "reason": "dial timeout"}
 	got := incident.NewReport(want).Event()
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("report -> event round trip mismatch:\n got %+v\nwant %+v", got, want)
+	}
+
+	nonHTTP := incident.Event{
+		EventID:     "evt-breaker",
+		Type:        incident.TypeBreakerOpen,
+		ScopeKey:    "/api/v1/orders/",
+		OccurredAt:  time.Date(2026, 11, 16, 12, 5, 0, 0, time.UTC),
+		Route:       "/api/v1/orders/",
+		Summary:     "circuit breaker opened for /api/v1/orders/",
+		Occurrences: 2,
+		Details:     map[string]any{"threshold": float64(5)},
+	}
+	if err := nonHTTP.Validate(); err != nil {
+		t.Fatalf("non-HTTP event Validate(): %v", err)
+	}
+	if roundTrip := incident.NewReport(nonHTTP).Event(); !reflect.DeepEqual(roundTrip, nonHTTP) {
+		t.Fatalf("non-HTTP round trip mismatch:\n got %+v\nwant %+v", roundTrip, nonHTTP)
+	}
+
+	custom := incident.Event{
+		EventID:  "evt-custom",
+		Type:     "custom_probe_failed",
+		ScopeKey: "health-check-1",
+	}
+	if err := custom.Validate(); err != nil {
+		t.Fatalf("custom event type should be accepted cleanly: %v", err)
+	}
+
+	zeroOccurrences := testEvent()
+	zeroOccurrences.Occurrences = 0
+	if report := incident.NewReport(zeroOccurrences); report.Occurrences != 1 {
+		t.Fatalf("NewReport defaulted occurrences = %d, want 1", report.Occurrences)
+	}
+
+	badCases := []func(e *incident.Event){
+		func(e *incident.Event) { e.EventID = "" },
+		func(e *incident.Event) { e.Type = "Bad Type!" },
+		func(e *incident.Event) { e.ScopeKey = ""; e.Route = ""; e.ClientIP = "" },
+		func(e *incident.Event) { e.StatusCode = 999 },
+		func(e *incident.Event) { e.LatencyMS = -1 },
+		func(e *incident.Event) { e.Occurrences = -1 },
+		func(e *incident.Event) { e.WindowSeconds = -5 },
+	}
+	for i, mutate := range badCases {
+		bad := testEvent()
+		mutate(&bad)
+		if err := bad.Validate(); err == nil {
+			t.Fatalf("case %d: Validate() must reject invalid event", i)
+		}
 	}
 }
 
@@ -220,7 +275,7 @@ func TestGetReturnsNotFound(t *testing.T) {
 	}
 }
 
-func TestListClampsLimit(t *testing.T) {
+func TestListClampsLimitAndFiltersType(t *testing.T) {
 	t.Parallel()
 
 	store, mock := newMockStore(t)
@@ -228,12 +283,20 @@ func TestListClampsLimit(t *testing.T) {
 		WithArgs(50).
 		WillReturnRows(sqlmock.NewRows([]string{"event_id"}))
 
-	reports, err := store.List(context.Background(), 9999)
+	reports, err := store.List(context.Background(), "", 9999)
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
 	if len(reports) != 0 {
 		t.Fatalf("list returned %d reports, want 0", len(reports))
+	}
+
+	mock.ExpectQuery(`SELECT \* FROM "incident_reports" WHERE event_type = \$1 ORDER BY occurred_at DESC LIMIT \$2`).
+		WithArgs("upstream_error", 10).
+		WillReturnRows(sqlmock.NewRows([]string{"event_id"}))
+
+	if _, err := store.List(context.Background(), incident.TypeUpstreamError, 10); err != nil {
+		t.Fatalf("list filtered: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)

@@ -109,7 +109,7 @@ func (s *Store) SQLDB() (*sql.DB, error) {
 // Claim inserts a queued report for the event. It reports false when a
 // report with the same event ID already exists, which makes the ingest
 // path idempotent for retried webhook deliveries.
-func (s *Store) Claim(ctx context.Context, event TimeoutEvent) (bool, error) {
+func (s *Store) Claim(ctx context.Context, event Event) (bool, error) {
 	report := NewReport(event)
 	result := s.db.WithContext(ctx).
 		Clauses(clause.OnConflict{DoNothing: true}).
@@ -211,16 +211,18 @@ func (s *Store) Get(ctx context.Context, eventID string) (*Report, error) {
 	return &report, nil
 }
 
-// List returns the most recent reports ordered by occurrence time.
-func (s *Store) List(ctx context.Context, limit int) ([]Report, error) {
+// List returns the most recent reports ordered by occurrence time, optionally
+// filtered by event type.
+func (s *Store) List(ctx context.Context, eventType EventType, limit int) ([]Report, error) {
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
 	reports := make([]Report, 0, limit)
-	result := s.db.WithContext(ctx).
-		Order("occurred_at DESC").
-		Limit(limit).
-		Find(&reports)
+	query := s.db.WithContext(ctx).Order("occurred_at DESC").Limit(limit)
+	if eventType != "" {
+		query = query.Where("event_type = ?", eventType)
+	}
+	result := query.Find(&reports)
 	if result.Error != nil {
 		return nil, fmt.Errorf("list incident reports: %w", result.Error)
 	}
