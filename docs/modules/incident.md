@@ -1,33 +1,46 @@
-# 模块:超时事件与故障报告(incident)
+# 模块:异常事件与故障报告(incident)
 
-代码:`internal/incident/`。使用方:网关(产生 `TimeoutEvent`)、Agent 服务(去重、报告持久化)。
+代码:`internal/incident/`。使用方:网关(产生与归一化 `Event`)、Agent 服务(去重、Session 启动恢复与报告持久化)。
 
 ## 职责
 
-1. 定义网关与 Agent 服务之间的事件协议(`TimeoutEvent`);
+1. 定义网关与 Agent 服务之间的通用事件协议(`Event` / `EventType`);
 2. 提供内存 TTL 事件去重器(`Deduper`);
 3. 定义并持久化故障排查报告(`Report` / `Store`)。
 
 ## 组件
 
-### TimeoutEvent(`timeout.go`)
+### Event 与 EventType(`event.go`)
 
-网关 504 超时事件的载荷,字段:EventID、RequestID、OccurredAt、Method、Path、Route、ClientIP、StatusCode、LatencyMS。`Validate()` 聚合所有校验错误一次返回。**网关(发送方)与 Agent 服务(接收方)共用这一个结构体,改字段两边同时改。**
+通用的网关异常事件协议,支持平滑接入新的触发源:
+
+- **内置 `EventType`**:
+  - `upstream_timeout`(504 上游超时)
+  - `upstream_error`(502 上游连接/传输故障)
+  - `breaker_open`(熔断器开启)
+  - `upstream_5xx`(上游直接返回的 5xx 突增)
+  - `concurrency_limit`(429 每路由并发舱壁打满)
+  - `rate_limit_abuse`(429 单 IP 高频限流触发)
+- **开放扩展格式**:`IsValidEventType` 校验小写规范标识(`^[a-z][a-z0-9_-]{0,63}$`),后续新事件类型可直接接入而无需修改协议白名单。
+- **核心识别与归并字段**:`EventID`、`Type`、`ScopeKey`(故障作用域键,例如路由前缀或客户端 IP;缺省按 `Route` → `ClientIP` 回退)、`OccurredAt`、`Summary`、`Occurrences`、`WindowSeconds`、`SamplePaths`、`SampleClientIPs`、`Details`(`map[string]any`,承载各类事件专属扩展诊断字段)。
+- **可选 HTTP 请求上下文**:`RequestID`、`Method`、`Path`、`Route`、`ClientIP`、`StatusCode`(`0` 或合法 HTTP 状态码)、`LatencyMS`,从而原生兼容诸如 `breaker_open` 的非单请求控制面事件。
+
+`Validate()` 聚合所有校验错误一次返回。**网关(发送方)与 Agent 服务(接收方)共用这一个结构体,改字段两边同时改。**
 
 ### Deduper(`dedup.go`)
 
 - `Seen(eventID)`:TTL 窗口内重复返回 true;新 ID 记录并惰性驱逐过期项;空 ID 永远不算重复也不记录;
 - TTL 默认 10 分钟(由 Agent 配置 `AGENT_DEDUP_TTL` 决定);
 - 并发安全;驱逐在 size 达到 2 的幂时摊还触发,插入均摊 O(1);
-- **内存态,进程重启即失效**——去重的正确性不依赖它:由数据库唯一约束保证(见下),`Deduper` 只是省一次 DB 往返的快路径,多副本下同样成立。
+- **内存态,进程重启即失效**——去重的正确性不依赖它:由数据库唯一约束保证(见下),`Deduper` 只是省一次 DB 往返的快路径。
 
 ### Report 与状态机(`report.go`)
 
 状态:`queued → processing → completed / failed`。
 
-`Report` 完整记录一次排查:事件字段 + `Status` + `FinalMessage`(中文 Markdown 报告)+ `Steps` + `Executions`(JSONB,工具调用轨迹)+ Token 用量 + `Error` + 起止时间。`JSONB` 类型入库前校验 JSON 合法性。`Report.Event()` 从行字段重建原始 `TimeoutEvent`。
+`Report` 完整记录一次排查:事件字段(`EventType`、`ScopeKey`、`Summary`、`Details` JSONB、请求上下文与 `Occurrences` 归并次数,默认 1)+ `Status` + `FinalMessage`(中文 Markdown 报告)+ `Steps` + `Executions`(JSONB,工具调用轨迹)+ Token 用量 + `Error` + 起止时间。`JSONB` 类型入库前校验 JSON 合法性。`Report.Event()` 从行字段重建原始 `Event`。
 
-进程在 queued/processing 之间崩溃会让行保持未完成状态(唯一约束同时阻止了重投递再认领),多副本下需租约机制才能安全接管回收。
+单实例 Agent 在 `queued`/`processing` 期间崩溃或重启时,启动流程调用 `Store.LoadUnfinished` 自动回收孤儿行:其中 `processing` 行直接标记为 `failed`(避免重复施加重试/变更),`queued` 行在 `AGENT_RECOVERY_MAX_AGE` 内重新入队。
 
 ### Store(`store.go`)
 
@@ -35,24 +48,25 @@
 | --- | --- |
 | `OpenStore(ctx, dsn)` | 独立连接池(10 开 / 3 闲),启动时 Ping |
 | `Migrate()` | iofs 嵌入式迁移,**版本表 `incident_schema_migrations`**(与 trafficlog 隔离,允许同库共存) |
-| `Claim(ctx, event)` | 插入 queued 行,`ON CONFLICT DO NOTHING`;返回 false 表示该事件已被认领——这是幂等投递的表决层:多副本下同一事件只有一个 `INSERT` 成功,编排器队列归属由此唯一确定 |
+| `Claim(ctx, event)` | 插入 queued 行,`ON CONFLICT DO NOTHING`;返回 false 表示该事件已被认领——幂等投递的表决层 |
 | `MarkProcessing(ctx, eventID, at)` | 仅从 queued 转为 processing(条件更新,不覆盖其他字段) |
-| `LoadUnfinished(ctx)` | 返回全部 queued/processing 行(按发生时间升序),供后续租约恢复使用 |
-| `MarkFailed(ctx, eventID, cause, at)` | 条件更新把未完成行收尾为 `failed`(不影响已完成行,0 行命中不算错误);供启动恢复标记超龄事件 |
+| `LoadUnfinished(ctx)` | 返回全部 queued/processing 行(按发生时间升序),供单实例 Agent 启动恢复 |
+| `MarkFailed(ctx, eventID, cause, at)` | 条件更新把未完成行收尾为 `failed`(不影响已完成行,0 行命中不算错误);供启动恢复、队列满或主动取消收尾 |
 | `SaveResult(ctx, report)` | 覆盖写入排查结果;事件不存在返回 `ErrNotFound` |
-| `Get` / `List` | 单查 / 按发生时间倒序列表(limit 钳制到 1..200,默认 50) |
+| `Get` / `List` | 单查 / 按发生时间倒序列表(支持按 `eventType` 可选过滤,limit 钳制到 1..200,默认 50) |
 
-### 表结构(迁移 `migrations/000001_create_incident_reports.sql`)
+### 表结构(迁移 `migrations/`)
 
-`incident_reports`:主键 `event_id`;`status` 有 CHECK 约束(四种状态);Token 与 steps 非负;`executions JSONB` 可空;`started_at`/`finished_at` 可空;索引 `(occurred_at DESC)`、`(status, occurred_at DESC)`。
+- `000001_create_incident_reports`:主键 `event_id`;`status` 有 CHECK 约束(四种状态);Token 与 steps 非负;`executions JSONB` 可空;`started_at`/`finished_at` 可空;索引 `(occurred_at DESC)`、`(status, occurred_at DESC)`。
+- `000002_generalize_incidents`:新增 `event_type`、`scope_key`、`summary`、`details JSONB` 与 `occurrences INTEGER NOT NULL DEFAULT 1 CHECK (occurrences >= 1)`,放宽 HTTP 请求列默认值并允许 `status_code = 0`,新增索引 `(event_type, occurred_at DESC)`。
 
 ## 测试
 
-`dedup_test.go`(注入时钟,确定性)、`store_test.go`(sqlmock;注意 GORM `Take` 自动追加 `LIMIT $n` 参数)。
+`dedup_test.go`(注入时钟,确定性)、`store_test.go`(sqlmock;注意 GORM `Take` 自动追加 `LIMIT $n` 参数,以及 `Report.Event()` 对 HTTP 与非 HTTP 事件的往返、类型过滤与参数校验)。
 
 ## 修改本模块时必须同步检查
 
-- [gateway.md](gateway.md) 与 [agent.md](agent.md):`TimeoutEvent` 是两者的协议契约;
+- [gateway.md](gateway.md) 与 [agent.md](agent.md):`Event` 是两者的协议契约;
 - [agent-tools.md](agent-tools.md):无直接依赖,但若改了表名需全局排查;
 - 根 `README.md`:架构图(表清单)与 Agent 功能列表;
 - `docs/deployment.md`:若改了迁移策略。

@@ -33,5 +33,5 @@ Agent 服务的 `incident_reports` 表与 `base_logs` 同库,但迁移走独立�
 ## 修改本模块时必须同步检查
 
 - 根 `README.md`:「PostgreSQL 日志存储」功能列表、网关配置表(队列/批量参数);
-- [agent-tools.md](agent-tools.md):`query_error_logs` / `query_traffic_stats` / `query_top_ips` 直接依赖这里的表结构——**改表结构必须同步改工具 SQL**;
+- [agent-tools.md](agent-tools.md):`read_observability`(`error_logs` / `traffic_stats` / `top_ips`)直接依赖这里的表结构——**改表结构必须同步改工具 SQL**;
 - [gateway.md](gateway.md):若改了 `Entry` 结构或写入条件。

@@ -21,7 +21,7 @@ Google Cloud Console / Cloud Trace 风格的轻量级管理控制台，将 P50/P
 | 路由与 P99 分析 | `/routes` | 按路由前缀或精确路径聚合 Avg / P50 / P95 / P99 / Max 与 5xx 率，点击行下钻时序图与样本请求 |
 | 请求与错误日志 | `/logs` | 多条件筛选（route/path/request_id/trace_id/client_ip/状态码/最小耗时）与分页，点击行查看美化后的 Request/Response Body 并支持跳转 Trace |
 | 容器日志 | `/pod-logs` | 查询 Agent `GET /api/v1/k8s/pods*`，支持命名空间与 Halon 组件筛选、Pod/容器切换、尾部行数与时间窗口、上次崩溃实例 (`previous`) 与关键字高亮过滤 |
-| AI 故障报告 | `/incidents` | 查询 Agent `GET /api/v1/incidents*`，渲染中文 Markdown 报告与工具调用轨迹时间线，支持联动关联日志与 Trace |
+| AI 故障报告 | `/incidents` | 查询 Agent `GET /api/v1/incidents*`，支持按事件类型筛选、展示事件类型与归并次数、渲染中文 Markdown 报告与工具调用轨迹时间线，HTTP 请求型事件支持联动关联日志与 Trace |
 | 网关管控 | `/gateway` | 路由与每副本熔断器状态、Top IP 榜与 Redis 共享黑名单管理（`operator+`，显示 `<=10s` 传播窗口提示）、Redis Lua 全局限流配置（`full`） |
 | 用户与权限 | `/users` | `full` 角色在 `AUTH_LOGIN_ENABLED=true` 下管理本地账号、角色与临时密码重置 |
 

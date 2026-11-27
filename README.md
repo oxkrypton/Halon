@@ -6,8 +6,8 @@
 
 Halon 是一个**开源的云原生网关 Agent 项目**:一个通用 HTTP 网关 + 一个由大模型驱动的故障排查 Agent,两者彼此独立、通过契约通信,可部署到**任意 Kubernetes 集群**(Minikube、Kind、ACK、EKS 等)。
 
-- **网关(gateway)**:通用反向代理,按 `ROUTES` 环境变量把路径前缀转发到任意上游 HTTP 服务;自带 IP 黑名单、按 IP 限流、流量日志落库、上游超时事件上报。**不感知任何具体业务服务。**
-- **Agent 服务(agent)**:接收网关超时事件,调用 OpenAI 兼容大模型,借助日志/PromQL/K8s 只读工具取证,按权限级别执行 Pod 重启、扩容、IP 封禁等变更,产出中文 Markdown 排查报告并持久化。
+- **网关(gateway)**:通用反向代理,按 `ROUTES` 环境变量把路径前缀转发到任意上游 HTTP 服务;自带 IP 黑名单、按 IP 限流、流量日志落库、六类网关异常识别与阈值归并上报。**不感知任何具体业务服务。**
+- **Agent 服务(agent)**:接收网关归一化异常事件,按事件类型与范围匹配排查画像并调用 OpenAI 兼容大模型,借助日志/PromQL/网关状态/K8s 只读工具取证,按权限级别执行 Pod 重启、扩容、IP 封禁等变更,产出中文 Markdown 排查报告并持久化。
 
 `examples/user-service` 与 `examples/order-service` 是演示用后端(带故障注入),**不属于产品本体**,仅用于本地开发与故障演练。
 
@@ -36,12 +36,12 @@ Gin Gateway -- /metrics + OTLP traces --> 可选观测栈
 
 Gateway Admin (:9090) -- Bearer Token --> blacklist / rate-limit / breakers
 
-Gin Gateway -- 504 webhook --> Agent Service (:8081)
-                                   |-- 事件去重(TTL + ON CONFLICT)
-                                   |-- 编排器队列 --> LLM 排查循环
-                                   |-- 只读工具:日志 / PromQL / Pod / 事件
-                                   |-- 操作工具(按级别开放):重启 / 扩容 / 封禁
-                                   +-- 故障报告持久化 --> incident_reports
+Gin Gateway -- 异常阈值归一化 webhook --> Agent Service (:8081, 单实例)
+                                          |-- 事件去重(TTL + ON CONFLICT)
+                                          |-- Session 编排器(排队/取消/启动恢复)
+                                          |-- 只读工具:日志 / PromQL / 网关状态 / Pod / 事件
+                                          |-- 操作工具(按级别开放):重启 / 扩容 / 封禁
+                                          +-- 故障报告持久化 --> incident_reports
 ```
 
 ## 已完成功能
@@ -50,10 +50,10 @@ Gin Gateway -- 504 webhook --> Agent Service (:8081)
 
 - `ROUTES` 环境变量声明路由表(`前缀=上游地址`,逗号分隔,最长前缀优先),上游可以是集群内任意 HTTP 服务。
 - 上游弹性策略(基于 [failsafe-go](https://github.com/failsafe-go/failsafe-go)):拨号/TLS/响应头分阶段超时、幂等请求的有预算重试(默认关)、每路由熔断(503 + `Retry-After` 快速失败)、每路由并发上限(429 快速失败)、请求体大小上限。
-- 上游响应原样透传;上游超时返回 504 `UPSTREAM_TIMEOUT` 并触发故障事件;连接失败返回 502 `UPSTREAM_ERROR`;熔断开启返回 503 `UPSTREAM_UNAVAILABLE`。
+- 上游响应原样透传;识别 6 类网关异常(`upstream_timeout` 504、`upstream_error` 502、`breaker_open` 熔断跳闸、`upstream_5xx` 上游 5xx 突增、`concurrency_limit` 429 并发打满、`rate_limit_abuse` 429 单 IP 限流异常),按类型可配置开启与阈值条件上报。
 - 统一 JSON 错误响应和 `X-Request-ID` 请求追踪(自动透传到上游)。
-- 基于 Redis 的 IP 黑名单(进程内缓存 + pub/sub 失效与 TTL 兜底)及按客户端 IP 的 Redis Lua 令牌桶限流。
-- 独立管理端口 `:9090`,支持动态更新黑名单和限流参数、查询各路由熔断状态,暴露 Prometheus 指标(全指标清单见 [docs/modules/gateway.md](docs/modules/gateway.md))。
+- 基于 Redis 的 IP 黑名单(进程内缓存 + pub/sub 失效与 TTL 兜底)、按客户端 IP 的 Redis Lua 令牌桶限流,以及跨副本按 `(event_type, scope_key)` 异常归一化、突增阈值判定与发件冷却(`INCIDENT_SETTLE_DELAY` 默认 `15s` 聚集、`INCIDENT_COALESCE_COOLDOWN` 默认 `5m` 冷却、`INCIDENT_RETRY_BACKOFF` 默认 `1m` 退避)。
+- 独立管理端口 `:9090`,支持动态更新黑名单和限流参数、查询各路由熔断状态与只读 Redis 运行态(`/admin/state/*`),暴露 Prometheus 指标(全指标清单见 [docs/modules/gateway.md](docs/modules/gateway.md))。
 - 可选 OpenTelemetry 追踪(`OTEL_ENABLED`):自动注入/透传 W3C `traceparent`,上游零改动;`trace_id`、`route`、`upstream_latency_ms` 写入 PostgreSQL `base_logs` 并打印到结构化日志。配套可选观测栈见 `deploy/kubernetes/observability/`。
 - 可选 Web 管理控制台(`web/`):Google Cloud Console 风格 React 前端,内置 P50/P95/P99 分位数与运行态保护/队列健康看板、类 Jaeger 链路追踪瀑布流(支持 Tempo 或 PG 降级)、请求/错误日志、基于 K8s API 的实时容器日志、Agent AI 故障报告与熔断/黑名单/限流/用户管控,详见 [docs/modules/web.md](docs/modules/web.md)。
 - `/healthz` 存活检查和 `/readyz` 数据库就绪检查。
@@ -70,12 +70,12 @@ Gin Gateway -- 504 webhook --> Agent Service (:8081)
 
 ### Agent 故障排查服务
 
-- `POST /api/v1/incidents/timeout` 接收网关 504 webhook,Bearer 鉴权 + 事件体严格校验。
-- 事件去重与风暴抑制:内存 TTL 去重器 + `ON CONFLICT DO NOTHING` 保证事件幂等;按路由抑制窗口(`INCIDENT_COALESCE_COOLDOWN`,基于 Redis)防止同一路由超时风暴重复触发排查,配合 `INCIDENT_SETTLE_DELAY`(默认 `15s`)等待日志与 Prometheus 指标落齐后再启动 LLM。
-- 有界队列 + 可配置 worker 数的编排器,每次排查有独立超时,支持 readonly/operator/full 三级操作权限。
-- 只读工具:PostgreSQL 错误日志、流量统计、Top IP,Prometheus PromQL 即时查询,Pod/日志/事件/Deployment 状态。
+- `POST /api/v1/incidents` 接收网关归一化后的通用异常事件 webhook(同时兼容 `POST /api/v1/incidents/timeout`),Bearer 鉴权 + 事件体严格校验。
+- 事件去重与 Session 编排:内存 TTL 去重器 + `ON CONFLICT DO NOTHING` 保证事件幂等;单实例服务每次受理启动独立排查 Session(`GET /api/v1/sessions` 可查、`POST /api/v1/sessions/:event_id/cancel` 可取消),按 `(event_type, scope_key)` 对并发请求防重,重启时自动回收未完成行(`queued` 重排或过期收尾、`processing` 标记失败)。
+- 有界队列 + 可配置 worker 数的编排器,每次排查有独立超时与可取消上下文,支持 readonly/operator/full 三级操作权限。
+- 只读工具:支持按域组合查询的三大只读工具——`read_observability`(PostgreSQL 错误日志/流量统计/Top IP 与条件开放的 Prometheus PromQL 即时查询)、`read_gateway`(网关 Redis/黑名单/限流/熔断/活跃异常窗口状态,在配置管理地址与凭据后注册)、`read_k8s`(Pod/日志/事件/Deployment 状态)。
 - 操作工具(operator):Pod 重启、Deployment 扩容(上限保护)、网关 IP 封禁;full 级别额外支持更新容器镜像。
-- 命名空间白名单与资源级操作冷却(基于 Redis `SET NX PX` 互斥),SQL 全部参数化,工具参数严格校验。
+- 命名空间白名单、进程内资源级串行锁(`ResourceLocker`)与冷却(`MemoryCooldownStore`),SQL 全部参数化,工具参数严格校验。
 - 排查结果(中文 Markdown 报告、工具调用轨迹、Token 用量)持久化到 `incident_reports` 表,可随时通过 API 查询。
 
 ## 环境要求
@@ -130,11 +130,10 @@ curl -i http://localhost:8080/api/v1/users/404
 curl -i http://localhost:8080/readyz
 ```
 
-如需本地验证 Agent 排查闭环,再开一个终端启动 Agent 服务(网关配置 `AGENT_WEBHOOK_URL=http://localhost:8081/api/v1/incidents/timeout` 和相同的 Token 后重启):
+如需本地验证 Agent 排查闭环,再开一个终端启动 Agent 服务(网关配置 `AGENT_WEBHOOK_URL=http://localhost:8081/api/v1/incidents` 和相同的 Token 后重启):
 
 ```bash
 DATABASE_DSN='postgres://halon:halon-local-password@localhost:5432/halon?sslmode=disable' \
-REDIS_URL='redis://localhost:6379/0' \
 INGEST_TOKEN='halon-local-ingest-token' \
 OPENAI_API_KEY='<你的 OpenAI 兼容 API Key>' \
 OPENAI_MODEL='gpt-4o-mini' \
@@ -163,6 +162,9 @@ curl -s http://localhost:8081/api/v1/incidents -H 'Authorization: Bearer halon-l
 | `GET /admin/rules/rate-limit` | `gateway:rules:read` | 查询限流参数 |
 | `PUT /admin/rules/rate-limit` | `gateway:ratelimit:write` | 更新限流参数 |
 | `GET /admin/breakers` | `gateway:breaker:read` | 查询各路由熔断器状态 |
+| `GET /admin/state/gateway` | `gateway:rules:read` | 只读查询网关 Redis 健康、黑名单列表、全局限流与各路由熔断状态 |
+| `GET /admin/state/rate-limit/:ip` | `gateway:rules:read` | 只读查询指定 IP 黑名单命中与 Redis 令牌桶余量(不扣令牌) |
+| `GET /admin/state/incident-windows` | `gateway:observability:read` | 只读查询异常归一化窗口(支持 `?type=` / `?scope=`)计数、样本路径/IP 与冷却剩余 TTL |
 | `GET /admin/system` | `gateway:observability:read` | 查询当前登录主体、路由表、能力开关与 Redis 状态 |
 | `GET /admin/observability/{overview,timeseries,routes,logs,logs/:id,top-ips}` | `gateway:observability:read` | 查询 PostgreSQL 精确 P50/P95/P99、时序、路由排行、请求报文与 Top IP |
 | `GET /admin/traces` / `GET /admin/traces/:trace_id` | `gateway:observability:read` | 查询分布式链路列表与 Span 瀑布流(支持 Tempo 优先与 PostgreSQL 降级) |
@@ -206,13 +208,16 @@ curl -X PUT http://localhost:9090/admin/rules/rate-limit \
 
 | 接口 | 凭据 | 说明 |
 | --- | --- | --- |
-| `POST /api/v1/incidents/timeout` | `INGEST_TOKEN` | 接收超时事件并排队排查;重复事件返回 `duplicate: true`,同路由冷却期内返回 `suppressed: true` |
-| `GET /api/v1/incidents` | `incident:read` | 列出最近的故障报告,`limit` 参数最大 200 |
+| `POST /api/v1/incidents` | `INGEST_TOKEN` | 接收通用异常事件(`incident.Event`)并排队排查;重复事件返回 `duplicate: true`,同 `(event_type, scope_key)` 存在活跃 Session 时返回 `suppressed: true` |
+| `POST /api/v1/incidents/timeout` | `INGEST_TOKEN` | 兼容入口,缺省 `type` 自动补为 `upstream_timeout` |
+| `GET /api/v1/incidents` | `incident:read` | 列出最近的故障报告,支持 `?type=` 按事件类型过滤,`limit` 参数最大 200 |
 | `GET /api/v1/incidents/:event_id` | `incident:read` | 查询单个事件的排查报告与工具调用轨迹 |
+| `GET /api/v1/sessions` | `incident:read` | 列出当前排队、运行或取消中的活跃排查 Session 快照 |
+| `POST /api/v1/sessions/:event_id/cancel` | `incident:manage` | 手动取消活跃排查 Session |
 | `GET /api/v1/k8s/pods` | `k8s:pod_logs:read` | 列出白名单命名空间下的 Pod 状态、Ready 与重启次数(`namespace`/`label_selector`/`limit`) |
 | `GET /api/v1/k8s/pods/:pod/logs` | `k8s:pod_logs:read` | 读取 Pod 容器有界日志(`namespace`/`container`/`tail_lines`/`since_seconds`/`previous`,单次上限 1 MiB) |
 | `GET /healthz` / `GET /readyz` | — | 存活检查 / PostgreSQL 就绪检查 |
-| `GET /metrics` | — | Prometheus 指标(`halon_agent_redis_up`、`halon_agent_incident_admissions_total`,无需鉴权) |
+| `GET /metrics` | — | Prometheus 指标(`halon_agent_active_sessions`、`halon_agent_incident_admissions_total`,无需鉴权) |
 
 `legacy`/`hybrid` 下 `INGEST_TOKEN` 也可读报告(兼容),`jwt` 下读接口只接受 `aud=halon-agent` 的 JWT。
 
@@ -348,9 +353,18 @@ kubectl rollout restart deployment/agent
 | `OTEL_TRACES_SAMPLER_RATIO` | `1.0` | 采样比例(0–1,父 span 优先) |
 | `TEMPO_URL` | 空 | 可选 Tempo HTTP 查询地址(如 `http://tempo.observability.svc.cluster.local:3200`) |
 | `TEMPO_TIMEOUT` | `5s` | Tempo 查询 HTTP 超时 |
-| `AGENT_WEBHOOK_URL` | 空 | Agent 超时事件接收地址,为空则不推送 |
+| `AGENT_WEBHOOK_URL` | 空 | Agent 异常事件接收地址,为空则不推送 |
 | `AGENT_WEBHOOK_TOKEN` | 空 | Agent 接收接口 Bearer Token,配置 URL 后必填 |
-| `REDIS_URL` | 必填 | Redis 连接串(如 `redis://redis:6379/0`),承载黑名单与限流状态 |
+| `INCIDENT_QUEUE_SIZE` | `128` | 有界异常事件队列容量(兼容读取 `TIMEOUT_QUEUE_SIZE`) |
+| `INCIDENT_ENABLED_TYPES` | 全部 6 类内置类型 | 逗号分隔的启用异常类型(或 `none` 全部关闭) |
+| `INCIDENT_SETTLE_DELAY` | `15s` | 即开型事件首次开窗后的聚集等待时长(`0` 表示立即投递);突增型聚集取 `min(10s, INCIDENT_SETTLE_DELAY)` |
+| `INCIDENT_BREAKER_SETTLE_DELAY` | `5s` | `breaker_open` 开窗后的聚集等待时长 |
+| `INCIDENT_COALESCE_COOLDOWN` | `5m` | 常规异常成功投递后的归一化冷却期,`0` 表示关闭冷却 |
+| `INCIDENT_RETRY_BACKOFF` | `1m` | webhook 投递失败后的短退避(默认上限为 cooldown,不可超过 cooldown) |
+| `INCIDENT_5XX_THRESHOLD` / `INCIDENT_5XX_WINDOW` | `10` / `30s` | `upstream_5xx` 在检测窗口内达标触发排查的累计阈值与窗口长度 |
+| `INCIDENT_CONCURRENCY_THRESHOLD` / `INCIDENT_CONCURRENCY_WINDOW` | `10` / `30s` | `concurrency_limit` 突增触发的阈值与检测窗口 |
+| `INCIDENT_RATELIMIT_THRESHOLD` / `INCIDENT_RATELIMIT_WINDOW` / `INCIDENT_RATELIMIT_COOLDOWN` | `50` / `60s` / `10m` | `rate_limit_abuse`(按客户端 IP 归并)的触发阈值、检测窗口与冷却期 |
+| `REDIS_URL` | 必填 | Redis 连接串(如 `redis://redis:6379/0`),承载黑名单、限流与异常归一化状态 |
 | `BLACKLIST_CACHE_TTL` | `10s` | 黑名单进程内缓存的兜底刷新间隔 |
 | `REDIS_DIAL_TIMEOUT` | `1s` | Redis 拨号超时 |
 | `REDIS_OP_TIMEOUT` | `500ms` | Redis 单次操作超时(同时作为读写 socket 超时) |
@@ -375,20 +389,16 @@ kubectl rollout restart deployment/agent
 | `AGENT_MAX_STORED_TOOL_OUTPUT` | `262144`(256 KiB) | 工具输出落库(`incident_reports.executions`)的上限(字节),超出部分截断并置 `output_truncated` |
 | `AGENT_WORKERS` / `AGENT_QUEUE_SIZE` | `2` / `64` | 排查 worker 数与事件队列容量 |
 | `AGENT_RUN_TIMEOUT` | `5m` | 单次排查的超时时间 |
+| `AGENT_RECOVERY_MAX_AGE` | `30m` | 启动恢复时允许重新排队的 `queued` 事件最大年龄,超龄直接收尾为 `failed` |
 | `AGENT_DEDUP_TTL` | `10m` | 事件去重窗口 |
-| `INCIDENT_COALESCE_COOLDOWN` | `5m` | 同一路由排查成功后的抑制静默期;设为 `0` 关闭按路由抑制 |
-| `INCIDENT_RETRY_BACKOFF` | `1m` | 同一路由排查失败或队列满后的短退避(默认上限为 cooldown,不可超过 cooldown) |
-| `INCIDENT_SETTLE_DELAY` | `15s` | 新受理事件入队前的聚集延迟(等待日志与 Prometheus 就绪);设为 `0` 立即入队 |
-| `GATEWAY_ADMIN_URL` / `GATEWAY_ADMIN_TOKEN` | 空 | 网关管理接口地址与凭据;权限不足时封禁工具不可用。`readonly` 可不配;非 `readonly` 在 `jwt` 模式下必须配 `typ=agent` 且角色与操作级别一致的 JWT(启动自检) |
-| `PROMETHEUS_URL` | 空 | Prometheus 查询地址,为空时 PromQL 工具不可用 |
-| `REDIS_URL` | 必填 | Redis 连接串(如 `redis://redis:6379/0`),承载操作冷却与按路由抑制窗口 |
-| `REDIS_DIAL_TIMEOUT` | `1s` | Redis 拨号超时 |
-| `REDIS_OP_TIMEOUT` | `500ms` | Redis 单次操作超时(同时作为读写 socket 超时) |
+| `GATEWAY_ADMIN_URL` / `GATEWAY_ADMIN_TOKEN` | 空 | 网关管理接口地址与凭据;两者均非空时才注册 `read_gateway` 与 `gateway_block_ip`。`readonly` 若无需查网关状态可不配,需查网关状态且为 `jwt` 模式时配 `role=readonly` 的 Agent JWT;非 `readonly` 在 `jwt` 模式下必须配 `typ=agent` 且角色与操作级别一致的 JWT(启动自检) |
+| `PROMETHEUS_URL` | 空 | Prometheus 查询地址,为空时 `read_observability` 不暴露 `prometheus` 子数据源 |
 | `SHUTDOWN_TIMEOUT` | `30s` | 平滑退出超时 |
 
 ## 当前边界
 
-- 网关黑名单/限流与 Agent 资源级操作冷却/按路由风暴抑制统一基于 Redis(`REDIS_URL` 必填;风暴抑制在 Redis 不可达时 fail-open,限流 fail-open,操作冷却 fail-closed,黑名单写返回 503),网关与 Agent 均支持单副本或 2+ 副本(熔断器与并发舱壁是有意的 per-replica 语义,不外迁;事件去重由数据库唯一约束表决,任意副本数安全)。崩溃副本的悬挂排查暂不自动回收(需租约机制)。Redis 部署说明见 `docs/deployment.md`。
+- 网关黑名单/限流/跨副本按 `(event_type, scope_key)` 异常归一化与突增阈值判定统一基于 Redis(`REDIS_URL` 为网关必填项;限流与异常归一化在 Redis 不可达时降级本地兜底,黑名单写返回 503),网关支持单副本或 2+ 副本(熔断器与并发舱壁是有意的 per-replica 语义,不外迁)。
+- Agent 服务为单实例控制面(`replicas: 1`、`strategy.type: Recreate`,不连接 Redis),每次受理启动独立 Session,进程内通过资源串行锁与内存冷却防止并发 Session 竞争;事件去重由数据库唯一约束表决,启动时自动回收未完成行(`queued` 重排或过期收尾、`processing` 标记失败避免重复变更)。Redis 部署说明见 `docs/deployment.md`。
 - 异步日志采用有界、尽力投递队列,数据库长期不可用或队列饱和时会丢弃日志,避免拖垮业务请求。
 - 网关与上游之间、Agent 与网关管理接口之间使用集群内明文 HTTP;跨集群或不可信网络应启用 TLS。
 - 弹性策略依赖 failsafe-go(v0.x,API 可能变动),全部封装在 `internal/gateway/resilience.go`;追踪依赖 OpenTelemetry Go SDK,默认关闭。
@@ -405,12 +415,12 @@ kubectl rollout restart deployment/agent
 │   ├── gateway/                  # 通用网关入口
 │   └── halonctl/                 # 离线密钥生成与 JWT 签发/查看 CLI
 ├── internal/
-│   ├── agent/                    # 排查循环、编排器、事件 API 和配置
-│   ├── agent/tools/              # 日志/PromQL/K8s/封禁工具及测试
-│   ├── gateway/                  # 反向代理、弹性策略(resilience.go)、OTel(tracing.go)、中间件、规则和测试
+│   ├── agent/                    # 排查循环、Session 编排器、事件 API 和配置
+│   ├── agent/tools/              # 日志/PromQL/网关状态/K8s/封禁工具及测试
+│   ├── gateway/                  # 反向代理、弹性策略(resilience.go)、OTel(tracing.go)、异常归一化、中间件、规则和测试
 │   ├── authz/                    # 角色×权限、Ed25519 JWT 验证、gin 中间件
 │   ├── identity/                 # 可选本地用户、Argon2id 密码策略、Refresh Token 轮转与清理
-│   ├── incident/                 # 超时事件、去重、报告持久化及测试
+│   ├── incident/                 # 通用异常事件、去重、报告持久化及测试
 │   └── trafficlog/               # PostgreSQL、迁移、批写器和测试
 ├── examples/
 │   ├── user-service/             # 演示后端(非产品):HTTP 服务 + 故障注入 + 部署清单

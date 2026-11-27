@@ -48,7 +48,7 @@ docs/                      # 本文档中心
 4. **并发**:跨 goroutine 传递用有界 channel;队列满时丢弃并计数告警,不阻塞调用方;共享状态用 `sync.Mutex` 保护;所有测试必须过 `-race`。
 5. **安全**:Token 用 `subtle.ConstantTimeCompare` 比较;不信任代理头(`SetTrustedProxies(nil)`);请求体读取一律 `http.MaxBytesReader` 限长;容器 `runAsNonRoot` + 只读根文件系统 + drop ALL capabilities。
 6. **优雅退出**:`signal.NotifyContext` 监听 SIGINT/SIGTERM → 停 HTTP(有超时)→ 排空队列 → 关闭数据库。
-7. **解耦**:产品组件之间只能通过契约通信(TimeoutEvent webhook、管理 HTTP API、PostgreSQL 表结构),禁止共享内部包之外的状态;网关不得出现具体业务服务名。
+7. **解耦**:产品组件之间只能通过契约通信(`incident.Event` webhook、管理 HTTP API、PostgreSQL 表结构),禁止共享内部包之外的状态;网关不得出现具体业务服务名。
 8. **鉴权**:新增 HTTP 接口或工具必须复用 `internal/authz` 的 `Permission` 常量,网关侧挂 `Require`,Agent 工具侧写 `Tool.Permission`;角色映射只在代码中维护,签发工具为 `cmd/halonctl`,详见 [modules/auth.md](modules/auth.md)。
 
 ## 测试约定

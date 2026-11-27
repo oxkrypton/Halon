@@ -22,8 +22,8 @@
 | --- | --- |
 | `postgres.yaml` | StatefulSet + Service + PVC,数据在 Pod 重建后保留 |
 | `redis.yaml` | 单副本 Redis 7 + Service(开启 AOF),供开发与演练使用;生产建议托管或 HA Redis |
-| `gateway.yaml` | Deployment(支持多副本)+ 两个 Service(`gateway` / `gateway-admin`),`ROUTES` 声明上游路由,推送超时事件到 `http://agent:8081/api/v1/incidents/timeout` |
-| `agent.yaml` | ServiceAccount + 命名空间级 Role/RoleBinding(最小权限)+ Deployment(支持多副本)+ Service |
+| `gateway.yaml` | Deployment(支持多副本)+ 两个 Service(`gateway` / `gateway-admin`),`ROUTES` 声明上游路由,归一化后推送异常事件到 `http://agent:8081/api/v1/incidents` |
+| `agent.yaml` | ServiceAccount + 命名空间级 Role/RoleBinding(最小权限)+ 单实例 Deployment(`replicas: 1`, `strategy.type: Recreate`)+ Service |
 
 演示清单在 `examples/user-service/deploy.yaml` 与 `examples/order-service/deploy.yaml`,需单独 `kubectl apply`。
 
@@ -58,13 +58,13 @@ kubectl port-forward service/halon-web 18090:8080
 
 ### Redis(`deploy/kubernetes/redis.yaml`)
 
-Redis 是网关黑名单、限流以及 Agent 资源冷却、风暴抑制的必备后端,已包含在 `make deploy` 主路径中。
+Redis 是网关独占的状态后端,承载黑名单、按 IP 令牌桶限流以及跨副本按 `(event_type, scope_key)` 异常归一化、突增阈值计数与发件冷却窗口,已包含在 `make deploy` 主路径中。
 
-参考清单为单副本 Redis 7 + Service,开启 `appendonly yes` / `appendfsync everysec`:Redis 是黑名单的事实源,重启不得静默清空;AOF 最坏丢失约 1s 的写入,恢复后经网关管理接口(`PUT /admin/rules/blacklist/:ip`)重放补齐即可。该清单面向开发与演练;生产请改用云厂商托管 Redis 或 Helm 的 HA(Sentinel/Cluster)部署,并把网关与 Agent 的 `REDIS_URL` 指向生产地址。多套部署不要共用同一个 Redis logical DB(用 `REDIS_URL` 的 db 编号区分)。
+参考清单为单副本 Redis 7 + Service,开启 `appendonly yes` / `appendfsync everysec`:Redis 是黑名单的事实源,重启不得静默清空;AOF 最坏丢失约 1s 的写入,恢复后经网关管理接口(`PUT /admin/rules/blacklist/:ip`)重放补齐即可。该清单面向开发与演练;生产请改用云厂商托管 Redis 或 Helm 的 HA(Sentinel/Cluster)部署,并把网关的 `REDIS_URL` 指向生产地址。多套部署不要共用同一个 Redis logical DB(用 `REDIS_URL` 的 db 编号区分)。
 
-Redis 健康不进 `/readyz`(降级策略允许网关在 Redis 不可达时继续服务,摘除 Pod 反而中断全部流量),用指标表达:网关 `halon_gateway_redis_up`、Agent `halon_agent_redis_up`,告警规则可并入观测栈。
+Redis 健康不进 `/readyz`(降级策略允许网关在 Redis 不可达时继续服务,摘除 Pod 反而中断全部流量),用指标 `halon_gateway_redis_up` 表达,告警规则可并入观测栈。
 
-多副本扩缩:网关与 Agent 的黑名单、限流、操作冷却与路由风暴抑制均由 Redis 裁决,将 `gateway.yaml` / `agent.yaml` 中的 `replicas` 调整为 `2+` 即可直接水平扩容。
+网关扩缩与 Agent 部署边界:网关的黑名单、限流与异常归一化均由 Redis 裁决,将 `gateway.yaml` 中的 `replicas` 调整为 `2+` 即可直接水平扩容。Agent 固定为单实例控制面(`replicas: 1`、`strategy.type: Recreate`,先停旧 Pod 再起新 Pod,不连接 Redis),通过调整 `AGENT_WORKERS` 控制单进程内并发 Session 数。
 
 黑名单新增/解除通过 Redis pub/sub 即时广播并以 `BLACKLIST_CACHE_TTL`(默认 10s)兜底,最坏 10s 内收敛到全部副本。需要即时生效时逐 Pod 调管理接口:
 
@@ -98,7 +98,7 @@ done
 | `admin-token` | 网关管理接口静态 Token(`full`) | gateway;`legacy`/`hybrid` 下 agent 可选(不推荐) |
 | `ingest-token` | webhook 事件接收凭据 | agent、gateway(webhook 推送) |
 | `openai-api-key` | 大模型凭据 | agent |
-| `agent-gateway-token` | 可选:`typ=agent` 的 JWT,角色须等于 Agent 操作级别 | agent(operator/full 需访问网关时) |
+| `agent-gateway-token` | 可选:`typ=agent` 的 JWT,角色须等于 Agent 操作级别 | agent(`operator`/`full` 必填;`readonly` 需调用网关只读状态工具时可选配) |
 | `jwt-private-key` | 可选:base64 Ed25519 私钥(`AUTH_LOGIN_ENABLED=true` 时必填) | gateway(本地登录签发会话 JWT) |
 | `bootstrap-admin-user` / `bootstrap-admin-password` | 可选:首次引导创建的 `full` 管理员账号与初始密码 | gateway(`AUTH_LOGIN_ENABLED=true` 首次启动时) |
 
@@ -120,7 +120,7 @@ done
 1. Docker 启动 PostgreSQL 17 与 Redis 7(命令见 README);
 2. `make run-demo`(演示后端,:8090);
 3. 带 `DATABASE_DSN`/`REDIS_URL`/`ADMIN_TOKEN`/`ROUTES` 等环境变量 `make run-gateway`;
-4. 可选:带 `DATABASE_DSN`/`REDIS_URL`/`INGEST_TOKEN`/`OPENAI_API_KEY`/`OPENAI_MODEL` 等 `make run-agent`。Agent 会回退使用 `~/.kube/config` 访问集群;本地无集群时 K8s 工具会报连接错误,其余功能不受影响(可将操作级别保持 readonly 并忽略 K8s 工具错误)。
+4. 可选:带 `DATABASE_DSN`/`INGEST_TOKEN`/`OPENAI_API_KEY`/`OPENAI_MODEL` 等 `make run-agent`。Agent 会回退使用 `~/.kube/config` 访问集群;本地无集群时 K8s 工具会报连接错误,其余功能不受影响(可将操作级别保持 readonly 并忽略 K8s 工具错误)。
 
 ## 端到端故障演练(任意集群)
 

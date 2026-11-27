@@ -15,11 +15,12 @@
 | 权限 | readonly | operator | full |
 | --- | :-: | :-: | :-: |
 | `incident:read` | ✓ | ✓ | ✓ |
+| `incident:manage`(`/api/v1/sessions/:event_id/cancel`) | | ✓ | ✓ |
 | `k8s:pod_logs:read` | ✓ | ✓ | ✓ |
 | `gateway:rules:read` / `gateway:breaker:read` | ✓ | ✓ | ✓ |
 | `gateway:metrics:read`(`/metrics` 抓取) | ✓ | ✓ | ✓ |
-| `gateway:observability:read`(`/admin/system`、`/admin/observability/*`、`/admin/traces/*`) | ✓ | ✓ | ✓ |
-| `tool:observe`(`query_*`、`k8s_*` 只读工具) | ✓ | ✓ | ✓ |
+| `gateway:observability:read`(`/admin/system`、`/admin/observability/*`、`/admin/traces/*`、`/admin/state/incident-windows`) | ✓ | ✓ | ✓ |
+| `tool:observe`(`read_observability`、`read_gateway`、`read_k8s` 只读工具) | ✓ | ✓ | ✓ |
 | `gateway:blacklist:write`(`gateway_block_ip` 所需) | | ✓ | ✓ |
 | `tool:k8s:restart_pod` / `tool:k8s:scale` | | ✓ | ✓ |
 | `gateway:ratelimit:write` | | | ✓ |
@@ -58,7 +59,7 @@
 | `AUTH_JWT_ISSUER` | `halon` | 期望的 `iss` |
 | `AUTH_REVOKED_JTIS` | 空 | 逗号分隔的紧急撤销 jti |
 
-`ADMIN_TOKEN` 在 `legacy`/`hybrid` 下仍需配置(≥12 字符),映射为 `full` 主体;`jwt` 模式下可为空。`INGEST_TOKEN` 始终只用于 `POST /api/v1/incidents/timeout`,不进入角色体系:`hybrid` 下兼容报告读取,`jwt` 下读接口必须提供 JWT。
+`ADMIN_TOKEN` 在 `legacy`/`hybrid` 下仍需配置(≥12 字符),映射为 `full` 主体;`jwt` 模式下可为空。`INGEST_TOKEN` 始终只用于 `POST /api/v1/incidents` 与 `POST /api/v1/incidents/timeout`,不进入角色体系:`hybrid` 下兼容报告读取,`jwt` 下读接口必须提供 JWT。
 
 ## 本地用户与会话(可选,`AUTH_LOGIN_ENABLED=true`)
 
@@ -109,10 +110,10 @@
 | 位置 | 做法 |
 | --- | --- |
 | 网关管理接口 `:9090` | `authz.Middleware` + 按路由 `authz.Require(perm)`;无令牌/验签失败 401 `UNAUTHORIZED`,权限不足 403 `FORBIDDEN` / `PASSWORD_CHANGE_REQUIRED`,错误体仍是 `{error:{code,message,request_id}}` |
-| Agent HTTP API | ingest 独立于角色体系;`GET /incidents*` 要求 `incident:read`;`GET /k8s/pods*` 要求 `k8s:pod_logs:read` |
+| Agent HTTP API | ingest 独立于角色体系;`GET /incidents*` 与 `GET /sessions` 要求 `incident:read`;`POST /sessions/:event_id/cancel` 要求 `incident:manage`;`GET /k8s/pods*` 要求 `k8s:pod_logs:read` |
 | Agent 工具层 | `Tool.Permission` 取代 `Level`;`Registry` 注册时过滤、执行时再校验一次 |
 | Agent → 网关 | `GATEWAY_ADMIN_TOKEN` 可为 JWT,启动自检要求 `typ=agent` 且角色与 `AGENT_OPERATION_LEVEL` 一致,否则启动失败。若 `GATEWAY_ADMIN_URL` 已配置且操作级别为 `operator`/`full`,令牌为空也直接启动失败(避免运行时才 401);`GATEWAY_ADMIN_URL` 为空时允许空令牌(由工具自身报「未配置」),但 `jwt` 模式下非空静态令牌仍拒绝。静态令牌在级别低于 `full` 时打 WARN |
-| `readonly` Agent | 工具集里没有网关写操作,部署时可不配 `GATEWAY_ADMIN_TOKEN` |
+| `readonly` Agent | 工具集里没有网关写操作,可不配 `GATEWAY_ADMIN_TOKEN`;若需让模型调用只读网关状态工具(`read_gateway`),配置 `typ=agent, role=readonly` 的 JWT |
 | 网关 `/metrics` | `METRICS_REQUIRE_AUTH=true` 时只挂 `authz.Middleware` + `Require(gateway:metrics:read)`,允许 `readonly` 抓取;抓取不写审计日志、不计 `halon_gateway_admin_requests_total`,避免每次 Prometheus 拉取都产生一条记录 |
 | 数据面 `:8080` | 不变 |
 | 审计 | 管理接口写/读请求统一结构日志(`sub`/`typ`/`role`/`jti`/`permission`/`result`),指标 `halon_gateway_admin_requests_total{role,permission,result}`;仅 401/403 鉴权拒绝(`authz.DeniedFromContext`)计 `result="deny"`,下游业务错误(400/404/409/500)计 `result="allow"`;`/metrics` 抓取除外 |
