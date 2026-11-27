@@ -268,6 +268,98 @@ func (m *Metrics) RedisUp() bool {
 	return m.redisUpState.Load()
 }
 
+// RejectedCounts breaks down requests rejected before reaching an upstream.
+type RejectedCounts struct {
+	Total            int64 `json:"total"`
+	Blacklist        int64 `json:"blacklist"`
+	RateLimit        int64 `json:"rate_limit"`
+	ConcurrencyLimit int64 `json:"concurrency_limit"`
+	BodyTooLarge     int64 `json:"body_too_large"`
+}
+
+// RuntimeMetricsSnapshot aggregates per-replica runtime counters and gauges
+// for the console overview page.
+type RuntimeMetricsSnapshot struct {
+	InFlightRequests      int64          `json:"in_flight_requests"`
+	UpstreamInFlight      int64          `json:"upstream_in_flight"`
+	Rejected              RejectedCounts `json:"rejected"`
+	RetriesTotal          int64          `json:"retries_total"`
+	RetryExhaustedTotal   int64          `json:"retry_exhausted_total"`
+	BreakerTripsTotal     int64          `json:"breaker_trips_total"`
+	TrafficlogDropped     int64          `json:"trafficlog_dropped"`
+	TimeoutEventsDropped  int64          `json:"timeout_events_dropped"`
+	WebhookNotifyFailures int64          `json:"webhook_notify_failures"`
+}
+
+// RuntimeSnapshot reads current counter and gauge totals from the registry.
+func (m *Metrics) RuntimeSnapshot() RuntimeMetricsSnapshot {
+	var snapshot RuntimeMetricsSnapshot
+	if m == nil || m.registry == nil {
+		return snapshot
+	}
+	families, err := m.registry.Gather()
+	if err != nil {
+		return snapshot
+	}
+	for _, family := range families {
+		switch family.GetName() {
+		case "halon_gateway_in_flight_requests":
+			for _, metric := range family.GetMetric() {
+				snapshot.InFlightRequests += int64(metric.GetGauge().GetValue())
+			}
+		case "halon_gateway_upstream_in_flight":
+			for _, metric := range family.GetMetric() {
+				snapshot.UpstreamInFlight += int64(metric.GetGauge().GetValue())
+			}
+		case "halon_gateway_rejected_requests_total":
+			for _, metric := range family.GetMetric() {
+				val := int64(metric.GetCounter().GetValue())
+				snapshot.Rejected.Total += val
+				for _, label := range metric.GetLabel() {
+					if label.GetName() != "reason" {
+						continue
+					}
+					switch label.GetValue() {
+					case RejectReasonBlacklist:
+						snapshot.Rejected.Blacklist += val
+					case RejectReasonRateLimit:
+						snapshot.Rejected.RateLimit += val
+					case RejectReasonConcurrencyLimit:
+						snapshot.Rejected.ConcurrencyLimit += val
+					case RejectReasonBodyTooLarge:
+						snapshot.Rejected.BodyTooLarge += val
+					}
+				}
+			}
+		case "halon_gateway_retries_total":
+			for _, metric := range family.GetMetric() {
+				snapshot.RetriesTotal += int64(metric.GetCounter().GetValue())
+			}
+		case "halon_gateway_retry_exhausted_total":
+			for _, metric := range family.GetMetric() {
+				snapshot.RetryExhaustedTotal += int64(metric.GetCounter().GetValue())
+			}
+		case "halon_gateway_circuit_breaker_trips_total":
+			for _, metric := range family.GetMetric() {
+				snapshot.BreakerTripsTotal += int64(metric.GetCounter().GetValue())
+			}
+		case "halon_gateway_trafficlog_dropped_total":
+			for _, metric := range family.GetMetric() {
+				snapshot.TrafficlogDropped += int64(metric.GetCounter().GetValue())
+			}
+		case "halon_gateway_timeout_events_dropped_total":
+			for _, metric := range family.GetMetric() {
+				snapshot.TimeoutEventsDropped += int64(metric.GetCounter().GetValue())
+			}
+		case "halon_gateway_webhook_notify_failures_total":
+			for _, metric := range family.GetMetric() {
+				snapshot.WebhookNotifyFailures += int64(metric.GetCounter().GetValue())
+			}
+		}
+	}
+	return snapshot
+}
+
 func (m *Metrics) Handler() http.Handler {
 	return promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{})
 }

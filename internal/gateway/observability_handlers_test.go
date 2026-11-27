@@ -134,6 +134,18 @@ func TestObservabilityAndTraceAdminEndpoints(t *testing.T) {
 	}
 	rules, limiter := newTestRedisStores(t, 100, 100)
 	metrics := NewMetrics()
+	metrics.IncInFlight()
+	metrics.IncUpstreamInFlight("/api/v1/users/")
+	metrics.IncRejected(RejectReasonBlacklist)
+	metrics.IncRejected(RejectReasonRateLimit)
+	metrics.IncRejected(RejectReasonConcurrencyLimit)
+	metrics.IncRejected(RejectReasonBodyTooLarge)
+	metrics.IncRetry("/api/v1/users/")
+	metrics.IncRetryExhausted("/api/v1/users/")
+	metrics.IncBreakerTrips("/api/v1/users/")
+	metrics.IncTrafficlogDropped()
+	metrics.IncTimeoutEventsDropped()
+	metrics.IncWebhookNotifyFailures()
 	stub := &stubTrafficLogReader{
 		overview: trafficlog.OverviewStats{TotalRequests: 100, P99MS: 250.5, P95MS: 120, P50MS: 25},
 		series:   []trafficlog.TimeSeriesPoint{{TS: now, Requests: 10, P99MS: 250.5}},
@@ -225,5 +237,28 @@ func TestObservabilityAndTraceAdminEndpoints(t *testing.T) {
 	}
 	if resp := adminRequest(router, http.MethodGet, "/admin/system", pcrToken, ""); resp.Code != http.StatusForbidden {
 		t.Fatalf("pcr token status = %d, want 403", resp.Code)
+	}
+
+	overviewResp := adminRequest(router, http.MethodGet, "/admin/observability/overview?window=1h", token, "")
+	if overviewResp.Code != http.StatusOK {
+		t.Fatalf("overview status = %d: %s", overviewResp.Code, overviewResp.Body.String())
+	}
+	var overviewPayload struct {
+		Runtime RuntimeMetricsSnapshot `json:"runtime"`
+	}
+	if err := json.Unmarshal(overviewResp.Body.Bytes(), &overviewPayload); err != nil {
+		t.Fatal(err)
+	}
+	rt := overviewPayload.Runtime
+	if rt.InFlightRequests != 1 || rt.UpstreamInFlight != 1 ||
+		rt.Rejected.Total != 4 || rt.Rejected.Blacklist != 1 || rt.Rejected.RateLimit != 1 ||
+		rt.Rejected.ConcurrencyLimit != 1 || rt.Rejected.BodyTooLarge != 1 ||
+		rt.RetriesTotal != 1 || rt.RetryExhaustedTotal != 1 || rt.BreakerTripsTotal != 1 ||
+		rt.TrafficlogDropped != 1 || rt.TimeoutEventsDropped != 1 || rt.WebhookNotifyFailures != 1 {
+		t.Fatalf("unexpected runtime snapshot: %+v", rt)
+	}
+
+	if zero := (*Metrics)(nil).RuntimeSnapshot(); zero != (RuntimeMetricsSnapshot{}) {
+		t.Fatalf("nil RuntimeSnapshot = %+v, want zero", zero)
 	}
 }

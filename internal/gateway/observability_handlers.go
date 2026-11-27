@@ -106,7 +106,7 @@ func systemInfoHandler(routes *RouteTable, info SystemInfo, metrics *Metrics) gi
 	}
 }
 
-func observabilityOverviewHandler(logs TrafficLogReader) gin.HandlerFunc {
+func observabilityOverviewHandler(logs TrafficLogReader, metrics *Metrics) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if logs == nil {
 			abortWithError(c, http.StatusServiceUnavailable, "OBSERVABILITY_UNAVAILABLE", "traffic log store is not configured")
@@ -123,7 +123,11 @@ func observabilityOverviewHandler(logs TrafficLogReader) gin.HandlerFunc {
 			abortWithError(c, http.StatusInternalServerError, "QUERY_FAILED", "failed to query traffic overview")
 			return
 		}
-		c.JSON(http.StatusOK, gin.H{"overview": stats, "window": c.DefaultQuery("window", "1h")})
+		c.JSON(http.StatusOK, gin.H{
+			"overview": stats,
+			"runtime":  metrics.RuntimeSnapshot(),
+			"window":   c.DefaultQuery("window", "1h"),
+		})
 	}
 }
 

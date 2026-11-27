@@ -206,7 +206,7 @@ func NewAdminHandler(token string, rules BlacklistStore, limiter RateLimitBacken
 
 	obsRead := authz.Require(authz.PermGatewayObservabilityRead, abortWithError)
 	admin.GET("/system", obsRead, systemInfoHandler(options.Routes, options.SystemInfo, metrics))
-	admin.GET("/observability/overview", obsRead, observabilityOverviewHandler(options.TrafficLogs))
+	admin.GET("/observability/overview", obsRead, observabilityOverviewHandler(options.TrafficLogs, metrics))
 	admin.GET("/observability/timeseries", obsRead, observabilityTimeSeriesHandler(options.TrafficLogs))
 	admin.GET("/observability/routes", obsRead, observabilityRoutesHandler(options.TrafficLogs))
 	admin.GET("/observability/logs", obsRead, observabilityLogsHandler(options.TrafficLogs))
