@@ -6,7 +6,7 @@ metadata:
     app.kubernetes.io/name: gateway
     app.kubernetes.io/part-of: halon
 spec:
-  # Blacklist and rate-limit state live in Redis, so 2+ replicas are safe.
+  # Blacklist, rate-limit, and incident coalescing state live in Redis, so 2+ replicas are safe.
   replicas: 1
   selector:
     matchLabels:
@@ -90,12 +90,25 @@ spec:
             #       name: halon-secrets
             #       key: bootstrap-admin-password
             - name: AGENT_WEBHOOK_URL
-              value: http://agent:8081/api/v1/incidents/timeout
+              value: http://agent:8081/api/v1/incidents
             - name: AGENT_WEBHOOK_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: halon-secrets
                   key: ingest-token
+            # Generalized incident coalescing, burst threshold, and cooldown windows:
+            # - name: INCIDENT_ENABLED_TYPES
+            #   value: upstream_timeout,upstream_error,breaker_open,upstream_5xx,concurrency_limit,rate_limit_abuse
+            # - name: INCIDENT_SETTLE_DELAY
+            #   value: 15s
+            # - name: INCIDENT_COALESCE_COOLDOWN
+            #   value: 5m
+            # - name: INCIDENT_RETRY_BACKOFF
+            #   value: 1m
+            # - name: INCIDENT_5XX_THRESHOLD
+            #   value: "10"
+            # - name: INCIDENT_5XX_WINDOW
+            #   value: 30s
             # Distributed tracing is off by default. After deploying the
             # observability stack (make deploy-observability), uncomment:
             # - name: OTEL_ENABLED

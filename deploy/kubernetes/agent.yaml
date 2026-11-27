@@ -55,9 +55,11 @@ metadata:
     app.kubernetes.io/name: agent
     app.kubernetes.io/part-of: halon
 spec:
-  # Action cooldowns and route storm suppression live in Redis and event
-  # dedup is arbitrated by PostgreSQL, so 2+ replicas are safe.
+  # Single-instance control plane: active sessions and resource-level mutation
+  # locks run in-process, and Recreate avoids overlapping pods during rollouts.
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: agent
@@ -116,16 +118,15 @@ spec:
                 secretKeyRef:
                   name: halon-secrets
                   key: openai-api-key
-            # A readonly agent has no gateway write tool, so it needs no
-            # gateway token at all. For operator/full, issue an agent JWT
-            # whose role matches AGENT_OPERATION_LEVEL and mount it here:
+            # A readonly agent can optionally mount a role=readonly agent JWT
+            # to inspect gateway Redis/breaker state via gateway_get_* tools.
+            # For operator/full, issue an agent JWT whose role matches
+            # AGENT_OPERATION_LEVEL and mount it here:
             # - name: GATEWAY_ADMIN_TOKEN
             #   valueFrom:
             #     secretKeyRef:
             #       name: halon-secrets
             #       key: agent-gateway-token
-            - name: REDIS_URL
-              value: redis://redis:6379/0
           startupProbe:
             httpGet:
               path: /healthz
