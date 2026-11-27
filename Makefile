@@ -63,8 +63,8 @@ minikube-image: docker-build docker-build-demo
 deploy:
 	kubectl apply -f deploy/kubernetes/
 
-# Optional observability reference stack (Prometheus/Loki/Tempo/
-# OTel Collector). Not part of `make deploy`; see docs/deployment.md.
+# Optional observability reference stack (OTel Collector/Tempo/Prometheus/
+# Alertmanager). Not part of `make deploy`; see docs/deployment.md.
 deploy-observability:
 	kubectl apply -f deploy/kubernetes/observability/
 
