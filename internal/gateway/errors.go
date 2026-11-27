@@ -22,6 +22,11 @@ func abortWithError(c *gin.Context, httpStatus int, code, message string) {
 	}})
 }
 
-// upstreamTimeoutKey marks requests whose upstream call exceeded the proxy
-// timeout; the access log middleware turns them into timeout incidents.
-const upstreamTimeoutKey = "upstream_timeout"
+const (
+	// gatewayIncidentTypeKey records the classified incident type for a failed
+	// request; the access log middleware turns it into an incident event.
+	gatewayIncidentTypeKey = "gateway_incident_type"
+	// gatewayIncidentDetailKey optionally carries short diagnostic context for
+	// incident details.
+	gatewayIncidentDetailKey = "gateway_incident_detail"
+)

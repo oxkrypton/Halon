@@ -11,6 +11,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/oxkrypton/Halon/internal/authz"
+	"github.com/oxkrypton/Halon/internal/incident"
 	"github.com/oxkrypton/Halon/internal/trafficlog"
 )
 
@@ -144,7 +145,7 @@ func TestObservabilityAndTraceAdminEndpoints(t *testing.T) {
 	metrics.IncRetryExhausted("/api/v1/users/")
 	metrics.IncBreakerTrips("/api/v1/users/")
 	metrics.IncTrafficlogDropped()
-	metrics.IncTimeoutEventsDropped()
+	metrics.IncIncidentEventsDropped(incident.TypeUpstreamTimeout)
 	metrics.IncWebhookNotifyFailures()
 	stub := &stubTrafficLogReader{
 		overview: trafficlog.OverviewStats{TotalRequests: 100, P99MS: 250.5, P95MS: 120, P50MS: 25},
@@ -254,7 +255,7 @@ func TestObservabilityAndTraceAdminEndpoints(t *testing.T) {
 		rt.Rejected.Total != 4 || rt.Rejected.Blacklist != 1 || rt.Rejected.RateLimit != 1 ||
 		rt.Rejected.ConcurrencyLimit != 1 || rt.Rejected.BodyTooLarge != 1 ||
 		rt.RetriesTotal != 1 || rt.RetryExhaustedTotal != 1 || rt.BreakerTripsTotal != 1 ||
-		rt.TrafficlogDropped != 1 || rt.TimeoutEventsDropped != 1 || rt.WebhookNotifyFailures != 1 {
+		rt.TrafficlogDropped != 1 || rt.IncidentEventsDropped != 1 || rt.WebhookNotifyFailures != 1 {
 		t.Fatalf("unexpected runtime snapshot: %+v", rt)
 	}
 

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/oxkrypton/Halon/internal/incident"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -54,9 +55,11 @@ type Metrics struct {
 	breakerState     *prometheus.GaugeVec
 	breakerTrips     *prometheus.CounterVec
 
-	trafficlogDropped     prometheus.Counter
-	timeoutEventsDropped  prometheus.Counter
-	webhookNotifyFailures prometheus.Counter
+	trafficlogDropped       prometheus.Counter
+	incidentEventsDropped   *prometheus.CounterVec
+	incidentEventsCoalesced *prometheus.CounterVec
+	incidentsEmitted        *prometheus.CounterVec
+	webhookNotifyFailures   prometheus.Counter
 
 	redisUp      prometheus.Gauge
 	redisUpState atomic.Bool
@@ -124,13 +127,21 @@ func NewMetrics() *Metrics {
 			Name: "halon_gateway_trafficlog_dropped_total",
 			Help: "Traffic log entries dropped because the bounded queue was full.",
 		}),
-		timeoutEventsDropped: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "halon_gateway_timeout_events_dropped_total",
-			Help: "Timeout incident events dropped because the bounded queue was full.",
-		}),
+		incidentEventsDropped: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "halon_gateway_incident_events_dropped_total",
+			Help: "Incident events dropped because the bounded queue was full, by event type.",
+		}, []string{"type"}),
+		incidentEventsCoalesced: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "halon_gateway_incident_events_coalesced_total",
+			Help: "Raw anomaly events merged into an active coalescing window, by event type and route.",
+		}, []string{"type", "route"}),
+		incidentsEmitted: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "halon_gateway_incidents_emitted_total",
+			Help: "Coalesced incident webhooks delivered to the agent, by event type and route.",
+		}, []string{"type", "route"}),
 		webhookNotifyFailures: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "halon_gateway_webhook_notify_failures_total",
-			Help: "Timeout incident webhook deliveries that failed after all attempts.",
+			Help: "Incident webhook deliveries that failed after all attempts.",
 		}),
 		redisUp: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "halon_gateway_redis_up",
@@ -143,7 +154,7 @@ func NewMetrics() *Metrics {
 		m.requests, m.duration, m.inFlight, m.respSize, m.rejected, m.adminRequests,
 		m.upstreamRequests, m.upstreamDuration, m.upstreamInFlight,
 		m.retries, m.retriesExhausted, m.breakerState, m.breakerTrips,
-		m.trafficlogDropped, m.timeoutEventsDropped, m.webhookNotifyFailures,
+		m.trafficlogDropped, m.incidentEventsDropped, m.incidentEventsCoalesced, m.incidentsEmitted, m.webhookNotifyFailures,
 		m.redisUp,
 	)
 	return m
@@ -235,9 +246,35 @@ func (m *Metrics) IncTrafficlogDropped() {
 	}
 }
 
-func (m *Metrics) IncTimeoutEventsDropped() {
+func metricIncidentTypeLabel(eventType incident.EventType) string {
+	if incident.IsBuiltinEventType(eventType) {
+		return string(eventType)
+	}
+	return "other"
+}
+
+func metricRouteLabel(route string) string {
+	if route == "" {
+		return "none"
+	}
+	return route
+}
+
+func (m *Metrics) IncIncidentEventsDropped(eventType incident.EventType) {
 	if m != nil {
-		m.timeoutEventsDropped.Inc()
+		m.incidentEventsDropped.WithLabelValues(metricIncidentTypeLabel(eventType)).Inc()
+	}
+}
+
+func (m *Metrics) IncIncidentEventsCoalesced(eventType incident.EventType, route string) {
+	if m != nil {
+		m.incidentEventsCoalesced.WithLabelValues(metricIncidentTypeLabel(eventType), metricRouteLabel(route)).Inc()
+	}
+}
+
+func (m *Metrics) IncIncidentsEmitted(eventType incident.EventType, route string) {
+	if m != nil {
+		m.incidentsEmitted.WithLabelValues(metricIncidentTypeLabel(eventType), metricRouteLabel(route)).Inc()
 	}
 }
 
@@ -287,7 +324,7 @@ type RuntimeMetricsSnapshot struct {
 	RetryExhaustedTotal   int64          `json:"retry_exhausted_total"`
 	BreakerTripsTotal     int64          `json:"breaker_trips_total"`
 	TrafficlogDropped     int64          `json:"trafficlog_dropped"`
-	TimeoutEventsDropped  int64          `json:"timeout_events_dropped"`
+	IncidentEventsDropped int64          `json:"incident_events_dropped"`
 	WebhookNotifyFailures int64          `json:"webhook_notify_failures"`
 }
 
@@ -347,9 +384,9 @@ func (m *Metrics) RuntimeSnapshot() RuntimeMetricsSnapshot {
 			for _, metric := range family.GetMetric() {
 				snapshot.TrafficlogDropped += int64(metric.GetCounter().GetValue())
 			}
-		case "halon_gateway_timeout_events_dropped_total":
+		case "halon_gateway_incident_events_dropped_total":
 			for _, metric := range family.GetMetric() {
-				snapshot.TimeoutEventsDropped += int64(metric.GetCounter().GetValue())
+				snapshot.IncidentEventsDropped += int64(metric.GetCounter().GetValue())
 			}
 		case "halon_gateway_webhook_notify_failures_total":
 			for _, metric := range family.GetMetric() {

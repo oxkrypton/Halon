@@ -51,7 +51,7 @@ func (w *responseCapture) WriteString(data string) (int, error) {
 
 type AccessLogOptions struct {
 	Queue         chan<- trafficlog.Entry
-	TimeoutQueue  chan<- incident.TimeoutEvent
+	Incidents     *IncidentSink
 	SlowThreshold time.Duration
 	CaptureLimit  int64
 	Logger        *slog.Logger
@@ -60,7 +60,6 @@ type AccessLogOptions struct {
 
 func AccessLog(options AccessLogOptions) gin.HandlerFunc {
 	var dropped atomic.Uint64
-	var droppedTimeouts atomic.Uint64
 	return func(c *gin.Context) {
 		started := time.Now()
 		options.Metrics.IncInFlight()
@@ -111,28 +110,12 @@ func AccessLog(options AccessLogOptions) gin.HandlerFunc {
 			}
 		}
 		options.Metrics.Observe(c, status, latency)
-		timedOutValue, _ := c.Get(upstreamTimeoutKey)
-		timedOut, _ := timedOutValue.(bool)
-		if timedOut && options.TimeoutQueue != nil {
-			event := incident.TimeoutEvent{
-				EventID:    newRequestID(),
-				RequestID:  entry.Base.RequestID,
-				OccurredAt: time.Now().UTC(),
-				Method:     entry.Base.Method,
-				Path:       entry.Base.Path,
-				Route:      route,
-				ClientIP:   entry.Base.ClientIP,
-				StatusCode: status,
-				LatencyMS:  entry.Base.LatencyMS,
-			}
-			select {
-			case options.TimeoutQueue <- event:
-			default:
-				options.Metrics.IncTimeoutEventsDropped()
-				count := droppedTimeouts.Add(1)
-				if count == 1 || count%100 == 0 {
-					options.Logger.Warn("timeout incident queue full; dropping event", "dropped_total", count)
-				}
+		incidentTypeValue, _ := c.Get(gatewayIncidentTypeKey)
+		incidentType, _ := incidentTypeValue.(incident.EventType)
+		timedOut := incidentType == incident.TypeUpstreamTimeout
+		if options.Incidents != nil {
+			if event, ok := buildGatewayIncident(incidentType, c.GetString(gatewayIncidentDetailKey), entry.Base, outcome); ok {
+				options.Incidents.Emit(event)
 			}
 		}
 		attributes := []any{
@@ -158,6 +141,37 @@ func AccessLog(options AccessLogOptions) gin.HandlerFunc {
 		}
 		options.Logger.Info("http request", attributes...)
 	}
+}
+
+func buildGatewayIncident(classified incident.EventType, detail string, base trafficlog.BaseLog, outcome *upstreamOutcome) (incident.Event, bool) {
+	eventType := classified
+	if eventType == "" {
+		if base.Status >= http.StatusInternalServerError && outcome != nil && outcome.result == UpstreamResultSuccess {
+			eventType = incident.TypeUpstream5xx
+		} else {
+			return incident.Event{}, false
+		}
+	}
+	scopeKey := base.Route
+	if eventType == incident.TypeRateLimitAbuse {
+		scopeKey = base.ClientIP
+	}
+	event := incident.Event{
+		Type:       eventType,
+		ScopeKey:   scopeKey,
+		RequestID:  base.RequestID,
+		OccurredAt: time.Now().UTC(),
+		Method:     base.Method,
+		Path:       base.Path,
+		Route:      base.Route,
+		ClientIP:   base.ClientIP,
+		StatusCode: base.Status,
+		LatencyMS:  base.LatencyMS,
+	}
+	if detail != "" {
+		event.Details = map[string]any{"error": detail}
+	}
+	return event, true
 }
 
 func captureRequestBody(c *gin.Context, limit int64) string {

@@ -14,6 +14,7 @@ import (
 
 	"github.com/oxkrypton/Halon/internal/authz"
 	"github.com/oxkrypton/Halon/internal/identity"
+	"github.com/oxkrypton/Halon/internal/incident"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -39,7 +40,7 @@ type Config struct {
 	RateLimitBurst       int
 	LogQueueSize         int
 	LogBatchSize         int
-	TimeoutQueueSize     int
+	IncidentQueueSize    int
 	LogFlushInterval     time.Duration
 	ProxyTimeout         time.Duration
 	SlowRequestThreshold time.Duration
@@ -76,6 +77,20 @@ type Config struct {
 	RedisDialTimeout  time.Duration
 	RedisOpTimeout    time.Duration
 
+	// Cross-replica incident coalescing, burst detection, and delivery cooldown.
+	IncidentEnabledTypes         map[incident.EventType]bool
+	IncidentCoalesceCooldown     time.Duration
+	IncidentSettleDelay          time.Duration
+	IncidentRetryBackoff         time.Duration
+	IncidentBreakerSettleDelay   time.Duration
+	Incident5xxThreshold         int
+	Incident5xxWindow            time.Duration
+	IncidentConcurrencyThreshold int
+	IncidentConcurrencyWindow    time.Duration
+	IncidentRateLimitThreshold   int
+	IncidentRateLimitWindow      time.Duration
+	IncidentRateLimitCooldown    time.Duration
+
 	// Local username/password login. Disabled by default; when enabled the
 	// gateway holds the Ed25519 signing key and AUTH_MODE must be hybrid/jwt.
 	LoginEnabled           bool
@@ -109,7 +124,7 @@ func LoadConfig() (Config, error) {
 		RateLimitBurst:       40,
 		LogQueueSize:         1024,
 		LogBatchSize:         500,
-		TimeoutQueueSize:     64,
+		IncidentQueueSize:    128,
 		LogFlushInterval:     time.Second,
 		ProxyTimeout:         3 * time.Second,
 		SlowRequestThreshold: time.Second,
@@ -140,6 +155,18 @@ func LoadConfig() (Config, error) {
 		BlacklistCacheTTL: 10 * time.Second,
 		RedisDialTimeout:  time.Second,
 		RedisOpTimeout:    500 * time.Millisecond,
+
+		IncidentCoalesceCooldown:     5 * time.Minute,
+		IncidentSettleDelay:          15 * time.Second,
+		IncidentRetryBackoff:         time.Minute,
+		IncidentBreakerSettleDelay:   5 * time.Second,
+		Incident5xxThreshold:         10,
+		Incident5xxWindow:            30 * time.Second,
+		IncidentConcurrencyThreshold: 10,
+		IncidentConcurrencyWindow:    30 * time.Second,
+		IncidentRateLimitThreshold:   50,
+		IncidentRateLimitWindow:      60 * time.Second,
+		IncidentRateLimitCooldown:    10 * time.Minute,
 
 		JWTPrivateKey:          os.Getenv("AUTH_JWT_PRIVATE_KEY"),
 		JWTKID:                 strings.TrimSpace(os.Getenv("AUTH_JWT_KID")),
@@ -172,8 +199,14 @@ func LoadConfig() (Config, error) {
 	if cfg.LogBatchSize, err = envInt("LOG_BATCH_SIZE", cfg.LogBatchSize); err != nil {
 		return Config{}, err
 	}
-	if cfg.TimeoutQueueSize, err = envInt("TIMEOUT_QUEUE_SIZE", cfg.TimeoutQueueSize); err != nil {
-		return Config{}, err
+	if os.Getenv("INCIDENT_QUEUE_SIZE") != "" {
+		if cfg.IncidentQueueSize, err = envInt("INCIDENT_QUEUE_SIZE", cfg.IncidentQueueSize); err != nil {
+			return Config{}, err
+		}
+	} else if os.Getenv("TIMEOUT_QUEUE_SIZE") != "" {
+		if cfg.IncidentQueueSize, err = envInt("TIMEOUT_QUEUE_SIZE", cfg.IncidentQueueSize); err != nil {
+			return Config{}, err
+		}
 	}
 	if cfg.LogFlushInterval, err = envDuration("LOG_FLUSH_INTERVAL", cfg.LogFlushInterval); err != nil {
 		return Config{}, err
@@ -263,8 +296,48 @@ func LoadConfig() (Config, error) {
 	if cfg.RedisOpTimeout, err = envDuration("REDIS_OP_TIMEOUT", cfg.RedisOpTimeout); err != nil {
 		return Config{}, err
 	}
-
 	var validationErrors []error
+
+	if cfg.IncidentEnabledTypes, err = parseIncidentEnabledTypes(os.Getenv("INCIDENT_ENABLED_TYPES")); err != nil {
+		validationErrors = append(validationErrors, err)
+	}
+	if cfg.IncidentCoalesceCooldown, err = envDuration("INCIDENT_COALESCE_COOLDOWN", cfg.IncidentCoalesceCooldown); err != nil {
+		return Config{}, err
+	}
+	defaultRetryBackoff := cfg.IncidentRetryBackoff
+	if cfg.IncidentCoalesceCooldown >= 0 && cfg.IncidentCoalesceCooldown < defaultRetryBackoff {
+		defaultRetryBackoff = cfg.IncidentCoalesceCooldown
+	}
+	if cfg.IncidentRetryBackoff, err = envDuration("INCIDENT_RETRY_BACKOFF", defaultRetryBackoff); err != nil {
+		return Config{}, err
+	}
+	if cfg.IncidentSettleDelay, err = envDuration("INCIDENT_SETTLE_DELAY", cfg.IncidentSettleDelay); err != nil {
+		return Config{}, err
+	}
+	if cfg.IncidentBreakerSettleDelay, err = envDuration("INCIDENT_BREAKER_SETTLE_DELAY", cfg.IncidentBreakerSettleDelay); err != nil {
+		return Config{}, err
+	}
+	if cfg.Incident5xxThreshold, err = envInt("INCIDENT_5XX_THRESHOLD", cfg.Incident5xxThreshold); err != nil {
+		return Config{}, err
+	}
+	if cfg.Incident5xxWindow, err = envDuration("INCIDENT_5XX_WINDOW", cfg.Incident5xxWindow); err != nil {
+		return Config{}, err
+	}
+	if cfg.IncidentConcurrencyThreshold, err = envInt("INCIDENT_CONCURRENCY_THRESHOLD", cfg.IncidentConcurrencyThreshold); err != nil {
+		return Config{}, err
+	}
+	if cfg.IncidentConcurrencyWindow, err = envDuration("INCIDENT_CONCURRENCY_WINDOW", cfg.IncidentConcurrencyWindow); err != nil {
+		return Config{}, err
+	}
+	if cfg.IncidentRateLimitThreshold, err = envInt("INCIDENT_RATELIMIT_THRESHOLD", cfg.IncidentRateLimitThreshold); err != nil {
+		return Config{}, err
+	}
+	if cfg.IncidentRateLimitWindow, err = envDuration("INCIDENT_RATELIMIT_WINDOW", cfg.IncidentRateLimitWindow); err != nil {
+		return Config{}, err
+	}
+	if cfg.IncidentRateLimitCooldown, err = envDuration("INCIDENT_RATELIMIT_COOLDOWN", cfg.IncidentRateLimitCooldown); err != nil {
+		return Config{}, err
+	}
 
 	// Login is opt-in. Parse its variables centrally here and, when enabled,
 	// merge the public half of the signing key into the verifier set so the
@@ -346,8 +419,8 @@ func LoadConfig() (Config, error) {
 	if math.IsNaN(cfg.RateLimitRPS) || math.IsInf(cfg.RateLimitRPS, 0) || cfg.RateLimitRPS <= 0 || cfg.RateLimitBurst <= 0 {
 		validationErrors = append(validationErrors, errors.New("rate limit values must be positive"))
 	}
-	if cfg.LogQueueSize <= 0 || cfg.LogBatchSize <= 0 || cfg.TimeoutQueueSize <= 0 || cfg.LogFlushInterval <= 0 {
-		validationErrors = append(validationErrors, errors.New("log queues, batch size, and flush interval must be positive"))
+	if cfg.LogQueueSize <= 0 || cfg.LogBatchSize <= 0 || cfg.IncidentQueueSize <= 0 || cfg.LogFlushInterval <= 0 {
+		validationErrors = append(validationErrors, errors.New("log and incident queues, batch size, and flush interval must be positive"))
 	}
 	if cfg.ProxyTimeout <= 0 || cfg.SlowRequestThreshold <= 0 || cfg.BodyCaptureLimit <= 0 || cfg.ShutdownTimeout <= 0 {
 		validationErrors = append(validationErrors, errors.New("timeouts and body capture limit must be positive"))
@@ -396,6 +469,18 @@ func LoadConfig() (Config, error) {
 	if cfg.BlacklistCacheTTL <= 0 || cfg.RedisDialTimeout <= 0 || cfg.RedisOpTimeout <= 0 {
 		validationErrors = append(validationErrors, errors.New("blacklist cache TTL and redis timeouts must be positive"))
 	}
+	if cfg.IncidentCoalesceCooldown < 0 || cfg.IncidentRetryBackoff < 0 || cfg.IncidentSettleDelay < 0 ||
+		cfg.IncidentBreakerSettleDelay < 0 || cfg.IncidentRateLimitCooldown < 0 {
+		validationErrors = append(validationErrors, errors.New("incident coalescing cooldowns, retry backoff, and settle delays must be non-negative"))
+	}
+	if cfg.IncidentCoalesceCooldown > 0 && cfg.IncidentRetryBackoff > cfg.IncidentCoalesceCooldown {
+		validationErrors = append(validationErrors, errors.New("INCIDENT_RETRY_BACKOFF must not exceed INCIDENT_COALESCE_COOLDOWN"))
+	}
+	if cfg.Incident5xxThreshold <= 0 || cfg.Incident5xxWindow <= 0 ||
+		cfg.IncidentConcurrencyThreshold <= 0 || cfg.IncidentConcurrencyWindow <= 0 ||
+		cfg.IncidentRateLimitThreshold <= 0 || cfg.IncidentRateLimitWindow <= 0 {
+		validationErrors = append(validationErrors, errors.New("incident burst thresholds and detection windows must be positive"))
+	}
 	if cfg.LoginEnabled {
 		if cfg.AccessTokenTTL < time.Minute || cfg.AccessTokenTTL > time.Hour {
 			validationErrors = append(validationErrors, errors.New("AUTH_ACCESS_TOKEN_TTL must be between 1m and 1h"))
@@ -437,6 +522,111 @@ var slogLevels = map[string]slog.Level{
 	"info":  slog.LevelInfo,
 	"warn":  slog.LevelWarn,
 	"error": slog.LevelError,
+}
+
+// IncidentPolicies builds the per-event-type coalescing and cooldown policy
+// set from the validated gateway configuration.
+func (c Config) IncidentPolicies() IncidentPolicySet {
+	enabled := func(t incident.EventType) bool {
+		if len(c.IncidentEnabledTypes) == 0 {
+			return false
+		}
+		return c.IncidentEnabledTypes[t]
+	}
+	spikeSettle := min(10*time.Second, c.IncidentSettleDelay)
+	rateLimitBackoff := c.IncidentRetryBackoff
+	if c.IncidentRateLimitCooldown > 0 && rateLimitBackoff > c.IncidentRateLimitCooldown {
+		rateLimitBackoff = c.IncidentRateLimitCooldown
+	}
+	if c.IncidentRateLimitCooldown == 0 {
+		rateLimitBackoff = 0
+	}
+	return IncidentPolicySet{
+		Default: IncidentPolicy{
+			Enabled:        true,
+			MinOccurrences: 1,
+			SettleDelay:    c.IncidentSettleDelay,
+			Cooldown:       c.IncidentCoalesceCooldown,
+			RetryBackoff:   c.IncidentRetryBackoff,
+		},
+		Policies: map[incident.EventType]IncidentPolicy{
+			incident.TypeUpstreamTimeout: {
+				Enabled:        enabled(incident.TypeUpstreamTimeout),
+				MinOccurrences: 1,
+				SettleDelay:    c.IncidentSettleDelay,
+				Cooldown:       c.IncidentCoalesceCooldown,
+				RetryBackoff:   c.IncidentRetryBackoff,
+			},
+			incident.TypeUpstreamError: {
+				Enabled:        enabled(incident.TypeUpstreamError),
+				MinOccurrences: 1,
+				SettleDelay:    c.IncidentSettleDelay,
+				Cooldown:       c.IncidentCoalesceCooldown,
+				RetryBackoff:   c.IncidentRetryBackoff,
+			},
+			incident.TypeBreakerOpen: {
+				Enabled:        enabled(incident.TypeBreakerOpen),
+				MinOccurrences: 1,
+				SettleDelay:    c.IncidentBreakerSettleDelay,
+				Cooldown:       c.IncidentCoalesceCooldown,
+				RetryBackoff:   c.IncidentRetryBackoff,
+			},
+			incident.TypeUpstream5xx: {
+				Enabled:        enabled(incident.TypeUpstream5xx),
+				MinOccurrences: c.Incident5xxThreshold,
+				DetectWindow:   c.Incident5xxWindow,
+				SettleDelay:    spikeSettle,
+				Cooldown:       c.IncidentCoalesceCooldown,
+				RetryBackoff:   c.IncidentRetryBackoff,
+			},
+			incident.TypeConcurrencyLimit: {
+				Enabled:        enabled(incident.TypeConcurrencyLimit),
+				MinOccurrences: c.IncidentConcurrencyThreshold,
+				DetectWindow:   c.IncidentConcurrencyWindow,
+				SettleDelay:    spikeSettle,
+				Cooldown:       c.IncidentCoalesceCooldown,
+				RetryBackoff:   c.IncidentRetryBackoff,
+			},
+			incident.TypeRateLimitAbuse: {
+				Enabled:        enabled(incident.TypeRateLimitAbuse),
+				MinOccurrences: c.IncidentRateLimitThreshold,
+				DetectWindow:   c.IncidentRateLimitWindow,
+				SettleDelay:    spikeSettle,
+				Cooldown:       c.IncidentRateLimitCooldown,
+				RetryBackoff:   rateLimitBackoff,
+			},
+		},
+	}
+}
+
+func parseIncidentEnabledTypes(raw string) (map[incident.EventType]bool, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		enabled := make(map[incident.EventType]bool, len(incident.BuiltinEventTypes()))
+		for _, t := range incident.BuiltinEventTypes() {
+			enabled[t] = true
+		}
+		return enabled, nil
+	}
+	if strings.EqualFold(trimmed, "none") {
+		return map[incident.EventType]bool{}, nil
+	}
+	enabled := make(map[incident.EventType]bool)
+	for _, item := range strings.Split(trimmed, ",") {
+		part := strings.TrimSpace(item)
+		if part == "" {
+			continue
+		}
+		parsed, err := incident.ParseEventType(part)
+		if err != nil || !incident.IsBuiltinEventType(parsed) {
+			return nil, fmt.Errorf("INCIDENT_ENABLED_TYPES: unsupported event type %q", part)
+		}
+		enabled[parsed] = true
+	}
+	if len(enabled) == 0 {
+		return nil, errors.New("INCIDENT_ENABLED_TYPES must list at least one event type or \"none\"")
+	}
+	return enabled, nil
 }
 
 // SlogLevel returns the configured log level; LoadConfig guarantees it is valid.

@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -14,10 +15,11 @@ import (
 	"github.com/failsafe-go/failsafe-go/circuitbreaker"
 	"github.com/failsafe-go/failsafe-go/failsafehttp"
 	"github.com/failsafe-go/failsafe-go/retrypolicy"
+	"github.com/oxkrypton/Halon/internal/incident"
 )
 
 // ResilienceConfig carries the per-route resilience policy settings. All
-// policies are in-memory, matching the single-replica boundary documented in
+// policies are in-memory, matching the per-replica boundary documented in
 // AGENTS.md.
 type ResilienceConfig struct {
 	RetryMaxAttempts         int
@@ -29,6 +31,7 @@ type ResilienceConfig struct {
 	ConcurrencyPerRoute      uint
 	Metrics                  *Metrics
 	Logger                   *slog.Logger
+	Incidents                *IncidentSink
 }
 
 // upstreamOutcome records the final upstream call classification of one
@@ -116,6 +119,19 @@ func NewResilienceSet(prefixes []string, cfg ResilienceConfig, baseFor func(pref
 					cfg.Metrics.IncBreakerTrips(route)
 					cfg.Metrics.SetBreakerState(route, breakerStateOpen)
 					logger.Warn("circuit breaker open", "route", route)
+					if cfg.Incidents != nil {
+						cfg.Incidents.Emit(incident.Event{
+							Type:     incident.TypeBreakerOpen,
+							ScopeKey: route,
+							Route:    route,
+							Summary:  fmt.Sprintf("circuit breaker opened for route %s after %d failures", route, cfg.BreakerFailureThreshold),
+							Details: map[string]any{
+								"failure_threshold": cfg.BreakerFailureThreshold,
+								"open_duration":     cfg.BreakerOpenDuration.String(),
+								"count_5xx":         cfg.BreakerCount5xx,
+							},
+						})
+					}
 				}).
 				OnHalfOpen(func(circuitbreaker.StateChangedEvent) {
 					cfg.Metrics.SetBreakerState(route, breakerStateHalfOpen)

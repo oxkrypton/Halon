@@ -10,7 +10,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/oxkrypton/Halon/internal/authz"
-	"github.com/oxkrypton/Halon/internal/incident"
 	"github.com/oxkrypton/Halon/internal/trafficlog"
 )
 
@@ -22,7 +21,7 @@ type Dependencies struct {
 	Routes               *RouteTable
 	Repository           Pinger
 	LogQueue             chan<- trafficlog.Entry
-	TimeoutQueue         chan<- incident.TimeoutEvent
+	Incidents            *IncidentSink
 	Logger               *slog.Logger
 	Rules                BlacklistStore
 	Limiter              RateLimitBackend
@@ -41,7 +40,7 @@ func NewHTTPHandler(dependencies Dependencies) *gin.Engine {
 	metrics := dependencies.Metrics
 	router := newRouter(logger, AccessLog(AccessLogOptions{
 		Queue:         dependencies.LogQueue,
-		TimeoutQueue:  dependencies.TimeoutQueue,
+		Incidents:     dependencies.Incidents,
 		SlowThreshold: dependencies.SlowRequestThreshold,
 		CaptureLimit:  dependencies.BodyCaptureLimit,
 		Logger:        logger,
@@ -92,10 +91,11 @@ type AdminOptions struct {
 	LoginLimiter RateLimitBackend
 
 	// Console observability, route inspection, and distributed trace query dependencies.
-	TrafficLogs TrafficLogReader
-	Routes      *RouteTable
-	Tempo       *TempoClient
-	SystemInfo  SystemInfo
+	TrafficLogs       TrafficLogReader
+	Routes            *RouteTable
+	Tempo             *TempoClient
+	SystemInfo        SystemInfo
+	IncidentCoalescer IncidentCoalescer
 }
 
 func NewAdminHandler(token string, rules BlacklistStore, limiter RateLimitBackend, logger *slog.Logger, metrics *Metrics, options AdminOptions) *gin.Engine {
@@ -214,6 +214,11 @@ func NewAdminHandler(token string, rules BlacklistStore, limiter RateLimitBacken
 	admin.GET("/observability/top-ips", obsRead, observabilityTopIPsHandler(options.TrafficLogs))
 	admin.GET("/traces", obsRead, listTracesHandler(options.Tempo, options.TrafficLogs))
 	admin.GET("/traces/:trace_id", obsRead, getTraceHandler(options.Tempo, options.TrafficLogs))
+
+	rulesRead := authz.Require(authz.PermGatewayRulesRead, abortWithError)
+	admin.GET("/state/gateway", rulesRead, gatewayStateHandler(rules, limiter, options.Resilience, metrics))
+	admin.GET("/state/rate-limit/:ip", rulesRead, rateLimitIPStateHandler(rules, limiter, metrics))
+	admin.GET("/state/incident-windows", obsRead, incidentWindowsStateHandler(options.IncidentCoalescer, metrics))
 
 	if options.LoginEnabled && options.AuthService != nil {
 		registerAuthRoutes(router, authenticator, options.AuthService, options.LoginLimiter, logger)

@@ -20,6 +20,7 @@ import (
 	"github.com/failsafe-go/failsafe-go/bulkhead"
 	"github.com/failsafe-go/failsafe-go/circuitbreaker"
 	"github.com/gin-gonic/gin"
+	"github.com/oxkrypton/Halon/internal/incident"
 )
 
 // routePrefixKey records the matched route prefix for metrics and
@@ -261,17 +262,30 @@ func upstreamErrorHandler(resilience *ResilienceSet, metrics *Metrics, prefix st
 		abortWithError(c, http.StatusServiceUnavailable, "UPSTREAM_UNAVAILABLE", "upstream is temporarily unavailable")
 	case errors.Is(err, bulkhead.ErrFull):
 		metrics.IncRejected(RejectReasonConcurrencyLimit)
+		c.Set(gatewayIncidentTypeKey, incident.TypeConcurrencyLimit)
 		c.Header("Retry-After", "1")
 		abortWithError(c, http.StatusTooManyRequests, "CONCURRENCY_LIMIT", "too many in-flight requests to this upstream")
 	case errors.As(err, &maxBytesErr):
 		metrics.IncRejected(RejectReasonBodyTooLarge)
 		abortWithError(c, http.StatusRequestEntityTooLarge, "REQUEST_TOO_LARGE", "request body exceeds the gateway limit")
 	case isTimeoutError(err):
-		c.Set(upstreamTimeoutKey, true)
+		c.Set(gatewayIncidentTypeKey, incident.TypeUpstreamTimeout)
 		abortWithError(c, http.StatusGatewayTimeout, "UPSTREAM_TIMEOUT", "upstream request timed out")
 	default:
+		if !errors.Is(err, context.Canceled) {
+			c.Set(gatewayIncidentTypeKey, incident.TypeUpstreamError)
+			c.Set(gatewayIncidentDetailKey, truncateIncidentDetail(err.Error(), 256))
+		}
 		abortWithError(c, http.StatusBadGateway, "UPSTREAM_ERROR", "upstream request failed")
 	}
+}
+
+func truncateIncidentDetail(raw string, limit int) string {
+	raw = strings.TrimSpace(raw)
+	if limit <= 0 || len(raw) <= limit {
+		return raw
+	}
+	return raw[:limit]
 }
 
 // routeLabel returns the gin route pattern, or the matched proxy prefix for

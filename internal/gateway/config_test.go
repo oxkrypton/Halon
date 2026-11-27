@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/oxkrypton/Halon/internal/authz"
+	"github.com/oxkrypton/Halon/internal/incident"
 )
 
 func setRequiredGatewayEnv(t *testing.T) {
@@ -322,5 +323,72 @@ func TestLoadConfigTempo(t *testing.T) {
 	t.Setenv("TEMPO_TIMEOUT", "0s")
 	if _, err := LoadConfig(); err == nil {
 		t.Fatal("expected error for zero TEMPO_TIMEOUT")
+	}
+}
+
+func TestLoadConfigIncidentCoalescing(t *testing.T) {
+	setRequiredGatewayEnv(t)
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.IncidentCoalesceCooldown != 5*time.Minute || cfg.IncidentSettleDelay != 15*time.Second || cfg.IncidentRetryBackoff != time.Minute {
+		t.Fatalf("unexpected coalescing defaults: cooldown=%v settle=%v backoff=%v",
+			cfg.IncidentCoalesceCooldown, cfg.IncidentSettleDelay, cfg.IncidentRetryBackoff)
+	}
+	policies := cfg.IncidentPolicies()
+	for _, et := range incident.BuiltinEventTypes() {
+		if !policies.Enabled(et) {
+			t.Fatalf("expected %s to be enabled by default", et)
+		}
+	}
+	if policies.PolicyFor(incident.TypeUpstream5xx).MinOccurrences != 10 || policies.PolicyFor(incident.TypeRateLimitAbuse).MinOccurrences != 50 {
+		t.Fatalf("unexpected threshold defaults: %+v", policies)
+	}
+
+	setRequiredGatewayEnv(t)
+	t.Setenv("INCIDENT_ENABLED_TYPES", "upstream_timeout,breaker_open")
+	t.Setenv("INCIDENT_COALESCE_COOLDOWN", "30s")
+	t.Setenv("INCIDENT_SETTLE_DELAY", "0s")
+	t.Setenv("INCIDENT_5XX_THRESHOLD", "4")
+	t.Setenv("INCIDENT_RATELIMIT_COOLDOWN", "2m")
+	cfg, err = LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.IncidentCoalesceCooldown != 30*time.Second || cfg.IncidentRetryBackoff != 30*time.Second || cfg.IncidentSettleDelay != 0 {
+		t.Fatalf("unexpected coalescing overrides: cooldown=%v settle=%v backoff=%v",
+			cfg.IncidentCoalesceCooldown, cfg.IncidentSettleDelay, cfg.IncidentRetryBackoff)
+	}
+	overridePolicies := cfg.IncidentPolicies()
+	if !overridePolicies.Enabled(incident.TypeUpstreamTimeout) || !overridePolicies.Enabled(incident.TypeBreakerOpen) || overridePolicies.Enabled(incident.TypeUpstream5xx) {
+		t.Fatalf("INCIDENT_ENABLED_TYPES not applied: %+v", overridePolicies.Policies)
+	}
+
+	setRequiredGatewayEnv(t)
+	t.Setenv("INCIDENT_ENABLED_TYPES", "none")
+	cfg, err = LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.IncidentPolicies().Enabled(incident.TypeUpstreamTimeout) {
+		t.Fatal("INCIDENT_ENABLED_TYPES=none must disable all built-in types")
+	}
+
+	badCases := []map[string]string{
+		{"INCIDENT_COALESCE_COOLDOWN": "2m", "INCIDENT_RETRY_BACKOFF": "3m"},
+		{"INCIDENT_SETTLE_DELAY": "-1s"},
+		{"INCIDENT_ENABLED_TYPES": "upstream_timeout,not_a_real_type"},
+		{"INCIDENT_5XX_THRESHOLD": "0"},
+		{"INCIDENT_RATELIMIT_WINDOW": "0s"},
+	}
+	for _, envs := range badCases {
+		setRequiredGatewayEnv(t)
+		for k, v := range envs {
+			t.Setenv(k, v)
+		}
+		if _, err := LoadConfig(); err == nil {
+			t.Fatalf("expected LoadConfig() error for %v", envs)
+		}
 	}
 }

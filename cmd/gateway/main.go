@@ -138,6 +138,8 @@ func run() error {
 	rules := gateway.NewRedisBlacklistStore(redisClient, cfg.BlacklistCacheTTL, cfg.RedisOpTimeout, logger, metrics.SetRedisUp)
 	defer rules.Close()
 	limiter := gateway.NewRedisRateLimiter(redisClient, cfg.RateLimitRPS, cfg.RateLimitBurst, cfg.RedisOpTimeout, logger, metrics.SetRedisUp)
+	incidentCoalescer := gateway.NewRedisIncidentCoalescer(redisClient, cfg.RedisOpTimeout, logger, metrics.SetRedisUp)
+	incidentPolicies := cfg.IncidentPolicies()
 
 	queue := make(chan trafficlog.Entry, cfg.LogQueueSize)
 	writer := trafficlog.NewBatchWriter(repository, queue, cfg.LogBatchSize, cfg.LogFlushInterval, logger)
@@ -147,11 +149,16 @@ func run() error {
 		close(writerDone)
 	}()
 
-	var timeoutQueue chan incident.TimeoutEvent
+	var incidentQueue chan incident.Event
+	var incidentSink *gateway.IncidentSink
 	notifierDone := make(chan struct{})
 	if cfg.AgentWebhookURL != "" {
-		timeoutQueue = make(chan incident.TimeoutEvent, cfg.TimeoutQueueSize)
-		notifier := gateway.NewTimeoutNotifier(cfg.AgentWebhookURL, cfg.AgentWebhookToken, timeoutQueue, logger, metrics)
+		incidentQueue = make(chan incident.Event, cfg.IncidentQueueSize)
+		incidentSink = gateway.NewIncidentSink(incidentQueue, incidentPolicies, metrics, logger)
+		notifier := gateway.NewIncidentNotifierWithOptions(cfg.AgentWebhookURL, cfg.AgentWebhookToken, incidentQueue, logger, metrics, gateway.IncidentNotifierOptions{
+			Coalescer: incidentCoalescer,
+			Policies:  incidentPolicies,
+		})
 		go func() {
 			notifier.Run()
 			close(notifierDone)
@@ -177,6 +184,7 @@ func run() error {
 			BreakerCount5xx:          cfg.BreakerCount5xx,
 			ConcurrencyPerRoute:      cfg.ConcurrencyPerRoute,
 			Logger:                   logger,
+			Incidents:                incidentSink,
 		},
 		Logger:           logger,
 		TransportWrapper: tracing.WrapTransport,
@@ -187,7 +195,7 @@ func run() error {
 		Routes:               routes,
 		Repository:           repository,
 		LogQueue:             queue,
-		TimeoutQueue:         timeoutQueue,
+		Incidents:            incidentSink,
 		Logger:               logger,
 		Rules:                rules,
 		Limiter:              limiter,
@@ -251,6 +259,7 @@ func run() error {
 		TrafficLogs:        repository,
 		Routes:             routes,
 		Tempo:              tempoClient,
+		IncidentCoalescer:  incidentCoalescer,
 		SystemInfo: gateway.SystemInfo{
 			AuthMode:     string(cfg.Auth.Mode),
 			LoginEnabled: cfg.LoginEnabled,
@@ -291,8 +300,8 @@ func run() error {
 
 	// Stop accepting events only after all in-flight HTTP handlers have finished.
 	close(queue)
-	if timeoutQueue != nil {
-		close(timeoutQueue)
+	if incidentQueue != nil {
+		close(incidentQueue)
 	}
 	select {
 	case <-writerDone:
@@ -302,7 +311,7 @@ func run() error {
 	select {
 	case <-notifierDone:
 	case <-shutdownContext.Done():
-		shutdownResult = append(shutdownResult, errors.New("timeout notifier shutdown timed out"))
+		shutdownResult = append(shutdownResult, errors.New("incident notifier shutdown timed out"))
 	}
 	if cleaner != nil {
 		cleaner.Close()

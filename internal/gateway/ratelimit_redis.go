@@ -71,6 +71,7 @@ type RedisRateLimiter struct {
 }
 
 var _ RateLimitBackend = (*RedisRateLimiter)(nil)
+var _ RateLimitInspector = (*RedisRateLimiter)(nil)
 
 // RedisRateLimiterOption customises a RedisRateLimiter at construction time.
 type RedisRateLimiterOption func(*RedisRateLimiter)
@@ -149,6 +150,70 @@ func (l *RedisRateLimiter) Settings() (float64, int) {
 	l.cfgMu.Lock()
 	defer l.cfgMu.Unlock()
 	return l.rps, l.burst
+}
+
+// InspectIP reads the current Redis token-bucket state for ip without
+// consuming a token.
+func (l *RedisRateLimiter) InspectIP(ctx context.Context, ip string) (RateLimitIPStatus, error) {
+	canonical, err := canonicalIP(ip)
+	if err != nil {
+		return RateLimitIPStatus{}, err
+	}
+	rps, burst, err := l.settings()
+	if err != nil {
+		l.reportHealth(false)
+		return RateLimitIPStatus{}, fmt.Errorf("%w: %v", ErrRateLimitUnavailable, err)
+	}
+	opCtx, cancel := context.WithTimeout(ctx, l.opTimeout)
+	defer cancel()
+
+	key := l.prefix + canonical
+	pipe := l.client.Pipeline()
+	hmgetCmd := pipe.HMGet(opCtx, key, "tokens", "ts")
+	pttlCmd := pipe.PTTL(opCtx, key)
+	timeCmd := pipe.Time(opCtx)
+	if _, err := pipe.Exec(opCtx); err != nil && err != redis.Nil {
+		l.reportHealth(false)
+		return RateLimitIPStatus{}, fmt.Errorf("%w: %v", ErrRateLimitUnavailable, err)
+	}
+	l.reportHealth(true)
+
+	status := RateLimitIPStatus{
+		IP:                canonical,
+		Active:            false,
+		Tokens:            float64(burst),
+		RequestsPerSecond: rps,
+		Burst:             burst,
+	}
+	values := hmgetCmd.Val()
+	if len(values) != 2 || values[0] == nil || values[1] == nil {
+		return status, nil
+	}
+	tokens, tokensErr := strconv.ParseFloat(fmt.Sprint(values[0]), 64)
+	ts, tsErr := strconv.ParseInt(fmt.Sprint(values[1]), 10, 64)
+	if tokensErr != nil || tsErr != nil {
+		return status, nil
+	}
+	nowTime, timeErr := timeCmd.Result()
+	nowMs := time.Now().UTC().UnixMilli()
+	if timeErr == nil {
+		nowMs = nowTime.UnixMilli()
+	}
+	refilled := tokens + float64(nowMs-ts)*rps/1000.0
+	if refilled > float64(burst) {
+		refilled = float64(burst)
+	}
+	if refilled < 0 {
+		refilled = 0
+	}
+	ttlMS := int64(0)
+	if pttl, ttlErr := pttlCmd.Result(); ttlErr == nil && pttl > 0 {
+		ttlMS = pttl.Milliseconds()
+	}
+	status.Active = true
+	status.Tokens = math.Round(refilled*1000) / 1000
+	status.TTLMS = ttlMS
+	return status, nil
 }
 
 // settings resolves the effective parameters, refreshing the short config
